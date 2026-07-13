@@ -1,0 +1,690 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * I2C driver for LSTP USB interface.
+ *
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ */
+
+#include <linux/i2c.h>
+#include <linux/err.h>
+#include <linux/overflow.h>
+#include <linux/version.h>
+
+#include "lstp-main.h"
+
+enum lstp_i2c_cmd {
+	LSTP_I2C_CMD_BUS_RECOVERY = 0x00,
+	LSTP_I2C_CMD_READ = 0x01,
+	LSTP_I2C_CMD_WRITE = 0x02,
+	LSTP_I2C_CMD_READ_RECVLEN_DEPRECATED = 0x03, /* Do not use */
+	LSTP_I2C_CMD_WRITE_READ = 0x04,
+	LSTP_I2C_CMD_SMBUS_BLOCK_READ = 0x05
+} __packed;
+
+enum lstp_i2c_cmd_flags { LSTP_I2C_CMD_FLAG_NO_STOP = 0x40 };
+
+enum lstp_i2c_smbus_block_read_flags {
+	LSTP_I2C_SMBUS_BLOCK_READ_FLAG_PEC = BIT(0),
+} __packed;
+
+struct lstp_i2c_read_req {
+	u8 addr;
+	__le16 rd_len;
+} __packed;
+
+struct lstp_i2c_write_req {
+	u8 addr;
+	u8 wr_data[];
+} __packed;
+
+struct lstp_i2c_rd_recvlen_deprecated_req {
+	u8 addr;
+} __packed;
+
+struct lstp_i2c_wr_rd_req {
+	u8 addr;
+	__le16 rd_len;
+	u8 wr_data[]; /* Write length inferred from length in header */
+} __packed;
+
+struct lstp_i2c_smbus_block_read_req {
+	u8 addr;
+	__le16 flags; /* lstp_i2c_smbus_block_read_flags */
+	u8 wr_data[]; /* Write length inferred from length in header */
+} __packed;
+
+enum lstp_i2c_speed {
+	LSTP_I2C_SPEED_100KHZ = 0x00,
+	LSTP_I2C_SPEED_400KHZ = 0x01,
+	LSTP_I2C_SPEED_1000KHZ = 0x02,
+	LSTP_I2C_SPEED_3400KHZ = 0x03,
+};
+
+struct lstp_i2c_config {
+	u8 speed;
+} __packed;
+
+struct lstp_i2c_priv {
+	struct i2c_adapter *adap;
+	bool use_smbus_block_read; /* False once MCU has rejected LSTP_I2C_CMD_SMBUS_BLOCK_READ */
+};
+
+/**
+ * lstp_i2c_bus_recovery() - Perform I2C bus recovery procedure.
+ * @adap: I2C adapter to recover
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int lstp_i2c_bus_recovery(struct i2c_adapter *adap)
+{
+	struct lstp_channel *ch = adap->algo_data;
+	int ret;
+
+	ret = lstp_request(ch, LSTP_I2C_CMD_BUS_RECOVERY, NULL, 0, NULL, 0, NULL);
+	if (ret)
+		dev_err(&adap->dev, "%s: ch_%d: Bus recovery failed (%pe)\n", __func__, ch->ch_id,
+			ERR_PTR(ret));
+	return ret;
+}
+
+/**
+ * lstp_i2c_validate_msg() - Validate an I2C message before transmission.
+ * @msg: I2C message to validate
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int lstp_i2c_validate_msg(struct i2c_msg *msg)
+{
+	if (!msg->buf && msg->len > 0)
+		return -EINVAL;
+
+	if (msg->flags & I2C_M_TEN)
+		return -EAFNOSUPPORT; /* 10-bit address not supported */
+
+	if (msg->addr > 0x7F)
+		return -EINVAL; /* Only 7-bit address supported */
+
+	return 0;
+}
+
+/**
+ * lstp_i2c_read() - Perform an I2C read transaction.
+ * @adap:    I2C adapter to use
+ * @msg:     I2C message describing the read
+ * @no_stop: If true, omit STOP for repeated START
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int lstp_i2c_read(struct i2c_adapter *adap, struct i2c_msg *msg, bool no_stop)
+{
+	u8 cmd = LSTP_I2C_CMD_READ;
+	struct lstp_channel *ch = adap->algo_data;
+	struct lstp_i2c_read_req req = {
+		.addr = msg->addr,
+		.rd_len = cpu_to_le16(msg->len),
+	};
+	int ret;
+
+	ret = lstp_i2c_validate_msg(msg);
+	if (ret) {
+		dev_err(&adap->dev, "%s: ch_%d: Invalid message to addr=0x%02x (%pe)\n", __func__,
+			ch->ch_id, msg->addr, ERR_PTR(ret));
+		return ret;
+	}
+
+	if (msg->len > ch->max_rx_payload) {
+		dev_err(&adap->dev,
+			"%s: ch_%d: Read request message to addr=0x%02x too long (%u bytes, max %zu)\n",
+			__func__, ch->ch_id, msg->addr, msg->len, ch->max_rx_payload);
+		return -EINVAL;
+	}
+
+	dev_dbg(&adap->dev, "%s: ch_%d: addr=0x%02x, len=%d\n", __func__, ch->ch_id, msg->addr,
+		msg->len);
+
+	if (no_stop)
+		cmd |= LSTP_I2C_CMD_FLAG_NO_STOP;
+
+	ret = lstp_request(ch, cmd, &req, sizeof(req), msg->buf, msg->len, NULL);
+	if (ret && ret != lstp_status_to_errno(LSTP_NACK) && ret != lstp_status_to_errno(LSTP_BUSY))
+		dev_err_ratelimited(&adap->dev, "%s: ch_%d: READ to addr=0x%02x failed (%pe)\n",
+				    __func__, ch->ch_id, msg->addr, ERR_PTR(ret));
+	return ret;
+}
+
+/**
+ * lstp_i2c_write() - Perform an I2C write transaction.
+ * @adap:    I2C adapter to use
+ * @msg:     I2C message describing the write
+ * @no_stop: If true, omit STOP for repeated START
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int lstp_i2c_write(struct i2c_adapter *adap, struct i2c_msg *msg, bool no_stop)
+{
+	u8 cmd = LSTP_I2C_CMD_WRITE;
+	struct lstp_channel *ch = adap->algo_data;
+	struct lstp_i2c_write_req req_head = { .addr = msg->addr };
+	struct kvec vecs[2] = {
+		{ .iov_base = &req_head, .iov_len = sizeof(req_head) },
+		{ .iov_base = msg->buf, .iov_len = msg->len },
+	};
+	int ret;
+
+	ret = lstp_i2c_validate_msg(msg);
+	if (ret) {
+		dev_err(&adap->dev, "%s: ch_%d: Invalid message to addr=0x%02x (%pe)\n", __func__,
+			ch->ch_id, msg->addr, ERR_PTR(ret));
+		return ret;
+	}
+
+	if (sizeof(req_head) + msg->len > ch->max_tx_payload) {
+		dev_err(&adap->dev,
+			"%s: ch_%d: Write message to addr=0x%02x too long (%u bytes, max %zu)\n",
+			__func__, ch->ch_id, msg->addr, msg->len,
+			ch->max_tx_payload - sizeof(req_head));
+		return -EINVAL;
+	}
+
+	if (msg->len > 0)
+		dev_dbg(&adap->dev, "%s: ch_%d: addr=0x%02x, len=%d, data=0x%*ph\n", __func__,
+			ch->ch_id, msg->addr, msg->len, msg->len, msg->buf);
+	else
+		dev_dbg(&adap->dev, "%s: ch_%d: addr=0x%02x, len=%d\n", __func__, ch->ch_id,
+			msg->addr, msg->len);
+
+	if (no_stop)
+		cmd |= LSTP_I2C_CMD_FLAG_NO_STOP;
+
+	ret = lstp_requestv(ch, cmd, vecs, ARRAY_SIZE(vecs), NULL, 0, NULL);
+	if (ret && ret != lstp_status_to_errno(LSTP_NACK) && ret != lstp_status_to_errno(LSTP_BUSY))
+		dev_err_ratelimited(&adap->dev, "%s: ch_%d: WRITE to addr=0x%02x failed (%pe)\n",
+				    __func__, ch->ch_id, msg->addr, ERR_PTR(ret));
+	return ret;
+}
+
+/**
+ * lstp_i2c_read_recvlen_deprecated() - Deprecated SMBus block read (slave indicates length). Does
+ * not support PEC.
+ * @adap:    I2C adapter to use
+ * @msg:     I2C message; msg->len updated to actual bytes received
+ * @no_stop: If true, omit STOP for repeated START
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int lstp_i2c_read_recvlen_deprecated(struct i2c_adapter *adap, struct i2c_msg *msg,
+					    bool no_stop)
+{
+	u8 cmd = LSTP_I2C_CMD_READ_RECVLEN_DEPRECATED;
+	struct lstp_channel *ch = adap->algo_data;
+	struct lstp_i2c_rd_recvlen_deprecated_req req = { .addr = msg->addr };
+	size_t pkt_len = 0;
+	u16 rx_len;
+	u8 block_len;
+	int ret;
+
+	ret = lstp_i2c_validate_msg(msg);
+	if (ret) {
+		dev_err(&adap->dev, "%s: ch_%d: Invalid message to addr=0x%02x (%pe)\n", __func__,
+			ch->ch_id, msg->addr, ERR_PTR(ret));
+		return ret;
+	}
+
+	if (msg->len > ch->max_rx_payload) {
+		dev_err(&adap->dev,
+			"%s: ch_%d: Read recvlen message to addr=0x%02x too long (%u bytes, max %zu)\n",
+			__func__, ch->ch_id, msg->addr, msg->len, ch->max_rx_payload);
+		return -EINVAL;
+	}
+
+	if (no_stop)
+		cmd |= LSTP_I2C_CMD_FLAG_NO_STOP;
+
+	ret = lstp_request(ch, cmd, &req, sizeof(req), msg->buf, msg->len, &pkt_len);
+	if (ret) {
+		if (ret != lstp_status_to_errno(LSTP_NACK) &&
+		    ret != lstp_status_to_errno(LSTP_BUSY))
+			dev_err_ratelimited(&adap->dev,
+					    "%s: ch_%d: READ_RECVLEN to addr=0x%02x failed (%pe)\n",
+					    __func__, ch->ch_id, msg->addr, ERR_PTR(ret));
+		return ret;
+	}
+
+	if (pkt_len == 0) {
+		dev_err(&adap->dev, "%s: ch_%d: Empty response packet\n", __func__, ch->ch_id);
+		return -EIO;
+	}
+
+	block_len = msg->buf[0];
+	if (block_len > I2C_SMBUS_BLOCK_MAX) {
+		dev_err(&adap->dev, "%s: ch_%d: Invalid block length %u\n", __func__, ch->ch_id,
+			block_len);
+		return -EPROTO;
+	}
+
+	rx_len = block_len + 1;
+	if (pkt_len < rx_len) {
+		dev_err(&adap->dev, "%s: ch_%d: Invalid response length (%zu)\n", __func__,
+			ch->ch_id, pkt_len);
+		return -EIO;
+	}
+
+	msg->len = rx_len;
+	return 0;
+}
+
+/**
+ * lstp_i2c_write_read() - Atomic write-then-read with repeated START.
+ * @adap:   I2C adapter to use
+ * @wr_msg: I2C message describing the write phase (addr, buf, len)
+ * @rd_msg: I2C message describing the read phase (addr, buf, len)
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int lstp_i2c_write_read(struct i2c_adapter *adap, struct i2c_msg *wr_msg,
+			       struct i2c_msg *rd_msg)
+{
+	struct lstp_channel *ch = adap->algo_data;
+	struct lstp_i2c_wr_rd_req req_head = {
+		.addr = wr_msg->addr,
+		.rd_len = cpu_to_le16(rd_msg->len),
+	};
+	struct kvec vecs[2] = {
+		{ .iov_base = &req_head, .iov_len = sizeof(req_head) },
+		{ .iov_base = wr_msg->buf, .iov_len = wr_msg->len },
+	};
+	int ret;
+
+	ret = lstp_i2c_validate_msg(wr_msg);
+	if (ret) {
+		dev_err(&adap->dev, "%s: ch_%d: Invalid write message to addr=0x%02x (%pe)\n",
+			__func__, ch->ch_id, wr_msg->addr, ERR_PTR(ret));
+		return ret;
+	}
+
+	if (sizeof(req_head) + wr_msg->len > ch->max_tx_payload) {
+		dev_err(&adap->dev,
+			"%s: ch_%d: Write message to addr=0x%02x too long (%u bytes, max %zu)\n",
+			__func__, ch->ch_id, wr_msg->addr, wr_msg->len,
+			ch->max_tx_payload - sizeof(req_head));
+		return -EINVAL;
+	}
+
+	ret = lstp_i2c_validate_msg(rd_msg);
+	if (ret) {
+		dev_err(&adap->dev, "%s: ch_%d: Invalid read message to addr=0x%02x (%pe)\n",
+			__func__, ch->ch_id, rd_msg->addr, ERR_PTR(ret));
+		return ret;
+	}
+
+	if (rd_msg->len > ch->max_rx_payload) {
+		dev_err(&adap->dev,
+			"%s: ch_%d: Read message to addr=0x%02x too long (%u bytes, max %zu)\n",
+			__func__, ch->ch_id, rd_msg->addr, rd_msg->len, ch->max_rx_payload);
+		return -EINVAL;
+	}
+
+	if (wr_msg->addr != rd_msg->addr) {
+		dev_err(&adap->dev, "%s: ch_%d: Write/read addr mismatch (wr=0x%02x, rd=0x%02x)\n",
+			__func__, ch->ch_id, wr_msg->addr, rd_msg->addr);
+		return -EINVAL;
+	}
+
+	ret = lstp_requestv(ch, LSTP_I2C_CMD_WRITE_READ, vecs, ARRAY_SIZE(vecs), rd_msg->buf,
+			    rd_msg->len, NULL);
+	if (ret && ret != lstp_status_to_errno(LSTP_NACK) && ret != lstp_status_to_errno(LSTP_BUSY))
+		dev_err_ratelimited(&adap->dev,
+				    "%s: ch_%d: WRITE_READ to addr=0x%02x failed (%pe)\n", __func__,
+				    ch->ch_id, wr_msg->addr, ERR_PTR(ret));
+	return ret;
+}
+
+/**
+ * lstp_i2c_smbus_block_read() - SMBus block read with optional write phase (slave indicates
+ * length).
+ * @adap:    I2C adapter to use
+ * @wr_msg:  Optional write phase (addr, buf, len). If non-NULL, must target the same slave as
+ * rd_msg.
+ * @rd_msg:  I2C message describing the read phase; rd_msg->len updated to actual bytes received
+ * @no_stop: If true, omit STOP for repeated START
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int lstp_i2c_smbus_block_read(struct i2c_adapter *adap, struct i2c_msg *wr_msg,
+				     struct i2c_msg *rd_msg, bool no_stop)
+{
+	u8 cmd = LSTP_I2C_CMD_SMBUS_BLOCK_READ;
+	struct lstp_channel *ch = adap->algo_data;
+	DEFINE_RAW_FLEX(struct lstp_i2c_smbus_block_read_req, req, wr_data, I2C_SMBUS_BLOCK_MAX);
+	size_t pkt_len = 0;
+	u16 rx_len;
+	u16 wr_len = wr_msg ? wr_msg->len : 0;
+	u8 *wr_buf = wr_msg ? wr_msg->buf : NULL;
+	u8 block_len;
+	bool pec = rd_msg->flags & I2C_CLIENT_PEC;
+	u16 rx_buf_len = I2C_SMBUS_BLOCK_MAX + (pec ? 2 : 1);
+	int ret;
+
+	ret = lstp_i2c_validate_msg(rd_msg);
+	if (ret) {
+		dev_err(&adap->dev, "%s: ch_%d: Invalid read message to addr=0x%02x (%pe)\n",
+			__func__, ch->ch_id, rd_msg->addr, ERR_PTR(ret));
+		return ret;
+	}
+
+	if (wr_msg) {
+		ret = lstp_i2c_validate_msg(wr_msg);
+		if (ret) {
+			dev_err(&adap->dev,
+				"%s: ch_%d: Invalid write message to addr=0x%02x (%pe)\n", __func__,
+				ch->ch_id, wr_msg->addr, ERR_PTR(ret));
+			return ret;
+		}
+
+		if (wr_msg->addr != rd_msg->addr) {
+			dev_err(&adap->dev,
+				"%s: ch_%d: Write/read addr mismatch (wr=0x%02x, rd=0x%02x)\n",
+				__func__, ch->ch_id, wr_msg->addr, rd_msg->addr);
+			return -EINVAL;
+		}
+	}
+
+	if (wr_len > I2C_SMBUS_BLOCK_MAX) {
+		dev_err(&adap->dev,
+			"%s: ch_%d: SMBus write phase to addr=0x%02x too long (%u bytes, max %u)\n",
+			__func__, ch->ch_id, rd_msg->addr, wr_len, I2C_SMBUS_BLOCK_MAX);
+		return -EINVAL;
+	}
+
+	if (rx_buf_len > ch->max_rx_payload) {
+		dev_err(&adap->dev,
+			"%s: ch_%d: Read message to addr=0x%02x too long (%u bytes, max %zu)\n",
+			__func__, ch->ch_id, rd_msg->addr, rx_buf_len, ch->max_rx_payload);
+		return -EINVAL;
+	}
+
+	if (struct_size(req, wr_data, wr_len) > ch->max_tx_payload) {
+		dev_err(&adap->dev,
+			"%s: ch_%d: SMBus write phase to addr=0x%02x too long (%zu bytes, max %zu)\n",
+			__func__, ch->ch_id, rd_msg->addr, struct_size(req, wr_data, wr_len),
+			ch->max_tx_payload);
+		return -EMSGSIZE;
+	}
+
+	*req = (struct lstp_i2c_smbus_block_read_req){
+		.addr = rd_msg->addr,
+		.flags = cpu_to_le16(pec ? LSTP_I2C_SMBUS_BLOCK_READ_FLAG_PEC : 0),
+	};
+	if (wr_len)
+		memcpy(req->wr_data, wr_buf, wr_len);
+
+	if (no_stop)
+		cmd |= LSTP_I2C_CMD_FLAG_NO_STOP;
+
+	ret = lstp_request(ch, cmd, req, struct_size(req, wr_data, wr_len), rd_msg->buf, rx_buf_len,
+			   &pkt_len);
+	if (ret) {
+		if (ret != lstp_status_to_errno(LSTP_NACK) &&
+		    ret != lstp_status_to_errno(LSTP_NOT_SUPP) &&
+		    ret != lstp_status_to_errno(LSTP_BUSY))
+			dev_err_ratelimited(&adap->dev,
+					    "%s: ch_%d: SMBUS_BLOCK_READ to addr=0x%02x failed (%pe)\n",
+					    __func__, ch->ch_id, rd_msg->addr, ERR_PTR(ret));
+		return ret;
+	}
+
+	if (pkt_len == 0) {
+		dev_err(&adap->dev, "%s: ch_%d: Empty response packet\n", __func__, ch->ch_id);
+		return -EIO;
+	}
+
+	block_len = rd_msg->buf[0];
+	if (block_len > I2C_SMBUS_BLOCK_MAX) {
+		dev_err(&adap->dev, "%s: ch_%d: Invalid block length %u\n", __func__, ch->ch_id,
+			block_len);
+		return -EPROTO;
+	}
+
+	rx_len = block_len + (pec ? 2 : 1);
+	if (pkt_len < rx_len) {
+		dev_err(&adap->dev, "%s: ch_%d: Invalid response length (%zu)\n", __func__,
+			ch->ch_id, pkt_len);
+		return -EIO;
+	}
+
+	rd_msg->len = rx_len;
+	return 0;
+}
+
+/**
+ * lstp_i2c_smbus_block_read_wrapper() - SMBus block read with legacy fallback.
+ * @adap:    I2C adapter to use
+ * @wr_msg:  Optional write phase. If non-NULL, must target the same slave as @rd_msg
+ * @rd_msg:  Read phase message; rd_msg->len is updated to actual bytes received
+ * @no_stop: If true, omit STOP for repeated START on the read phase
+ *
+ * Tries the atomic SMBUS_BLOCK_READ opcode first. If the device
+ * rejects it (or has done so previously this session), falls back to a
+ * lstp_i2c_write() + lstp_i2c_read_recvlen_deprecated() transaction.
+ * PEC clients are rejected on the fallback path because the deprecated path cannot transport the
+ * trailing PEC byte.
+ *
+ * TODO: remove the fallback path (and lstp_i2c_read_recvlen_deprecated()) once
+ * all deployed devices support SMBUS_BLOCK_READ.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int lstp_i2c_smbus_block_read_wrapper(struct i2c_adapter *adap, struct i2c_msg *wr_msg,
+					     struct i2c_msg *rd_msg, bool no_stop)
+{
+	struct lstp_channel *ch = adap->algo_data;
+	struct lstp_i2c_priv *priv = ch->priv;
+	u16 wr_len = wr_msg ? wr_msg->len : 0;
+	int ret;
+
+	if (READ_ONCE(priv->use_smbus_block_read)) {
+		ret = lstp_i2c_smbus_block_read(adap, wr_msg, rd_msg, no_stop);
+		if (ret != lstp_status_to_errno(LSTP_NOT_SUPP))
+			return ret;
+
+		/*
+		 * MCU rejected the new opcode; cache the result so subsequent
+		 * calls skip straight to the legacy chain.
+		 */
+		dev_warn_once(&adap->dev,
+			      "%s: ch_%d: Using deprecated recvlen path! -- Update LSTP Device\n",
+			      __func__, ch->ch_id);
+		WRITE_ONCE(priv->use_smbus_block_read, false);
+	}
+
+	/* Deprecated fallback path */
+	if (rd_msg->flags & I2C_CLIENT_PEC) {
+		dev_err(&adap->dev,
+			"%s: ch_%d: PEC client at addr=0x%02x not supported by deprecated recv-len opcode; update MCU firmware to support LSTP_I2C_CMD_SMBUS_BLOCK_READ\n",
+			__func__, ch->ch_id, rd_msg->addr);
+		return -EOPNOTSUPP;
+	}
+
+	if (wr_msg && wr_len > 0) {
+		ret = lstp_i2c_write(adap, wr_msg, true /* no_stop */);
+		if (ret)
+			return ret;
+	}
+	return lstp_i2c_read_recvlen_deprecated(adap, rd_msg, no_stop);
+}
+
+/**
+ * lstp_i2c_xfer() - Main I2C transfer function for the adapter.
+ * @adap: I2C adapter to use
+ * @msgs: Array of I2C messages to transfer
+ * @num:  Number of messages in the array
+ *
+ * Implements the i2c_algorithm.xfer callback. Processes an array of I2C
+ * messages, handling read, write, and combined transactions.
+ *
+ * Return: Number of messages transferred on success, negative errno on failure.
+ */
+static int lstp_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
+{
+	int ret = 0;
+	int i;
+	struct lstp_channel *ch = adap->algo_data;
+
+	if (!msgs || num <= 0)
+		return -EINVAL;
+
+	dev_dbg(&adap->dev, "%s: ch_%d: I2C transfer with %d message(s)\n", __func__, ch->ch_id,
+		num);
+
+	if (num == 2 && !(msgs[0].flags & I2C_M_RD) && (msgs[1].flags & I2C_M_RD) &&
+	    !(msgs[1].flags & I2C_M_RECV_LEN)) {
+		/*
+		 * TODO: This should be more generic but that requires some MCU changes
+		 * 1) Support no-stop flag for atomic write-read
+		 *    (skip over matching pairs in the loop instead of this special case)
+		 */
+		ret = lstp_i2c_write_read(adap, &msgs[0], &msgs[1]);
+		return ret ? ret : num;
+	}
+
+	for (i = 0; i < num; i++) {
+		bool no_stop = (i != num - 1);
+
+		if (msgs[i].flags & I2C_M_RD) {
+			if (msgs[i].flags & I2C_M_RECV_LEN)
+				ret = lstp_i2c_smbus_block_read_wrapper(adap, NULL, &msgs[i],
+									no_stop);
+			else
+				ret = lstp_i2c_read(adap, &msgs[i], no_stop);
+		} else {
+			ret = lstp_i2c_write(adap, &msgs[i], no_stop);
+		}
+
+		if (ret)
+			return ret;
+	}
+
+	return num;
+}
+
+/**
+ * lstp_i2c_functionality() - Report I2C adapter capabilities.
+ * @adap: I2C adapter to query
+ *
+ * Return: Bitmask of supported I2C_FUNC_* flags.
+ */
+static u32 lstp_i2c_functionality(struct i2c_adapter *adap)
+{
+	/* TODO: This needs to be discoverable, also need separate commands for 10-bit address */
+	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL_ALL;
+}
+
+static struct i2c_bus_recovery_info lstp_i2c_recovery_info = {
+	.recover_bus = lstp_i2c_bus_recovery,
+};
+
+static const struct i2c_algorithm lstp_i2c_algorithm = {
+#if KERNEL_VERSION(6, 11, 0) <= LINUX_VERSION_CODE
+	.xfer = lstp_i2c_xfer,
+#else
+	.master_xfer = lstp_i2c_xfer,
+#endif
+	.functionality = lstp_i2c_functionality,
+};
+
+/**
+ * lstp_i2c_init() - Initialize I2C adapter for an LSTP channel.
+ * @ch:   LSTP channel configured as I2C type
+ * @info: unused
+ *
+ * Allocates adapter and parses config. Adapter stored in
+ * ch->priv but not registered; call lstp_i2c_start() after RX URB setup.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int lstp_i2c_init(struct lstp_channel *ch, const struct lstp_channel_init_info *info)
+{
+	struct i2c_adapter *adap;
+	struct lstp_i2c_priv *priv;
+
+	if (info->config_len < sizeof(struct lstp_i2c_config)) {
+		dev_err(ch->dev, "%s: ch_%d: I2C config too short: %zu < %zu\n", __func__,
+			ch->ch_id, info->config_len, sizeof(struct lstp_i2c_config));
+		return -EINVAL;
+	}
+
+	/* Allocate memory */
+	priv = devm_kzalloc(ch->dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+	adap = devm_kzalloc(ch->dev, sizeof(*adap), GFP_KERNEL);
+	if (!adap)
+		return -ENOMEM;
+
+	/* Initialize I2C adapter */
+	adap->owner = THIS_MODULE;
+	adap->class = I2C_CLASS_HWMON;
+	adap->algo = &lstp_i2c_algorithm;
+	adap->algo_data = ch;
+	adap->dev.parent = ch->dev;
+	adap->bus_recovery_info = &lstp_i2c_recovery_info;
+	device_set_node(&adap->dev, ch->fwnode);
+	strscpy(adap->name, ch->display_name, sizeof(adap->name));
+	/* TODO: save i2c speed from config */
+
+	priv->adap = adap;
+	priv->use_smbus_block_read = true;
+	ch->priv = priv;
+
+	dev_dbg(ch->dev, "%s: ch_%d: Initialized as %s\n", __func__, ch->ch_id, adap->name);
+	return 0;
+}
+
+/**
+ * lstp_i2c_start() - Register I2C adapter with Linux I2C core.
+ * @ch: LSTP channel with initialized adapter (from lstp_i2c_init)
+ *
+ * When the adapter's firmware node is set (from lstp_i2c_init), the
+ * I2C core resolves bus numbers via aliases and auto-enumerates child
+ * devices from firmware (DT or ACPI) child nodes.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int lstp_i2c_start(struct lstp_channel *ch)
+{
+	int ret;
+	struct lstp_i2c_priv *priv = ch->priv;
+	struct i2c_adapter *adap = priv ? priv->adap : NULL;
+
+	if (!adap) {
+		dev_err(ch->dev, "%s: ch_%d: I2C adapter not initialized\n", __func__, ch->ch_id);
+		return -EINVAL;
+	}
+
+	ret = devm_i2c_add_adapter(ch->dev, adap);
+	if (ret) {
+		dev_err(ch->dev, "%s: ch_%d: Could not register I2C adapter (%pe)\n", __func__,
+			ch->ch_id, ERR_PTR(ret));
+		return ret;
+	}
+
+	deprecated_lstp_channel_publish_child_dev(ch, &adap->dev);
+
+	dev_info(ch->dev, "%s: ch_%d: Started as %s\n", __func__, ch->ch_id, adap->name);
+	return 0;
+}
+
+/* clang-format off */
+LSTP_SUBSYS(i2c, LSTP_CHANNEL_TYPE_I2C, lstp_i2c_init, lstp_i2c_start,
+	    .fwnode_compatible = "nvidia,lstp-i2c",
+);
+/* clang-format on */
