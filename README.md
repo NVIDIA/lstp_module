@@ -1,154 +1,217 @@
-# __NVIDIA_OSS__ Standard Repo Template
+# Low Speed Transport Protocol (LSTP) Driver for Linux
 
-This README file is from the NVIDIA_OSS standard repo template of [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file). It provides a list of files in the PLC-OSS-Template and guidelines on how to use (clone and customize) them.
+Out-of-tree Linux USB driver for [Low-Speed Transport Protocol (LSTP)](devicetree/bindings/nvidia,lstp.yaml) device. See [LSTP Specification 1.0.pdf](LSTP Specification 1.0.pdf) for more details.
 
-**Upon completing the customization for the project repo, the repo admin should replace this README template with the project specific README file.**
+## Contributing
 
-- Files (org-wide templates in the NVIDIA .github org repo; per-repo overrides allowed) in [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file)
+This project is currently not accepting contributions.
 
-   - Root 
-     - README.md skeleton (CTA + Quickstart + Support/Security/Governance links) 
-     - LICENSE (Apache 2.0 by default)
-        - For other licenses, see the [Confluence page](https://confluence.nvidia.com/pages/viewpage.action?pageId=788418816) for other licenses
-        - CLA.md file (delete if not using MIT or BSD licenses)
-     - CODE_OF_CONDUCT.md 
-     - SECURITY.md (vuln reporting path) 
-     - CONTRIBUTING.md (base; repo can add specifics)
-     - SUPPORT.md (Support levels/channels)
-     - GOVERNANCE.md (baseline; repo may extend)
-     - CITATION.md (for projects that need citation)
+## Cheatsheet
 
-   - .github/ 
-     - ISSUE_TEMPLATE/ (<https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository>)
-       - bug.yml, feature.yml, task.yml, config.yml 
-     - PULL_REQUEST_TEMPLATE.md (<https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/creating-a-pull-request-template-for-your-repository>)
-     - workflows/
-     - Note: workflow-templates/ for starter workflows should live in the org-level .github repo, not per-repo
-
-   - Repo-specific (not org-template, maintained by the team)
-     - CODEOWNERS (place at .github/CODEOWNERS or repo root)
-     - CHANGELOG.md (or RELEASE.md) 
-     - ROADMAP.md 
-     - MAINTAINERS.md 
-     - NOTICE or THIRD_PARTY_NOTICES / THIRD_PARTY_LICENSES (dependency specific)
-     - Build/package files (CMake, pyproject, Dockerfile, etc.)
-
-   - Recommended structure and hygiene
-     - docs/
-     - examples/
-     - tests/
-     - scripts/
-     - Container/dev env: Dockerfile, docker/, .devcontainer/ (optional)
-     - Build/package (language-specific):
-       - Python: pyproject.toml, setup.cfg/setup.py, requirements.txt, environment.yml
-       - C++: CMakeLists.txt, cmake/, vcpkg.json
-     - Repo hygiene: .gitignore, .gitattributes, .editorconfig, .pre-commit-config.yaml, .clang-format
-
-
-## Usage of [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file) for NEW NVIDIA OSS repos
-
-1. Clone the [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file)
-2. Find/replace all in the clone of `___PROJECT___` and `__PROJECT_NAME__` with the name of the specific project.
-3. Inspect all files to make sure all replacements work and update text as needed
-
-
-**What you can reuse immediately**
-- CODE_OF_CONDUCT.md
-- SECURITY.md
-- CONTRIBUTING.md (base)
-- .github/ISSUE_TEMPLATE/.yml (bug/feature/task + config.yml)
-- .github/PULL_REQUEST_TEMPLATE.md
-- Reusable workflows 
-
-**What you must customize per repo**
-- README.md: copy the skeleton and fill in product-specific details (Quickstart, Requirements, Usage, Support level, links)
-- LICENSE: check file is correct, update year, consult Confluence for alternatives https://confluence.nvidia.com/pages/viewpage.action?pageId=788418816, add CLA.md only if your license/process requires it
-- CODEOWNERS: replace <TEAM> with your GitHub team handle(s). Place at .github/CODEOWNERS (or repo root)
-- MAINTAINERS.md: list maintainers names/roles, escalation path
-- CHANGELOG.md (or RELEASE.md): track releases/changes
-- SUPPORT.md: Update for your project
-- ROADMAP.md (optional): upcoming milestones
-- NOTICE / THIRD_PARTY_NOTICES (if you ship third‑party content)
-- Build/package files (CMake/pyproject/Dockerfile/etc.), tests/, docs/, examples/, scripts/ as appropriate
-- Workflows: Edit if you need custom behavior 
-
-
-4. Change git origin to point to new repo and push
-5. Remove the line break below and everything above it
-
-## Usage for existing NVIDIA OSS repos
-
-1. Follow the steps above, but add the files to your existing repo and merge
-
-<!-- REMOVE THE LINE BELOW AND EVERYTHING ABOVE -->
------------------------------------------
-# [Project Title]
-One-sentence value proposition for users. Who is it for, and why it matters. 
-
-# Overview
-What the project does? Why the project is useful?
-Provide a brief overview, highlighting key features or problem-solving capabilities.
-
-# Getting Started
-Guide users on how they can get started with the project. This should include basic installation step, quick-start examples 
-```bash
-# Option A: Package manager (pip/conda/npm/etc.)
-<copy-paste install>
-
-# Option B: Container
-docker run <image> <args>
-
-# Verify (hello world)
-<one-liner or ~10-line example>
+Dependencies:
 ```
-# Requirements
-Include a list of pre-requisites. 
-- OS/Arch: <summary or link to full matrix>
-- Runtime/Compiler: <versions>
-- GPU/Drivers (if applicable): CUDA <ver>, driver <ver>, etc.
-
-# Usage
-```bash
-# Minimal runnable snippet (≤20 lines)
-<code>
+sudo apt install -y build-essential linux-headers-$(uname -r)
 ```
-- More examples/tutorials: <link>
-- API reference: <link>
 
-# Performance (Optional)
-Summary of benchmarks; link to detailed results and hardware used.
+Build and load:
 
-## Releases & Roadmap 
-- Releases/Changelog: <link>
-- (Optional) Next milestones or link to `ROADMAP.md`.
-  
-# Contribution Guidelines
-- Start here: `CONTRIBUTING.md`
-- Code of Conduct: `CODE_OF_CONDUCT.md`
-- Development quickstart (build/test):
-```bash
-<clone> && <deps> && <build/test>
 ```
-## Governance & Maintainers
-- Governance: `GOVERNANCE.md`
-- Maintainers: <team/handles>
-- Labeling/triage policy: <link>
+make build
+make load
 
-## Security
-- Vulnerability disclosure: `SECURITY.md`
-- Do not file public issues for security reports.
+# Signing optional (see creating signing keys below):
+sudo /usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 ~/LSTP_KEYS/MOK.priv ~/LSTP_KEYS/MOK.der ./build/lstp.ko
+```
 
-## Support
-- Level: <Experimental | Maintained | Stable>
-- How to get help: Issues/Discussions/<channel link>
-- Response expectations (if any).
+Unload:
 
-# Community
-Provide the channel for community communications.
+```
+make unload
+```
 
-# References
-Provide a list of related references
+### Signing
 
-# License
-This project is licensed under the [NAME HERE] License - see the LICENSE.md file for details
-- License: <link>
+Required on any kernel that enforces signed modules: x86 distros with UEFI
+Secure Boot (e.g. Ubuntu), BMC / OpenBMC builds, and other locked-down
+kernels. Check with `mokutil --sb-state` or
+`cat /sys/module/module/parameters/sig_enforce`.
+
+One-time: create a key and enroll it (x86 Secure Boot via MOK shown here;
+BMCs typically sign with a key already in the kernel's trusted keyring):
+
+```
+mkdir ~/LSTP_KEYS/
+openssl req -new -x509 -newkey rsa:2048 -keyout ~/LSTP_KEYS/MOK.priv -outform DER -out ~/LSTP_KEYS/MOK.der -nodes -days 36500 -subj "/CN=NVLSTP/"
+sudo mokutil --import ~/LSTP_KEYS/MOK.der
+sudo reboot now
+# In MOK manager: Enroll MOK > Continue > password > Finish and reboot
+```
+
+Every build: sign `lstp.ko` before `make load`:
+
+```
+sudo /usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 ~/LSTP_KEYS/MOK.priv ~/LSTP_KEYS/MOK.der ./build/lstp.ko
+```
+
+### Cross-build
+
+Required dependencies:
+```
+sudo apt install -y build-essential bc bison flex libssl-dev libncurses5-dev git
+```
+
+You will also need your target cross toolchain. Using aarch64 for example:
+```
+sudo apt install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+```
+
+To build for a non-host kernel, point `KDIR` at a `modules_prepare`'d kernel
+source tree and pass `ARCH`/`CROSS_COMPILE`.
+For Raspberry Pi: clone your target branch of
+[raspberrypi/linux](https://github.com/raspberrypi/linux) into `~/linux`,
+run the board's `*_defconfig` and `modules_prepare` against it, then
+`make build_rpi` (cross-compiles against `~/linux`).
+
+## Module Parameters
+
+### auto_bind_spidev
+
+By default, the driver registers SPI controllers but does not create spidev
+character devices on them. On systems without firmware node descriptions
+(device tree or ACPI), spidev devices must be explicitly enabled:
+
+```
+make load auto_bind_spidev=1
+```
+
+On systems with device tree or ACPI, SPI child devices are enumerated
+automatically from the firmware description and this parameter has no effect.
+
+When the driver is built in-tree, the compile-time default is controlled by
+`CONFIG_USB_LSTP_SPI_SPIDEV`.
+
+## Using and Inspecting LSTP
+
+### Driver Logs
+
+Driver messages go to the kernel log. View with `dmesg`:
+
+```
+sudo dmesg | grep -i lstp
+```
+
+### Finding LSTP Devices
+
+Bound USB interfaces appear as symlinks under the driver's sysfs directory:
+
+```
+$ find /sys/bus/usb/drivers/lstp -maxdepth 1 -type l
+/sys/bus/usb/drivers/lstp/3-3.1:1.2
+/sys/bus/usb/drivers/lstp/3-4.4:1.2
+...
+```
+
+### Sysfs Topology
+
+Each bound interface exposes an `lstp/` directory with a `name` and a
+`channel/` subdirectory. Each channel has `name`, `enable`, and a `device`
+symlink to the underlying Linux device:
+
+> **Don't hardcode bus numbers, `spiX.Y`, `i2c-N`, or `gpiochipN`.** USB is
+> dynamic: these IDs can change across boots, topologies, and hotplug order.
+> Only a device-tree (or equivalent firmware) description gives stable
+> ordering. Otherwise, always discover devices via sysfs.
+
+```
+$ tree -L 3 /sys/bus/usb/devices/1-1.2.2:1.2/lstp/
+/sys/bus/usb/devices/1-1.2.2:1.2/lstp/
+├── channel
+│   ├── 1
+│   │   ├── device -> ../../../spi_master/spi7
+│   │   ├── enable
+│   │   └── name
+│   ├── 2
+│   │   ├── device -> ../../../i2c-22
+│   │   ├── enable
+│   │   └── name
+│   ├── 3
+│   │   ├── device -> ../../../i2c-23
+│   │   ├── enable
+│   │   └── name
+│   └── 4
+│       ├── device -> ../../../gpiochip2
+│       ├── enable
+│       └── name
+└── name
+```
+
+Discovery flow:
+
+1. List bound interfaces in `/sys/bus/usb/drivers/lstp/`.
+2. For each, iterate `lstp/channel/*/`.
+3. Match on `channel/<N>/name` (the stable identifier).
+4. Follow `channel/<N>/device` at runtime to get the node to open.
+
+Example: find every SPI channel named `MY_BOARD_SPI` across all bound LSTP
+devices and print its underlying SPI master:
+
+```
+for ch in /sys/bus/usb/drivers/lstp/*:*/lstp/channel/*/; do
+    [ "$(cat "$ch/name")" = "MY_BOARD_SPI" ] || continue
+    target=$(readlink -f "$ch/device")
+    case "$target" in */spi_master/*) ;; *) continue ;; esac
+    usb_path=$(readlink -f "$ch/../../..")
+
+    echo "usb=$usb_path spi=$target"
+done
+```
+
+## Device Tree Support Example
+(For general USB device DTs, see: https://www.kernel.org/doc/Documentation/devicetree/bindings/usb/usb-device.txt)
+```
+&ehci1 {
+    status = "okay";
+
+    hub@1 {
+        reg = <1>;
+        hub@2 {
+            reg = <2>;
+                device@1 {
+                    reg = <1>;
+                    interface@2 {
+                        reg = <2>;
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+
+                        channel@1 {
+                            reg = <1>;
+                            compatible = "nvidia,lstp-spi";
+                            label = "spi-lstp-host0";
+                            #address-cells = <1>;
+                            #size-cells = <0>;
+
+                            spidev@0 {
+                                compatible = "nvidia,lstp-spidev";
+                                reg = <0>;
+                                spi-max-frequency = <18750000>;
+                            };
+
+                            spidev@1 {
+                                compatible = "nvidia,lstp-spidev";
+                                reg = <1>;
+                                spi-max-frequency = <18750000>;
+                            };
+                        };
+
+                        channel@2 {
+                            reg = <2>;
+                            compatible = "nvidia,lstp-ipmi";
+                            label = "ipmi-lstp-host0";
+                        };
+                    };
+                };
+            };
+        };
+    };
+};
+```
