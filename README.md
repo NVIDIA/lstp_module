@@ -1,6 +1,6 @@
 # Low Speed Transport Protocol (LSTP) Driver for Linux
 
-Out-of-tree Linux USB driver for [Low-Speed Transport Protocol (LSTP)](devicetree/bindings/nvidia,lstp.yaml) device. See [LSTP Specification 1.0.pdf](LSTP Specification 1.0.pdf) for more details.
+Out-of-tree Linux USB driver for [Low-Speed Transport Protocol (LSTP)](devicetree/bindings/nvidia,lstp.yaml) device. See [LSTP Specification 1.0.pdf](LSTP%20Specification%201.0.pdf) for more details.
 
 ## Contributing
 

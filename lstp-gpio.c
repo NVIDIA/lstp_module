@@ -199,13 +199,14 @@ static int lstp_gpio_read_direction(struct lstp_gpio_priv *priv, unsigned int pi
 	u16 offset = pin_offset + offsetof(struct lstp_gpio_pin, config) +
 		     offsetof(struct lstp_gpio_pin_config, direction);
 	size_t actual;
+	int lstp_status;
 	int ret;
 
 	if (pin >= priv->npins)
 		return -EINVAL;
 
-	ret = lstp_ch0_read_config(ch, offset, sizeof(*direction), &resp, &actual);
-	if (ret == lstp_status_to_errno(LSTP_ERROR) || ret == lstp_status_to_errno(LSTP_NOT_SUPP)) {
+	ret = lstp_ch0_read_config(ch, offset, sizeof(*direction), &resp, &actual, &lstp_status);
+	if (lstp_status == LSTP_ERROR || lstp_status == LSTP_NOT_SUPP) {
 		/*
 		 * TODO: Legacy support - remove this at some point
 		 * Fallback for firmware that only supports whole pin reads.
@@ -213,7 +214,7 @@ static int lstp_gpio_read_direction(struct lstp_gpio_priv *priv, unsigned int pi
 		dev_warn_ratelimited(ch->dev, "%s: ch_%d: Partial pin config read rejected.\n",
 				     __func__, ch->ch_id);
 		ret = lstp_ch0_read_config(ch, pin_offset, sizeof(struct lstp_gpio_pin), &resp,
-					   &actual);
+					   &actual, NULL);
 		if (ret)
 			return ret;
 		*direction = ((const struct lstp_gpio_pin *)resp->ch_config)->config.direction;
@@ -244,7 +245,7 @@ static int lstp_gpio_get_value(struct gpio_chip *gc, unsigned int pin)
 	int ret;
 
 	ret = lstp_request(ch, LSTP_GPIO_CMD_GET_VALUE, &req, sizeof(req), &resp, sizeof(resp),
-			   NULL);
+			   NULL, NULL);
 	if (ret) {
 		dev_err(ch->dev, "%s: ch_%d: Could not get value for pin %u (%pe)\n", __func__,
 			ch->ch_id, pin, ERR_PTR(ret));
@@ -277,7 +278,7 @@ static void lstp_gpio_set_value(struct gpio_chip *gc, unsigned int pin, int valu
 	};
 	int ret;
 
-	ret = lstp_request(ch, LSTP_GPIO_CMD_SET_VALUE, &req, sizeof(req), NULL, 0, NULL);
+	ret = lstp_request(ch, LSTP_GPIO_CMD_SET_VALUE, &req, sizeof(req), NULL, 0, NULL, NULL);
 	if (ret)
 		dev_err(ch->dev, "%s: ch_%d: Could not set value %d for pin %u (%pe)\n", __func__,
 			ch->ch_id, value, pin, ERR_PTR(ret));
@@ -355,7 +356,7 @@ static int lstp_gpio_get_multiple(struct gpio_chip *gc, unsigned long *mask, uns
 		}
 
 		ret = lstp_request(ch, LSTP_GPIO_CMD_GET_VALUE, req, pins_in_pkt * sizeof(*req),
-				   resp, pins_in_pkt * sizeof(*resp), NULL);
+				   resp, pins_in_pkt * sizeof(*resp), NULL, NULL);
 		if (ret) {
 			dev_err(ch->dev, "%s: ch_%d: Could not get values for %d pins (%pe)\n",
 				__func__, ch->ch_id, pins_in_pkt, ERR_PTR(ret));
@@ -441,7 +442,7 @@ static void lstp_gpio_set_multiple(struct gpio_chip *gc, unsigned long *mask, un
 		}
 
 		ret = lstp_request(ch, LSTP_GPIO_CMD_SET_VALUE, req, pins_in_pkt * sizeof(*req),
-				   NULL, 0, NULL);
+				   NULL, 0, NULL, NULL);
 		if (ret) {
 			dev_err(ch->dev,
 				"%s: ch_%d: Could not set values for pins (mask=%*pb) (%pe)\n",
@@ -479,7 +480,7 @@ static int lstp_gpio_get_irq_config(struct lstp_gpio_priv *priv, u16 pin)
 	int ret;
 
 	ret = lstp_request(ch, LSTP_GPIO_CMD_GET_IRQ_CONFIG, &req, sizeof(req), &resp, sizeof(resp),
-			   NULL);
+			   NULL, NULL);
 	if (ret) {
 		dev_err(ch->dev, "%s: ch_%d: GET_IRQ_CONFIG failed for pin %u (%pe)\n", __func__,
 			ch->ch_id, pin, ERR_PTR(ret));
@@ -506,7 +507,8 @@ static int lstp_gpio_set_irq_config(struct lstp_gpio_priv *priv, u16 pin, u8 irq
 	};
 	int ret;
 
-	ret = lstp_request(ch, LSTP_GPIO_CMD_SET_IRQ_CONFIG, &req, sizeof(req), NULL, 0, NULL);
+	ret = lstp_request(ch, LSTP_GPIO_CMD_SET_IRQ_CONFIG, &req, sizeof(req), NULL, 0, NULL,
+			   NULL);
 	if (ret)
 		dev_err(ch->dev, "%s: ch_%d: SET_IRQ_CONFIG failed for pin %u (%pe)\n", __func__,
 			ch->ch_id, pin, ERR_PTR(ret));
@@ -564,7 +566,7 @@ static int lstp_led_set_pattern(struct lstp_gpio_led *led, u32 repeats,
 		req->pattern[i].time_ms = cpu_to_le32(pattern[i].delta_t);
 	}
 
-	ret = lstp_request(ch, LSTP_GPIO_CMD_SET_LED_PATTERN, req, req_len, NULL, 0, NULL);
+	ret = lstp_request(ch, LSTP_GPIO_CMD_SET_LED_PATTERN, req, req_len, NULL, 0, NULL, NULL);
 	if (ret)
 		dev_err(ch->dev,
 			"%s: ch_%d: SET_LED_PATTERN failed for led '%s' (repeats=%u, num_steps=%u) (%pe)\n",

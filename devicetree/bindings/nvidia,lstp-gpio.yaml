@@ -17,6 +17,13 @@ description: |
   pin names.  The gpio-controller and #gpio-cells properties enable
   phandle references from consumers (e.g. gpio-leds, gpio-keys).
 
+  The channel is also an interrupt controller.  Consumers may either
+  reference a line with a *-gpios phandle and call gpiod_to_irq(), or use
+  the interrupts-extended / interrupt-parent + interrupts idiom via the
+  interrupt-controller and #interrupt-cells properties.  An interrupt line
+  must be an input; the firmware-reported pin direction is authoritative
+  and is not changed at runtime.
+
   GPIO hog child nodes are supported for boot-time pin configuration.
 
   Note: because the GPIO controller sits behind USB, all operations are
@@ -39,6 +46,15 @@ properties:
       Two cells: pin number and flags.
       Cell 0: GPIO pin offset (0-based).
       Cell 1: GPIO flags (e.g. GPIO_ACTIVE_LOW).
+
+  interrupt-controller: true
+
+  "#interrupt-cells":
+    const: 2
+    description: |
+      Two cells: GPIO line offset and trigger flags.
+      Cell 0: GPIO line offset (0-based), same numbering as #gpio-cells.
+      Cell 1: Trigger flags (see <dt-bindings/interrupt-controller/irq.h>).
 
   gpio-line-names:
     description: |
@@ -75,6 +91,10 @@ patternProperties:
 
     additionalProperties: false
 
+dependentRequired:
+  interrupt-controller: ["#interrupt-cells"]
+  "#interrupt-cells": [interrupt-controller]
+
 required:
   - compatible
   - reg
@@ -106,5 +126,29 @@ examples:
             gpios = <0 0>;
             output-high;
             line-name = "status-led-hog";
+        };
+    };
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    /* Act as an interrupt controller for a consumer via interrupts-extended */
+    gpio_irq_ch: channel@3 {
+        compatible = "nvidia,lstp-gpio";
+        reg = <3>;
+        gpio-controller;
+        #gpio-cells = <2>;
+        interrupt-controller;
+        #interrupt-cells = <2>;
+    };
+
+    alert-consumer {
+        compatible = "gpio-keys";
+
+        alert {
+            label = "alert";
+            linux,code = <143>; /* KEY_WAKEUP */
+            /* Line 1 as a falling-edge interrupt source */
+            interrupts-extended = <&gpio_irq_ch 1 IRQ_TYPE_EDGE_FALLING>;
         };
     };

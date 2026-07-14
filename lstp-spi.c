@@ -116,15 +116,16 @@ static int lstp_spi_do_transfer(struct lstp_channel *ch, struct spi_transfer *xf
 
 	if (xfer->tx_buf && xfer->rx_buf) {
 		cmd = LSTP_SPI_CMD_WRITE_READ | cs_bits | cs_flags;
-		ret = lstp_request(ch, cmd, xfer->tx_buf, xfer->len, xfer->rx_buf, xfer->len, NULL);
+		ret = lstp_request(ch, cmd, xfer->tx_buf, xfer->len, xfer->rx_buf, xfer->len, NULL,
+				   NULL);
 	} else if (xfer->tx_buf) {
 		cmd = LSTP_SPI_CMD_WRITE | cs_bits | cs_flags;
-		ret = lstp_request(ch, cmd, xfer->tx_buf, xfer->len, NULL, 0, NULL);
+		ret = lstp_request(ch, cmd, xfer->tx_buf, xfer->len, NULL, 0, NULL, NULL);
 	} else if (xfer->rx_buf) {
 		struct lstp_spi_read_req req = { .len = cpu_to_le32(xfer->len) };
 
 		cmd = LSTP_SPI_CMD_READ | cs_bits | cs_flags;
-		ret = lstp_request(ch, cmd, &req, sizeof(req), xfer->rx_buf, xfer->len, NULL);
+		ret = lstp_request(ch, cmd, &req, sizeof(req), xfer->rx_buf, xfer->len, NULL, NULL);
 	} else {
 		return -EINVAL;
 	}

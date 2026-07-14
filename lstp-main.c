@@ -176,7 +176,7 @@ static const int lstp_errno_map[] = {
  *
  * Return: Negative errno, or 0 on LSTP_SUCCESS.
  */
-int lstp_status_to_errno(u8 status)
+static int lstp_status_to_errno(u8 status)
 {
 	if (status < ARRAY_SIZE(lstp_errno_map))
 		return lstp_errno_map[status];
@@ -247,7 +247,10 @@ static int lstp_validate_rx_pkt(struct lstp_usb *dev, struct lstp_packet *rx_pkt
  * lstp_validate_resp() - Validate LSTP response packets.
  * @dev:             Device structure for error reporting
  * @rx_pkt:          Received packet to validate
- * @min_payload_len: Minimum payload length, or LSTP_ANY_RX_LEN to accept any length
+ * @min_payload_len:  Minimum payload length, or LSTP_ANY_RX_LEN to accept any length
+ * @lstp_status: Optional out-param. Set to the raw LSTP response status only
+ *                    when the returned errno is derived from that status; left
+ *                    untouched otherwise (payload/length validation failures).
  *
  * Assumes the packet has already been validated with lstp_validate_rx_pkt().
  *
@@ -258,7 +261,7 @@ static int lstp_validate_rx_pkt(struct lstp_usb *dev, struct lstp_packet *rx_pkt
  * Return: 0 on success, negative errno on failure.
  */
 static int lstp_validate_resp(struct lstp_usb *dev, struct lstp_packet *rx_pkt,
-			      size_t min_payload_len)
+			      size_t min_payload_len, int *lstp_status)
 {
 	int ret;
 	struct lstp_header *rx_hdr = &rx_pkt->hdr;
@@ -268,6 +271,8 @@ static int lstp_validate_resp(struct lstp_usb *dev, struct lstp_packet *rx_pkt,
 	/* Validate LSTP status */
 	ret = lstp_status_to_errno(GET_BIT_0_6(rx_hdr->status));
 	if (ret) {
+		if (lstp_status)
+			*lstp_status = GET_BIT_0_6(rx_hdr->status);
 		dev_dbg(&dev->intf->dev, "%s: ch_%u: LSTP error status %d (errno=%d)\n", __func__,
 			ch_id, GET_BIT_0_6(rx_hdr->status), ret);
 		return ret;
@@ -308,11 +313,13 @@ static int lstp_validate_resp(struct lstp_usb *dev, struct lstp_packet *rx_pkt,
  *            sizeof(struct lstp_ch0_read_resp); when @length is an explicit
  *            byte count (not LSTP_READ_CONFIG_MAX), at least @length bytes of
  *            ch_config[] are included.
+ * @lstp_status: Optional out-param for the raw status from the final LSTP
+ *               request; see lstp_request()
  *
  * Return: 0 on success, negative errno on failure.
  */
 int lstp_ch0_read_config(struct lstp_channel *ch, u16 offset, u16 length,
-			 struct lstp_ch0_read_resp **resp_out, size_t *len_out)
+			 struct lstp_ch0_read_resp **resp_out, size_t *len_out, int *lstp_status)
 {
 	struct lstp_channel *ch0;
 	struct lstp_channel_priv *priv;
@@ -320,8 +327,11 @@ int lstp_ch0_read_config(struct lstp_channel *ch, u16 offset, u16 length,
 	u16 max_config_len, config_len;
 	struct lstp_ch0_read_req req;
 	struct lstp_ch0_read_resp *resp __free(kfree) = NULL;
+	int request_status = LSTP_NO_RESPONSE_STATUS;
 	int ret;
 
+	if (lstp_status)
+		*lstp_status = LSTP_NO_RESPONSE_STATUS;
 	if (!ch)
 		return -ENODEV;
 	priv = to_lstp_priv(ch);
@@ -351,9 +361,8 @@ int lstp_ch0_read_config(struct lstp_channel *ch, u16 offset, u16 length,
 	};
 
 	ret = lstp_request(ch0, LSTP_CH0_CMD_READ_CONFIG, &req, sizeof(req), resp, max_payload_len,
-			   &actual);
-	if (ret == lstp_status_to_errno(LSTP_ERROR) && offset == 0 &&
-	    length == LSTP_READ_CONFIG_MAX) {
+			   &actual, &request_status);
+	if (request_status == LSTP_ERROR && offset == 0 && length == LSTP_READ_CONFIG_MAX) {
 		/*
 		 * TODO: Legacy support - remove this at some point
 		 * Fallback for old firmware that rejects an explicit
@@ -365,8 +374,10 @@ int lstp_ch0_read_config(struct lstp_channel *ch, u16 offset, u16 length,
 				     __func__, ch->ch_id);
 		req.length = cpu_to_le16(DEPRECATED_LSTP_READ_CONFIG_MAX);
 		ret = lstp_request(ch0, LSTP_CH0_CMD_READ_CONFIG, &req, sizeof(req), resp,
-				   max_payload_len, &actual);
+				   max_payload_len, &actual, &request_status);
 	}
+	if (lstp_status)
+		*lstp_status = request_status;
 	if (ret) {
 		dev_dbg(ch->dev, "%s: ch_%d: READ_CONFIG failed (%pe)\n", __func__, ch->ch_id,
 			ERR_PTR(ret));
@@ -433,7 +444,7 @@ int lstp_read_config_table(struct lstp_channel *ch, size_t config_head_size,
 		if (check_mul_overflow(n_entries, config_entry_size, &length))
 			return -EINVAL;
 
-		ret = lstp_ch0_read_config(ch, offset, length, &resp, &resp_len);
+		ret = lstp_ch0_read_config(ch, offset, length, &resp, &resp_len, NULL);
 		if (ret) {
 			dev_err(ch->dev,
 				"%s: ch_%d: config chunk %u (entries %u-%u) failed (%pe)\n",
@@ -486,7 +497,7 @@ static int lstp_ch0_read_desc(struct lstp_channel *ch, struct lstp_ch_desc *desc
 
 	/* Fixed read: firmware may append a config trailer; keep only the desc head. */
 	ret = lstp_request(ch0, LSTP_CH0_CMD_READ_CONFIG, &req, sizeof(req), desc, sizeof(*desc),
-			   NULL);
+			   NULL, NULL);
 	if (ret)
 		dev_err(ch->dev, "%s: ch_%d: READ_CONFIG failed (%pe)\n", __func__, ch->ch_id,
 			ERR_PTR(ret));
@@ -541,7 +552,7 @@ static int __lstp_ch0_write_config(struct lstp_channel *ch, u16 offset,
 	if (config_len)
 		memcpy(req->ch_config, config, config_len);
 
-	ret = lstp_request(ch0, LSTP_CH0_CMD_WRITE_CONFIG, req, req_len, NULL, 0, NULL);
+	ret = lstp_request(ch0, LSTP_CH0_CMD_WRITE_CONFIG, req, req_len, NULL, 0, NULL, NULL);
 	if (ret)
 		dev_warn_ratelimited(ch->dev,
 				     "%s: ch_%d: WRITE_CONFIG failed (%pe). Config locked?\n",
@@ -1121,7 +1132,7 @@ static int lstp_ch0_init(struct lstp_usb *dev)
 	if (!priv0->resp_buf)
 		return -ENOMEM;
 
-	ret = lstp_ch0_read_config(ch0, 0, LSTP_READ_CONFIG_MAX, &resp, &actual);
+	ret = lstp_ch0_read_config(ch0, 0, LSTP_READ_CONFIG_MAX, &resp, &actual, NULL);
 	if (ret)
 		return ret;
 
@@ -1237,7 +1248,7 @@ static int lstp_init_subsys_channel(struct lstp_usb *dev, u8 ch_id)
 		return -ENOMEM;
 	priv = to_lstp_priv(ch);
 
-	ret = lstp_ch0_read_config(ch, 0, LSTP_READ_CONFIG_MAX, &resp, &resp_len);
+	ret = lstp_ch0_read_config(ch, 0, LSTP_READ_CONFIG_MAX, &resp, &resp_len, NULL);
 	if (ret)
 		return ret;
 
@@ -2068,6 +2079,9 @@ void deprecated_lstp_channel_publish_child_dev(struct lstp_channel *ch, struct d
  * @resp_cap: Capacity of @resp in bytes. See lstp_request() for the
  *            strict / variable mode semantics.
  * @resp_len: Strict / variable mode selector; see lstp_request().
+ * @lstp_status: Optional out-param for the raw LSTP response status; see
+ *            lstp_request(). Publishes LSTP_SUCCESS only once the exchange is
+ *            fully validated.
  *
  * File-static engine used by lstp_request() / lstp_requestv() after they
  * have taken priv->tx_mutex via guard(lstp_channel)(). Owns
@@ -2092,7 +2106,7 @@ void deprecated_lstp_channel_publish_child_dev(struct lstp_channel *ch, struct d
  *         lstp_validate_resp() or usb_submit_urb().
  */
 static int lstp_request_xfer(struct lstp_channel *ch, u8 cmd, u16 req_len, void *resp,
-			     size_t resp_cap, size_t *resp_len)
+			     size_t resp_cap, size_t *resp_len, int *lstp_status)
 {
 	struct lstp_channel_priv *priv = to_lstp_priv(ch);
 	struct lstp_packet *tx_pkt = (struct lstp_packet *)priv->tx_buf;
@@ -2168,7 +2182,7 @@ static int lstp_request_xfer(struct lstp_channel *ch, u8 cmd, u16 req_len, void 
 		goto out_release;
 	}
 
-	ret = lstp_validate_resp(priv->usb, rx_pkt, wire_min);
+	ret = lstp_validate_resp(priv->usb, rx_pkt, wire_min, lstp_status);
 	if (ret)
 		goto out_release;
 
@@ -2193,6 +2207,10 @@ static int lstp_request_xfer(struct lstp_channel *ch, u8 cmd, u16 req_len, void 
 
 	if (resp && to_copy)
 		memcpy(resp, rx_pkt->payload, to_copy);
+
+	/* Publish success only once the whole exchange is validated. */
+	if (lstp_status)
+		*lstp_status = LSTP_SUCCESS;
 
 out_release:
 	clear_bit(LSTP_BUFFER_LOCK_BIT, &priv->resp_buffer_lock);
@@ -2227,6 +2245,12 @@ out_release:
  *              the call fails with -EMSGSIZE; otherwise the reported
  *              length is written to *@resp_len and that many bytes are
  *              copied into @resp
+ * @lstp_status: Optional out-param for the raw LSTP response status.
+ *            Set to the device status when the exchange succeeds
+ *            (LSTP_SUCCESS) or when the returned errno is derived from that
+ *            status. Set to LSTP_NO_RESPONSE_STATUS when the result is not
+ *            associated with a response status, such as transport errors or
+ *            payload/length validation failures. Unmodified if NULL.
  *
  * Issues one atomic LSTP request/response exchange. Channel locking and
  * RX-buffer release are internal; the caller only owns @req and @resp.
@@ -2248,14 +2272,14 @@ out_release:
  *         underlying USB I/O.
  */
 int lstp_request(struct lstp_channel *ch, u8 cmd, const void *req, size_t req_len, void *resp,
-		 size_t resp_cap, size_t *resp_len)
+		 size_t resp_cap, size_t *resp_len, int *lstp_status)
 {
 	return lstp_requestv(ch, cmd,
 			     &(const struct kvec){
 				     .iov_base = (void *)req,
 				     .iov_len = req_len,
 			     },
-			     1, resp, resp_cap, resp_len);
+			     1, resp, resp_cap, resp_len, lstp_status);
 }
 
 /**
@@ -2270,6 +2294,7 @@ int lstp_request(struct lstp_channel *ch, u8 cmd, const void *req, size_t req_le
  * @resp:     see lstp_request()
  * @resp_cap: see lstp_request()
  * @resp_len: see lstp_request()
+ * @lstp_status: see lstp_request()
  *
  * Identical to lstp_request() except that the request payload is the
  * concatenation of @vecs[0..@nvecs-1] rather than a single buffer.
@@ -2285,20 +2310,24 @@ int lstp_request(struct lstp_channel *ch, u8 cmd, const void *req, size_t req_le
  *	};
  *
  *	ret = lstp_requestv(ch, cmd, vecs, ARRAY_SIZE(vecs),
- *				   NULL, 0, NULL);
+ *			    NULL, 0, NULL, NULL);
  *
  * Context: Process context. May sleep.
  *
  * Return: see lstp_request().
  */
 int lstp_requestv(struct lstp_channel *ch, u8 cmd, const struct kvec *vecs, size_t nvecs,
-		  void *resp, size_t resp_cap, size_t *resp_len)
+		  void *resp, size_t resp_cap, size_t *resp_len, int *lstp_status)
 {
 	struct lstp_channel_priv *priv;
 	struct lstp_packet *tx_pkt;
 	size_t req_total = 0;
 	size_t off = 0;
 	size_t i;
+
+	/* Fail-safe default: only the xfer/validation publish a real status. */
+	if (lstp_status)
+		*lstp_status = LSTP_NO_RESPONSE_STATUS;
 
 	if (!ch)
 		return -ENODEV;
@@ -2333,7 +2362,7 @@ int lstp_requestv(struct lstp_channel *ch, u8 cmd, const struct kvec *vecs, size
 		}
 	}
 
-	return lstp_request_xfer(ch, cmd, (u16)req_total, resp, resp_cap, resp_len);
+	return lstp_request_xfer(ch, cmd, (u16)req_total, resp, resp_cap, resp_len, lstp_status);
 }
 
 /*******************************************************************************

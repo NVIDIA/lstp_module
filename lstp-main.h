@@ -79,6 +79,13 @@ enum lstp_status {
 	LSTP_TOO_LARGE = 0x07,
 };
 
+/*
+ * lstp_status out-param sentinel: the request result is not associated
+ * with an LSTP response status byte (transport/local error, or no response).
+ * Distinct from any valid status (0x00..0x7f from GET_BIT_0_6()).
+ */
+#define LSTP_NO_RESPONSE_STATUS (-1)
+
 struct lstp_ch0_read_req {
 	u8 ch_id;
 	__le16 offset;
@@ -306,17 +313,17 @@ bool lstp_channel_disconnected(const struct lstp_channel *ch);
 int lstp_send(struct lstp_channel *ch, u8 cmd, const void *payload, size_t len);
 
 int lstp_request(struct lstp_channel *ch, u8 cmd, const void *req, size_t req_len, void *resp,
-		 size_t resp_cap, size_t *resp_len);
+		 size_t resp_cap, size_t *resp_len, int *lstp_status);
 
 int lstp_requestv(struct lstp_channel *ch, u8 cmd, const struct kvec *vecs, size_t nvecs,
-		  void *resp, size_t resp_cap, size_t *resp_len);
+		  void *resp, size_t resp_cap, size_t *resp_len, int *lstp_status);
 
 /* Unsolicited-request response (atomic context, called from irq_callback) */
 void lstp_send_irq_resp(struct lstp_channel *ch, u8 status);
 
 /* ch0 READ_CONFIG helpers (lstp_request-based) */
 int lstp_ch0_read_config(struct lstp_channel *ch, u16 offset, u16 length,
-			 struct lstp_ch0_read_resp **resp_out, size_t *len_out);
+			 struct lstp_ch0_read_resp **resp_out, size_t *len_out, int *lstp_status);
 
 typedef int (*lstp_config_entry_fn)(struct lstp_channel *ch, unsigned int entry_idx,
 				    const void *entry, void *entry_ctx);
@@ -326,7 +333,5 @@ int lstp_read_config_table(struct lstp_channel *ch, size_t config_head_size,
 
 /* Subsystem-side device pin (compat scaffolding; see definition) */
 void deprecated_lstp_channel_publish_child_dev(struct lstp_channel *ch, struct device *child_dev);
-
-int lstp_status_to_errno(u8 status);
 
 #endif
