@@ -265,15 +265,16 @@ static int lstp_uart_send_with_retry(struct lstp_uart_ctx *ctx, u8 cmd, const vo
 				     size_t len)
 {
 	struct lstp_channel *ch = ctx->ch;
-	const int nack = lstp_status_to_errno(LSTP_NACK);
-	int ret = nack;
+	int lstp_status = LSTP_NACK;
+	int ret = 0;
 	int attempt;
 
-	for (attempt = 0; ret == nack && attempt < LSTP_UART_NAK_MAX_RETRIES; attempt++) {
+	for (attempt = 0; lstp_status == LSTP_NACK && attempt < LSTP_UART_NAK_MAX_RETRIES;
+	     attempt++) {
 		if (attempt)
 			fsleep(LSTP_UART_NAK_RETRY_DELAY_MS * USEC_PER_MSEC);
 
-		ret = lstp_request(ch, cmd, payload, len, NULL, 0, NULL);
+		ret = lstp_request(ch, cmd, payload, len, NULL, 0, NULL, &lstp_status);
 	}
 
 	if (ret)

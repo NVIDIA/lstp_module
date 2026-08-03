@@ -142,7 +142,7 @@ static ssize_t lstp_mmio_read(struct file *file, char __user *buf, size_t count,
 			.length = cpu_to_le16(0),
 		};
 
-		ret = lstp_request(ch, LSTP_MMIO_CMD_READ, &req, sizeof(req), NULL, 0, NULL);
+		ret = lstp_request(ch, LSTP_MMIO_CMD_READ, &req, sizeof(req), NULL, 0, NULL, NULL);
 		goto out_unlock;
 	}
 
@@ -160,7 +160,7 @@ static ssize_t lstp_mmio_read(struct file *file, char __user *buf, size_t count,
 		};
 
 		ret = lstp_request(ch, LSTP_MMIO_CMD_READ, &req, sizeof(req), ctx->xfer_buf, chunk,
-				   NULL);
+				   NULL, NULL);
 		if (ret) {
 			ret = done ?: ret;
 			goto out;
@@ -213,7 +213,7 @@ static ssize_t lstp_mmio_write(struct file *file, const char __user *buf, size_t
 	if (!count) {
 		req->offset = cpu_to_le32((u32)caller_offset);
 
-		ret = lstp_request(ch, LSTP_MMIO_CMD_WRITE, req, sizeof(*req), NULL, 0, NULL);
+		ret = lstp_request(ch, LSTP_MMIO_CMD_WRITE, req, sizeof(*req), NULL, 0, NULL, NULL);
 		goto out_unlock;
 	}
 
@@ -233,7 +233,7 @@ static ssize_t lstp_mmio_write(struct file *file, const char __user *buf, size_t
 		req->offset = cpu_to_le32((u32)(caller_offset + done));
 
 		ret = lstp_request(ch, LSTP_MMIO_CMD_WRITE, req, struct_size(req, data, chunk),
-				   NULL, 0, NULL);
+				   NULL, 0, NULL, NULL);
 		if (ret) {
 			ret = done ?: ret;
 			goto out;

@@ -37,6 +37,19 @@ properties:
       Common values: 100000 (standard), 400000 (fast).
     default: 100000
 
+  retries:
+    description: |
+      Number of times the I2C core re-issues a transfer that fails with
+      -EAGAIN (arbitration loss or bus busy) before giving up.
+
+      Ignored (forced to 0) when the channel config reports a non-zero
+      bus_arbitration_retries value.  Such a device performs its own bus
+      retries, covering both arbitration loss and bus-busy, before returning
+      failure to the host, so no host-side retries are added on top.
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 255
+    default: 3
+
 patternProperties:
   "^[a-zA-Z][a-zA-Z0-9,-]*@[0-9a-f]+$":
     type: object
@@ -68,6 +81,7 @@ examples:
         reg = <2>;
         #address-cells = <1>;
         #size-cells = <0>;
+        retries = <5>;
 
         sensor@48 {
             compatible = "ti,tmp102";
