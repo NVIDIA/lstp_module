@@ -1,0 +1,319 @@
+diff --git a/Documentation/driver-api/usb/index.rst b/Documentation/driver-api/usb/index.rst
+index a32819963..5a0bbeacb 100644
+--- a/Documentation/driver-api/usb/index.rst
++++ b/Documentation/driver-api/usb/index.rst
+@@ -22,3 +22,4 @@ Linux USB API
+    typec
+    typec_bus
+    usb3-debug-port
++   lstp
+diff --git a/Documentation/firmware-guide/acpi/index.rst b/Documentation/firmware-guide/acpi/index.rst
+index db9eb7229..f82759d02 100644
+--- a/Documentation/firmware-guide/acpi/index.rst
++++ b/Documentation/firmware-guide/acpi/index.rst
+@@ -30,3 +30,4 @@ ACPI Support
+    extcon-intel-int3496
+    intel-pmc-mux
+    chromeos-acpi-device
++   lstp
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 72294ddfa..1e21213ba 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -19552,6 +19552,27 @@ L:	linux-acpi@vger.kernel.org
+ S:	Maintained
+ F:	drivers/acpi/apei/ghes-nvidia.c
+ 
++NVIDIA LSTP USB ADAPTER DRIVERS
++M:	Adrian Ambrozewicz <aambrozewicz@nvidia.com>
++M:	Donald Shannon <donalds@nvidia.com>
++L:	linux-usb@vger.kernel.org
++S:	Supported
++F:	Documentation/ABI/testing/sysfs-bus-usb-devices-lstp
++F:	Documentation/devicetree/bindings/gpio/nvidia,lstp-gpio.yaml
++F:	Documentation/devicetree/bindings/i2c/nvidia,lstp-i2c.yaml
++F:	Documentation/devicetree/bindings/spi/nvidia,lstp-spi.yaml
++F:	Documentation/devicetree/bindings/usb/nvidia,lstp.yaml
++F:	Documentation/driver-api/usb/lstp.rst
++F:	Documentation/firmware-guide/acpi/lstp.rst
++F:	drivers/char/ipmi/ipmi-lstp.c
++F:	drivers/gpio/gpio-lstp.c
++F:	drivers/i2c/busses/i2c-lstp.c
++F:	drivers/leds/leds-lstp.c
++F:	drivers/spi/spi-lstp.c
++F:	drivers/tty/lstp_tty.c
++F:	drivers/usb/misc/lstp.c
++F:	include/linux/usb/lstp.h
++
+ NVIDIA VRS RTC DRIVER
+ M:	Shubhi Garg <shgarg@nvidia.com>
+ L:	linux-tegra@vger.kernel.org
+diff --git a/drivers/char/ipmi/Kconfig b/drivers/char/ipmi/Kconfig
+index 538a7d3c6..eb51a2d56 100644
+--- a/drivers/char/ipmi/Kconfig
++++ b/drivers/char/ipmi/Kconfig
+@@ -119,6 +119,38 @@ config IPMI_POWEROFF
+ 
+ endif # IPMI_HANDLER
+ 
++config LSTP_IPMI_BMC
++	tristate "NVIDIA LSTP IPMI BMC support"
++	depends on USB_LSTP
++	default USB_LSTP
++	help
++	  Say Y or M here to support the IPMI channels of NVIDIA LSTP USB
++	  adapters on a BMC. Each channel is exposed as an ipmi-lstp<n>
++	  character device through which BMC userspace receives requests
++	  from the host and sends the responses back.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called ipmi-lstp.
++
++config USB_LSTP_IPMI_MSG_NUM
++	bool "Message-number header on LSTP IPMI nodes"
++	depends on LSTP_IPMI_BMC
++	default y
++	help
++	  Messages read from and written to an LSTP IPMI device node carry a
++	  one-byte message number between the length and the payload, and a
++	  response must echo the number of the request it answers. The number
++	  exists only on the device node, not in the LSTP protocol, and no
++	  other BMC-side IPMI driver has it.
++
++	  Disable this option to drop it. The node then uses the layout of
++	  struct ipmi_ssif_msg from the ssif_bmc driver, a length followed by
++	  the payload, so that userspace written for ssif_bmc works unchanged.
++	  A response answers the request read last, and is dropped once a newer
++	  request has arrived.
++
++	  Say Y if userspace parses the message number.
++
+ config IPMI_KCS_BMC
+ 	tristate
+ 
+diff --git a/drivers/char/ipmi/Makefile b/drivers/char/ipmi/Makefile
+index 4ea450a82..2e320ce2c 100644
+--- a/drivers/char/ipmi/Makefile
++++ b/drivers/char/ipmi/Makefile
+@@ -29,3 +29,4 @@ obj-$(CONFIG_ASPEED_KCS_IPMI_BMC) += kcs_bmc_aspeed.o
+ obj-$(CONFIG_NPCM7XX_KCS_IPMI_BMC) += kcs_bmc_npcm7xx.o
+ obj-$(CONFIG_IPMB_DEVICE_INTERFACE) += ipmb_dev_int.o
+ obj-$(CONFIG_SSIF_IPMI_BMC) += ssif_bmc.o
++obj-$(CONFIG_LSTP_IPMI_BMC) += ipmi-lstp.o
+diff --git a/drivers/gpio/Kconfig b/drivers/gpio/Kconfig
+index a48586bb8..7ef6a9031 100644
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -2051,6 +2051,20 @@ config GPIO_USBIO
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called gpio_usbio.
+ 
++config GPIO_LSTP
++	tristate "NVIDIA LSTP GPIO support"
++	depends on USB_LSTP
++	default USB_LSTP
++	select GPIOLIB_IRQCHIP
++	help
++	  Say Y or M here to support the GPIO channels of NVIDIA LSTP USB
++	  adapters. Each channel is registered as a GPIO chip, together
++	  with an interrupt controller for its pins. Pins the firmware
++	  reports as LEDs are left to the LEDS_LSTP driver.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called gpio-lstp.
++
+ endmenu
+ 
+ menu "Virtual GPIO drivers"
+diff --git a/drivers/gpio/Makefile b/drivers/gpio/Makefile
+index dc9e6d643..acd0cfae2 100644
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -101,6 +101,7 @@ obj-$(CONFIG_GPIO_LP873X)		+= gpio-lp873x.o
+ obj-$(CONFIG_GPIO_LP87565)		+= gpio-lp87565.o
+ obj-$(CONFIG_GPIO_LPC18XX)		+= gpio-lpc18xx.o
+ obj-$(CONFIG_GPIO_LPC32XX)		+= gpio-lpc32xx.o
++obj-$(CONFIG_GPIO_LSTP)			+= gpio-lstp.o
+ obj-$(CONFIG_GPIO_LTC4283)		+= gpio-ltc4283.o
+ obj-$(CONFIG_GPIO_MACSMC)		+= gpio-macsmc.o
+ obj-$(CONFIG_GPIO_MADERA)		+= gpio-madera.o
+diff --git a/drivers/i2c/busses/Kconfig b/drivers/i2c/busses/Kconfig
+index d7b895083..9e3b21f18 100644
+--- a/drivers/i2c/busses/Kconfig
++++ b/drivers/i2c/busses/Kconfig
+@@ -1387,6 +1387,19 @@ config I2C_USBIO
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called i2c_usbio.
+ 
++config I2C_LSTP
++	tristate "NVIDIA LSTP I2C support"
++	depends on USB_LSTP
++	default USB_LSTP
++	help
++	  Say Y or M here to support the I2C channels of NVIDIA LSTP USB
++	  adapters. Each channel is registered as an I2C adapter, and the
++	  devices behind it can be described by device tree, ACPI or
++	  instantiated from userspace.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called i2c-lstp.
++
+ config I2C_CP2615
+ 	tristate "Silicon Labs CP2615 USB sound card and I2C adapter"
+ 	depends on USB
+diff --git a/drivers/i2c/busses/Makefile b/drivers/i2c/busses/Makefile
+index 3755c54b3..5970b0bb1 100644
+--- a/drivers/i2c/busses/Makefile
++++ b/drivers/i2c/busses/Makefile
+@@ -138,6 +138,7 @@ obj-$(CONFIG_I2C_DLN2)		+= i2c-dln2.o
+ obj-$(CONFIG_I2C_LJCA)		+= i2c-ljca.o
+ obj-$(CONFIG_I2C_NCT6694)	+= i2c-nct6694.o
+ obj-$(CONFIG_I2C_USBIO)		+= i2c-usbio.o
++obj-$(CONFIG_I2C_LSTP)		+= i2c-lstp.o
+ obj-$(CONFIG_I2C_CP2615) += i2c-cp2615.o
+ obj-$(CONFIG_I2C_PARPORT)	+= i2c-parport.o
+ obj-$(CONFIG_I2C_PCI1XXXX)	+= i2c-mchp-pci1xxxx.o
+diff --git a/drivers/leds/Kconfig b/drivers/leds/Kconfig
+index d0d318223..dda329222 100644
+--- a/drivers/leds/Kconfig
++++ b/drivers/leds/Kconfig
+@@ -1050,6 +1050,20 @@ source "drivers/leds/flash/Kconfig"
+ comment "RGB LED drivers"
+ source "drivers/leds/rgb/Kconfig"
+ 
++config LEDS_LSTP
++	tristate "LED support for NVIDIA LSTP adapters"
++	depends on LEDS_CLASS
++	depends on GPIO_LSTP
++	default GPIO_LSTP
++	help
++	  Say Y or M here to support the LEDs of NVIDIA LSTP USB adapters,
++	  the pins of the adapter's GPIO channels that the firmware reports
++	  as LEDs. They are registered with the LED class, with blink and
++	  pattern requests handed to the adapter.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called leds-lstp.
++
+ comment "LED Triggers"
+ source "drivers/leds/trigger/Kconfig"
+ 
+diff --git a/drivers/leds/Makefile b/drivers/leds/Makefile
+index a68244bd5..115b88c6b 100644
+--- a/drivers/leds/Makefile
++++ b/drivers/leds/Makefile
+@@ -60,6 +60,7 @@ obj-$(CONFIG_LEDS_LP8501)		+= leds-lp8501.o
+ obj-$(CONFIG_LEDS_LP8788)		+= leds-lp8788.o
+ obj-$(CONFIG_LEDS_LP8860)		+= leds-lp8860.o
+ obj-$(CONFIG_LEDS_LP8864)		+= leds-lp8864.o
++obj-$(CONFIG_LEDS_LSTP)			+= leds-lstp.o
+ obj-$(CONFIG_LEDS_LT3593)		+= leds-lt3593.o
+ obj-$(CONFIG_LEDS_LTC3220)		+= leds-ltc3220.o
+ obj-$(CONFIG_LEDS_MAX5970)		+= leds-max5970.o
+diff --git a/drivers/spi/Kconfig b/drivers/spi/Kconfig
+index a0f37e2df..e76abaac8 100644
+--- a/drivers/spi/Kconfig
++++ b/drivers/spi/Kconfig
+@@ -694,6 +694,19 @@ config SPI_LJCA
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called spi-ljca.
+ 
++config SPI_LSTP
++	tristate "NVIDIA LSTP SPI support"
++	depends on USB_LSTP
++	default USB_LSTP
++	help
++	  Say Y or M here to support the SPI channels of NVIDIA LSTP USB
++	  adapters. Each channel is registered as an SPI host controller,
++	  and the devices behind it can be described by device tree, ACPI
++	  or created through spidev.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called spi-lstp.
++
+ config SPI_MA35D1_QSPI
+ 	tristate "Nuvoton MA35D1 QSPI controller"
+ 	depends on ARCH_MA35 || COMPILE_TEST
+diff --git a/drivers/spi/Makefile b/drivers/spi/Makefile
+index a18814fbd..c0b1ea649 100644
+--- a/drivers/spi/Makefile
++++ b/drivers/spi/Makefile
+@@ -86,6 +86,7 @@ obj-$(CONFIG_SPI_LOONGSON_CORE)		+= spi-loongson-core.o
+ obj-$(CONFIG_SPI_LOONGSON_PCI)		+= spi-loongson-pci.o
+ obj-$(CONFIG_SPI_LOONGSON_PLATFORM)	+= spi-loongson-plat.o
+ obj-$(CONFIG_SPI_LP8841_RTC)		+= spi-lp8841-rtc.o
++obj-$(CONFIG_SPI_LSTP)			+= spi-lstp.o
+ obj-$(CONFIG_SPI_MA35D1_QSPI)		+= spi-ma35d1-qspi.o
+ obj-$(CONFIG_SPI_MESON_SPICC)		+= spi-meson-spicc.o
+ obj-$(CONFIG_SPI_MESON_SPIFC)		+= spi-meson-spifc.o
+diff --git a/drivers/tty/Kconfig b/drivers/tty/Kconfig
+index 5d6b0dd4d..34a86259b 100644
+--- a/drivers/tty/Kconfig
++++ b/drivers/tty/Kconfig
+@@ -406,6 +406,19 @@ config RPMSG_TTY
+ 	  To compile this driver as a module, choose M here: the module will be
+ 	  called rpmsg_tty.
+ 
++config LSTP_TTY
++	tristate "NVIDIA LSTP UART support"
++	depends on USB_LSTP
++	default USB_LSTP
++	help
++	  Say Y or M here to support the UART channels of NVIDIA LSTP USB
++	  adapters. Each channel is registered as a tty device named
++	  ttyLSTP<n>, so the usual serial tools and line disciplines work
++	  on top of it.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called lstp_tty.
++
+ endif # TTY
+ 
+ source "drivers/tty/serdev/Kconfig"
+diff --git a/drivers/tty/Makefile b/drivers/tty/Makefile
+index c6a063a54..c352adda5 100644
+--- a/drivers/tty/Makefile
++++ b/drivers/tty/Makefile
+@@ -26,3 +26,4 @@ obj-$(CONFIG_GOLDFISH_TTY)	+= goldfish.o
+ obj-$(CONFIG_MIPS_EJTAG_FDC_TTY) += mips_ejtag_fdc.o
+ obj-$(CONFIG_VCC)		+= vcc.o
+ obj-$(CONFIG_RPMSG_TTY)		+= rpmsg_tty.o
++obj-$(CONFIG_LSTP_TTY)		+= lstp_tty.o
+diff --git a/drivers/usb/misc/Kconfig b/drivers/usb/misc/Kconfig
+index 91b62acb5..9cfb43b2a 100644
+--- a/drivers/usb/misc/Kconfig
++++ b/drivers/usb/misc/Kconfig
+@@ -194,6 +194,21 @@ config USB_USBIO
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called usbio.
+ 
++config USB_LSTP
++	tristate "NVIDIA LSTP USB adapter support"
++	depends on USB
++	select AUXILIARY_BUS
++	help
++	  Say Y here to support NVIDIA LSTP (Low-Speed Transport Protocol)
++	  USB adapters. An LSTP adapter exposes firmware-configured I2C,
++	  SPI, GPIO, UART and IPMI channels over a single USB interface.
++	  This core driver discovers the channels and offers each one as an
++	  auxiliary device; enable GPIO_LSTP, LEDS_LSTP, I2C_LSTP, SPI_LSTP,
++	  LSTP_TTY and LSTP_IPMI_BMC for the channel types you need.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called lstp.
++
+ source "drivers/usb/misc/sisusbvga/Kconfig"
+ 
+ config USB_LD
+diff --git a/drivers/usb/misc/Makefile b/drivers/usb/misc/Makefile
+index 494ab0377..5133075e5 100644
+--- a/drivers/usb/misc/Makefile
++++ b/drivers/usb/misc/Makefile
+@@ -13,6 +13,7 @@ obj-$(CONFIG_USB_EZUSB_FX2)		+= ezusb.o
+ obj-$(CONFIG_APPLE_MFI_FASTCHARGE)	+= apple-mfi-fastcharge.o
+ obj-$(CONFIG_USB_LJCA)			+= usb-ljca.o
+ obj-$(CONFIG_USB_USBIO)			+= usbio.o
++obj-$(CONFIG_USB_LSTP)			+= lstp.o
+ obj-$(CONFIG_USB_IDMOUSE)		+= idmouse.o
+ obj-$(CONFIG_USB_IOWARRIOR)		+= iowarrior.o
+ obj-$(CONFIG_USB_ISIGHTFW)		+= isight_firmware.o

@@ -1,0 +1,60 @@
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 1e21213ba..c26b1e9bd 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -19564,6 +19564,7 @@ F:	Documentation/devicetree/bindings/usb/nvidia,lstp.yaml
+ F:	Documentation/driver-api/usb/lstp.rst
+ F:	Documentation/firmware-guide/acpi/lstp.rst
+ F:	drivers/char/ipmi/ipmi-lstp.c
++F:	drivers/char/ipmi/lstp-ipmi-postcodes.h
+ F:	drivers/gpio/gpio-lstp.c
+ F:	drivers/i2c/busses/i2c-lstp.c
+ F:	drivers/leds/leds-lstp.c
+diff --git a/drivers/char/ipmi/Kconfig b/drivers/char/ipmi/Kconfig
+index eb51a2d56..d19a4fb12 100644
+--- a/drivers/char/ipmi/Kconfig
++++ b/drivers/char/ipmi/Kconfig
+@@ -132,6 +132,17 @@ config LSTP_IPMI_BMC
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called ipmi-lstp.
+ 
++config SEPARATE_LSTP_IPMI_POSTCODES
++	bool "Separate LSTP IPMI post code writes to separate miscdevice"
++	depends on LSTP_IPMI_BMC
++	help
++	  Enable this option to route IPMI post code writes to a separate
++	  miscdevice instead of the main IPMI message path. Since POST codes
++	  do not require a response, this allows faster processing by
++	  bypassing the standard IPMI request-response handling.
++
++	  If unsure, say N.
++
+ config USB_LSTP_IPMI_MSG_NUM
+ 	bool "Message-number header on LSTP IPMI nodes"
+ 	depends on LSTP_IPMI_BMC
+diff --git a/drivers/usb/misc/Kconfig b/drivers/usb/misc/Kconfig
+index 9cfb43b2a..c661d42ca 100644
+--- a/drivers/usb/misc/Kconfig
++++ b/drivers/usb/misc/Kconfig
+@@ -209,6 +209,21 @@ config USB_LSTP
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called lstp.
+ 
++config USB_LSTP_SPI_SPIDEV
++	bool "Auto-create spidev devices for LSTP SPI channels"
++	depends on USB_LSTP
++	depends on SPI_SPIDEV
++	help
++	  Make the lstp module default to creating spidev child devices for
++	  SPI channels that do not have firmware-described child devices.
++	  spidev binds to them by itself only where its ID table lists
++	  "spidev"; otherwise bind it with driver_override.
++
++	  This only sets the compile-time default for the auto_bind_spidev
++	  module parameter, which can still be overridden at load time.
++
++	  If unsure, say N.
++
+ source "drivers/usb/misc/sisusbvga/Kconfig"
+ 
+ config USB_LD

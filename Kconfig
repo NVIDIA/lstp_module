@@ -8,14 +8,16 @@ config USB_LSTP
 	depends on GPIOLIB
 	depends on LEDS_CLASS
 	depends on TTY
+	select AUXILIARY_BUS
 	select GPIOLIB_IRQCHIP
 	help
 	  This adds support for the Low-Speed Transport Protocol (LSTP)
 	  USB adapter. The LSTP adapter exposes firmware-configured I2C, SPI,
 	  GPIO, UART, IPMI, and MMIO channels over a single USB interface.
 
-	  This driver can also be built as a module. If so, the module will be
-	  called lstp.
+	  This driver can also be built as modules: the core, called lstp,
+	  and one module per subsystem driver, called gpio-lstp, leds-lstp,
+	  i2c-lstp, spi-lstp, lstp_tty, ipmi-lstp and lstp-mmio.
 
 	  If unsure, say N.
 
@@ -26,10 +28,13 @@ config USB_LSTP_SPI_SPIDEV
 	help
 	  Enable this option to make the lstp module default to creating spidev
 	  child devices for SPI channels that do not have firmware-described
-	  child devices.
+	  child devices. spidev binds to them by itself only where its ID table
+	  lists "spidev"; mainline needs driver_override.
 
 	  This only sets the compile-time default for the auto_bind_spidev module
 	  parameter. The default can still be overridden at module load time.
+	  The parameter is deprecated on kernels where SPI host controllers have
+	  the new_device attribute.
 
 	  If unsure, say N.
 
@@ -43,3 +48,22 @@ config SEPARATE_LSTP_IPMI_POSTCODES
 	  bypassing the standard IPMI request-response handling.
 
 	  If unsure, say N.
+
+config USB_LSTP_IPMI_MSG_NUM
+	bool "Message-number header on LSTP IPMI nodes"
+	depends on USB_LSTP
+	default y
+	help
+	  Messages read from and written to an LSTP IPMI device node carry a
+	  one-byte message number between the length and the payload, and a
+	  response must echo the number of the request it answers. The number
+	  exists only on the device node, not in the LSTP protocol, and no
+	  other BMC-side IPMI driver has it.
+
+	  Disable this option to drop it. The node then uses the layout of
+	  struct ipmi_ssif_msg from the ssif_bmc driver, a length followed by
+	  the payload, so that userspace written for ssif_bmc works unchanged.
+	  A response answers the request read last, and is dropped once a newer
+	  request has arrived.
+
+	  Say Y if userspace parses the message number.

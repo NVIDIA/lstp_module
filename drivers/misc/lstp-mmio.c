@@ -3,17 +3,10 @@
  * MMIO channel for LSTP USB interface.
  *
  * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
  */
 
+#include <linux/build_bug.h>
+#include <linux/cleanup.h>
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/idr.h>
@@ -22,13 +15,13 @@
 #include <linux/miscdevice.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/overflow.h>
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
-#include <linux/cleanup.h>
 
-#include "lstp-main.h"
+#include <linux/usb/lstp.h>
 
 static DEFINE_IDA(lstp_mmio_ida);
 
@@ -47,19 +40,27 @@ struct lstp_mmio_write_req {
 	u8 data[];
 } __packed;
 
+/* One per bind; the bind and each open fd hold @ref. */
 struct lstp_mmio_ctx {
-	struct kref kref;
-	struct lstp_channel *ch;
+	struct kref ref;
+	struct lstp_channel *ch; /* pinned for the life of @ctx */
 	struct miscdevice miscdev;
 	int ida_id;
-	struct mutex lock; /* Protects stopped and ch use for open fds */
+	/* held across the gone test and the device I/O; teardown waits on it once @stopped is up */
+	struct mutex lock;
 	u8 *xfer_buf;
 	bool stopped;
 };
 
-static void lstp_mmio_ctx_release(struct kref *kref)
+/*
+ * The ida id, and the /dev/lstp_mmio_<n> name built from it, stay taken until the last of
+ * the unbind and the last close, so a rebind with an fd still open comes back under another
+ * number. Partial-init safe: a failed lstp_mmio_init() unwinds through it as well.
+ */
+static void lstp_mmio_ctx_release(struct kref *ref)
 {
-	struct lstp_mmio_ctx *ctx = container_of(kref, struct lstp_mmio_ctx, kref);
+	struct lstp_mmio_ctx *ctx = container_of(ref, struct lstp_mmio_ctx, ref);
+	struct lstp_channel *ch = ctx->ch;
 
 	if (ctx->ida_id >= 0)
 		ida_free(&lstp_mmio_ida, ctx->ida_id);
@@ -67,21 +68,15 @@ static void lstp_mmio_ctx_release(struct kref *kref)
 	mutex_destroy(&ctx->lock);
 	kfree(ctx->xfer_buf);
 	kfree(ctx);
+	lstp_channel_put(ch);
 }
 
-static void lstp_mmio_ctx_get(struct lstp_mmio_ctx *ctx)
+/* Devres action for the bind's reference, booked ahead of lstp_mmio_deregister(). */
+static void lstp_mmio_ctx_put(void *data)
 {
-	kref_get(&ctx->kref);
-}
+	struct lstp_mmio_ctx *ctx = data;
 
-static void lstp_mmio_ctx_put(struct lstp_mmio_ctx *ctx)
-{
-	kref_put(&ctx->kref, lstp_mmio_ctx_release);
-}
-
-static void lstp_mmio_ctx_put_cb(void *data)
-{
-	lstp_mmio_ctx_put(data);
+	kref_put(&ctx->ref, lstp_mmio_ctx_release);
 }
 
 static struct lstp_mmio_ctx *lstp_mmio_file_ctx(struct file *file)
@@ -99,15 +94,26 @@ static int lstp_mmio_validate_range(loff_t caller_offset, size_t count)
 	return 0;
 }
 
+/* @stopped is per bind and never cleared; see Documentation/driver-api/usb/lstp.rst. */
+static bool lstp_mmio_gone(struct lstp_mmio_ctx *ctx)
+{
+	return READ_ONCE(ctx->stopped) || lstp_channel_disconnected(ctx->ch);
+}
+
 static int lstp_mmio_open(struct inode *inode, struct file *file)
 {
 	struct miscdevice *miscdev = file->private_data;
 	struct lstp_mmio_ctx *ctx = container_of(miscdev, struct lstp_mmio_ctx, miscdev);
 
-	if (READ_ONCE(ctx->stopped))
+	if (lstp_mmio_gone(ctx))
 		return -ENODEV;
 
-	lstp_mmio_ctx_get(ctx);
+	/*
+	 * The fd holds @ctx and @ctx its channel pin, so neither dangles past an unbind or a
+	 * disconnect. misc_mtx spans this ->open and misc_deregister(), which the bind's @ref
+	 * outlasts, so this cannot race the final put. I/O is still refused through @stopped.
+	 */
+	kref_get(&ctx->ref);
 	file->private_data = ctx;
 	return 0;
 }
@@ -115,27 +121,26 @@ static int lstp_mmio_open(struct inode *inode, struct file *file)
 static ssize_t lstp_mmio_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
 	struct lstp_mmio_ctx *ctx = lstp_mmio_file_ctx(file);
-	struct lstp_channel *ch;
-	struct lstp_mmio_read_req req;
 	loff_t caller_offset = *ppos;
 	size_t done = 0;
-	ssize_t ret;
+	ssize_t ret = lstp_mmio_validate_range(caller_offset, count);
 
-	ret = lstp_mmio_validate_range(caller_offset, count);
 	if (ret)
 		return ret;
 
 	mutex_lock(&ctx->lock);
-	if (ctx->stopped) {
+	if (lstp_mmio_gone(ctx)) {
 		ret = -ENODEV;
 		goto out_unlock;
 	}
 
-	ch = ctx->ch;
+	struct lstp_channel *ch = ctx->ch;
+	struct lstp_mmio_read_req req;
 
 	/* Probe enforces bulk_rx_size >= LSTP_USB_EP_MIN_SIZE; anchor the fixed request here. */
 	BUILD_BUG_ON(sizeof(struct lstp_header) + sizeof(req) > LSTP_USB_EP_MIN_SIZE);
 
+	/* A length of zero is a valid READ, so a count of zero goes to the device too. */
 	if (!count) {
 		req = (struct lstp_mmio_read_req){
 			.offset = cpu_to_le32((u32)caller_offset),
@@ -148,6 +153,12 @@ static ssize_t lstp_mmio_read(struct file *file, char __user *buf, size_t count,
 
 	while (done < count) {
 		size_t chunk = min3(count - done, ch->max_rx_payload, (size_t)U16_MAX);
+
+		/* Teardown lands while we hold @lock; stop at a chunk edge. */
+		if (lstp_mmio_gone(ctx)) {
+			ret = done ?: -ENODEV;
+			goto out;
+		}
 
 		if (signal_pending(current)) {
 			ret = done ?: -ERESTARTSYS;
@@ -188,28 +199,29 @@ static ssize_t lstp_mmio_write(struct file *file, const char __user *buf, size_t
 			       loff_t *ppos)
 {
 	struct lstp_mmio_ctx *ctx = lstp_mmio_file_ctx(file);
-	struct lstp_mmio_write_req *req;
-	struct lstp_channel *ch;
 	loff_t caller_offset = *ppos;
 	size_t done = 0;
-	ssize_t ret;
+	ssize_t ret = lstp_mmio_validate_range(caller_offset, count);
 
-	ret = lstp_mmio_validate_range(caller_offset, count);
 	if (ret)
 		return ret;
 
 	mutex_lock(&ctx->lock);
-	if (ctx->stopped) {
+	if (lstp_mmio_gone(ctx)) {
 		ret = -ENODEV;
 		goto out_unlock;
 	}
 
-	ch = ctx->ch;
-	req = (struct lstp_mmio_write_req *)ctx->xfer_buf;
+	struct lstp_channel *ch = ctx->ch;
+	struct lstp_mmio_write_req *req = (struct lstp_mmio_write_req *)ctx->xfer_buf;
 
 	/* Probe enforces bulk_tx_size >= LSTP_USB_EP_MIN_SIZE; anchor the fixed request here. */
 	BUILD_BUG_ON(sizeof(struct lstp_header) + sizeof(*req) > LSTP_USB_EP_MIN_SIZE);
 
+	/*
+	 * A request carrying only the offset is a valid zero-length WRITE, so a count of zero
+	 * goes to the device; what it does there is device-specific, not necessarily a no-op.
+	 */
 	if (!count) {
 		req->offset = cpu_to_le32((u32)caller_offset);
 
@@ -219,6 +231,12 @@ static ssize_t lstp_mmio_write(struct file *file, const char __user *buf, size_t
 
 	while (done < count) {
 		size_t chunk = min(count - done, ch->max_tx_payload - sizeof(*req));
+
+		/* Teardown lands while we hold @lock; stop at a chunk edge. */
+		if (lstp_mmio_gone(ctx)) {
+			ret = done ?: -ENODEV;
+			goto out;
+		}
 
 		if (signal_pending(current)) {
 			ret = done ?: -ERESTARTSYS;
@@ -259,7 +277,9 @@ static loff_t lstp_mmio_llseek(struct file *file, loff_t offset, int whence)
 
 static int lstp_mmio_release(struct inode *inode, struct file *file)
 {
-	lstp_mmio_ctx_put(lstp_mmio_file_ctx(file));
+	struct lstp_mmio_ctx *ctx = lstp_mmio_file_ctx(file);
+
+	kref_put(&ctx->ref, lstp_mmio_ctx_release);
 
 	return 0;
 }
@@ -273,68 +293,76 @@ static const struct file_operations lstp_mmio_fops = {
 	.release = lstp_mmio_release,
 };
 
-static int lstp_mmio_init(struct lstp_channel *ch, const struct lstp_channel_init_info *info)
+/* MMIO handles no unsolicited packets, so the context never goes through @ch->priv. */
+static struct lstp_mmio_ctx *lstp_mmio_init(struct lstp_channel *ch)
 {
-	struct lstp_mmio_ctx *ctx;
+	struct lstp_mmio_ctx *ctx = kzalloc_obj(*ctx);
 	int ret;
 
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 
-	kref_init(&ctx->kref);
-	ctx->ch = ch;
+	/*
+	 * Dropping @ref is the only unwind from here, and the release tolerates the partial
+	 * states below because @ida_id starts at -1 and the pointers start NULL.
+	 */
+	kref_init(&ctx->ref);
+	ctx->ch = lstp_channel_get(ch);
 	ctx->ida_id = -1;
 	mutex_init(&ctx->lock);
 
-	ret = devm_add_action_or_reset(ch->dev, lstp_mmio_ctx_put_cb, ctx);
-	if (ret)
-		return ret;
-
 	ctx->xfer_buf = kmalloc(max(min_t(size_t, ch->max_rx_payload, U16_MAX), ch->max_tx_payload),
 				GFP_KERNEL);
-	if (!ctx->xfer_buf)
-		return -ENOMEM;
+	if (!ctx->xfer_buf) {
+		ret = -ENOMEM;
+		goto err_put;
+	}
 
 	ctx->ida_id = ida_alloc(&lstp_mmio_ida, GFP_KERNEL);
-	if (ctx->ida_id < 0)
-		return ctx->ida_id;
+	if (ctx->ida_id < 0) {
+		ret = ctx->ida_id;
+		goto err_put;
+	}
 
 	ctx->miscdev.name = kasprintf(GFP_KERNEL, "lstp_mmio_%d", ctx->ida_id);
-	if (!ctx->miscdev.name)
-		return -ENOMEM;
+	if (!ctx->miscdev.name) {
+		ret = -ENOMEM;
+		goto err_put;
+	}
 
 	ctx->miscdev.minor = MISC_DYNAMIC_MINOR;
 	ctx->miscdev.fops = &lstp_mmio_fops;
 	ctx->miscdev.parent = ch->dev;
 	ctx->miscdev.mode = 0600;
-	ch->priv = ctx;
 
 	dev_dbg(ch->dev, "%s: ch_%d: Initialized as %s\n", __func__, ch->ch_id, ch->display_name);
-	return 0;
+	return ctx;
+
+err_put:
+	kref_put(&ctx->ref, lstp_mmio_ctx_release);
+	return ERR_PTR(ret);
 }
 
 static void lstp_mmio_deregister(void *data)
 {
 	struct lstp_mmio_ctx *ctx = data;
 
-	scoped_guard(mutex, &ctx->lock)
-		WRITE_ONCE(ctx->stopped, true);
+	/*
+	 * Flag before mutex, or the devres unwind would wait out a transfer's whole chunk loop,
+	 * one USB round trip per chunk for a length userspace chose. The loop bails at its next
+	 * chunk and the empty lock section waits only for that, so no transfer is cut mid-chunk.
+	 */
+	WRITE_ONCE(ctx->stopped, true);
+	scoped_guard(mutex, &ctx->lock) {
+	}
 
 	misc_deregister(&ctx->miscdev);
 }
 
-static int lstp_mmio_start(struct lstp_channel *ch)
+static int lstp_mmio_start(struct lstp_channel *ch, struct lstp_mmio_ctx *ctx)
 {
-	struct lstp_mmio_ctx *ctx = ch->priv;
-	int ret;
+	int ret = misc_register(&ctx->miscdev);
 
-	if (!ctx) {
-		dev_err(ch->dev, "%s: ch_%d: MMIO context not initialized\n", __func__, ch->ch_id);
-		return -EINVAL;
-	}
-
-	ret = misc_register(&ctx->miscdev);
 	if (ret) {
 		dev_err(ch->dev, "%s: ch_%d: Could not register miscdevice (%pe)\n", __func__,
 			ch->ch_id, ERR_PTR(ret));
@@ -345,12 +373,44 @@ static int lstp_mmio_start(struct lstp_channel *ch)
 	if (ret)
 		return ret;
 
-	deprecated_lstp_channel_publish_child_dev(ch, ctx->miscdev.this_device);
-
 	dev_info(ch->dev, "%s: ch_%d: Started as %s\n", __func__, ch->ch_id, ch->display_name);
 	return 0;
 }
 
-/* clang-format off */
-LSTP_SUBSYS(mmio, LSTP_CHANNEL_TYPE_MMIO, lstp_mmio_init, lstp_mmio_start);
-/* clang-format on */
+/* The context reference is booked before the miscdev's action, so it drops after the node. */
+static int lstp_mmio_probe(struct auxiliary_device *auxdev, const struct auxiliary_device_id *id)
+{
+	struct lstp_channel *ch = lstp_channel_from_auxdev(auxdev);
+	const struct lstp_channel_init_info *info = dev_get_platdata(&auxdev->dev);
+
+	if (!info)
+		return -ENODEV;
+
+	struct lstp_mmio_ctx *ctx = lstp_mmio_init(ch);
+
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
+
+	int ret = devm_add_action_or_reset(ch->dev, lstp_mmio_ctx_put, ctx);
+
+	if (ret)
+		return ret;
+
+	return lstp_mmio_start(ch, ctx);
+}
+
+static const struct auxiliary_device_id lstp_mmio_id_table[] = { { .name = "lstp.mmio" }, {} };
+MODULE_DEVICE_TABLE(auxiliary, lstp_mmio_id_table);
+
+static struct lstp_auxiliary_driver lstp_mmio_drv = {
+	.adrv = {
+		.name = "mmio",
+		.probe = lstp_mmio_probe,
+		.id_table = lstp_mmio_id_table,
+	},
+};
+module_lstp_auxiliary_driver(lstp_mmio_drv);
+
+MODULE_IMPORT_NS("LSTP");
+MODULE_DESCRIPTION("LSTP MMIO driver");
+MODULE_LICENSE("GPL");

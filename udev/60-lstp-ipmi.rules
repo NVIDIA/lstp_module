@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Example: a stable name for one LSTP IPMI channel. The driver names IPMI
+# nodes ipmi-lstp<n> in probe order; this rule adds /dev/ipmi-stable-symlink
+# for channel 4 of the adapter in USB port path
+# platform-xhci-hcd.0-usb-0:1.3:1.2.
+#
+# Edit ID_PATH, the channel and the name for your system. For a node, print
+# its port path and channel with
+#
+#   udevadm test-builtin path_id /sys/class/misc/ipmi-lstp0 | grep ^ID_PATH=
+#   cat /sys/class/misc/ipmi-lstp0/device/channel
+#
+# Copy the SYMLINK line once per channel to name. Install to
+# /etc/udev/rules.d/, then run "udevadm control --reload" and
+# "udevadm trigger --subsystem-match=misc".
+
+ACTION=="remove", GOTO="lstp_ipmi_end"
+SUBSYSTEM!="misc", GOTO="lstp_ipmi_end"
+KERNEL!="ipmi-lstp[0-9]*", GOTO="lstp_ipmi_end"
+KERNEL=="*-postcodes", GOTO="lstp_ipmi_end"
+
+IMPORT{builtin}="path_id"
+
+ENV{ID_PATH}=="platform-xhci-hcd.0-usb-0:1.3:1.2", ATTRS{channel}=="4", \
+  SYMLINK+="ipmi-stable-symlink", TAG+="systemd"
+
+LABEL="lstp_ipmi_end"
