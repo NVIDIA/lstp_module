@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config USB_OBMF
+	tristate "OBMF-ICP over USB"
+	depends on USB
+	select AUXILIARY_BUS
+	help
+	  Support for USB devices with an OCP OBMF-ICP interface (Open Boot
+	  and Management Framework Interface Consolidation Protocol). The
+	  driver discovers the device's channels and creates one device per
+	  channel for the I2C, serial and other function drivers.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called obmf.
+
+config OBMF_DIALECTS
+	bool "Devices that speak another wire protocol"
+	depends on USB_OBMF
+	help
+	  Support for USB devices whose interface speaks another wire
+	  protocol than OBMF-ICP. Their messages are translated to OBMF-ICP
+	  at the edge, so the same function drivers serve their channels.
+	  Each protocol has its own option below.
+
+	  If unsure, say N.
+
+config OBMF_LSTP
+	bool "LSTP devices"
+	depends on OBMF_DIALECTS
+	help
+	  Also bind USB devices that speak LSTP 1.0 (interface class 255,
+	  subclass 63, protocol 1) from the listed vendors. Their messages
+	  are translated to OBMF-ICP, so the same I2C and serial drivers
+	  serve their channels.
+
+	  If unsure, say N.
+
+config OBMF_KUNIT_TEST
+	bool "KUnit tests for OBMF-ICP over USB" if !KUNIT_ALL_TESTS
+	depends on USB_OBMF && KUNIT
+	depends on USB_OBMF=m || KUNIT=y
+	default KUNIT_ALL_TESTS
+	select DTC
+	help
+	  KUnit tests of the OBMF-ICP message layer and channel discovery,
+	  run against a fake transport, and of the USB probe checks. They
+	  are built into the obmf module.
+
+	  Select this option only if you will boot the kernel for the
+	  purpose of running unit tests (e.g. under UML or qemu).
+
+	  If unsure, say N.
+
+config OBMF_LSTP_KUNIT_TEST
+	bool "KUnit tests for the LSTP translation" if !KUNIT_ALL_TESTS
+	depends on USB_OBMF && KUNIT && OBMF_LSTP
+	depends on USB_OBMF=m || KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  KUnit tests of the LSTP message translation and discovery, run
+	  against a fake transport. They are built into the obmf module.
+
+	  Select this option only if you will boot the kernel for the
+	  purpose of running unit tests (e.g. under UML or qemu).
+
+	  If unsure, say N.
