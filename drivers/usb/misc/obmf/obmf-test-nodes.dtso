@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Interface nodes for the obmf-bus KUnit cases, whose channels are I2C on
- * 1, serial on 2 and GPIO on 3
+ * 1, serial on 2 and GPIO on 3, and for the obmf-tty node case, whose
+ * channels are both serial
  */
 /dts-v1/;
 /plugin/;
@@ -27,6 +28,10 @@
 		i2c@3 {
 			reg = <3>;
 		};
+
+		serial@4 {
+			reg = <4>;
+		};
 	};
 
 	obmf-test-name {
@@ -35,6 +40,10 @@
 
 		spi@1 {
 			reg = <1>;
+		};
+
+		i2c@2 {
+			reg = <2>;
 		};
 	};
 
@@ -46,8 +55,39 @@
 			reg = <1>;
 			status = "disabled";
 		};
+
+		serial@2 {
+			reg = <2>;
+		};
+	};
+
+	obmf-test-disabled-serial {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		i2c@1 {
+			reg = <1>;
+		};
+
+		serial@2 {
+			reg = <2>;
+			status = "disabled";
+		};
 	};
 
 	obmf-test-empty {
+	};
+
+	obmf-test-tty {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		serial@1 {
+			reg = <1>;
+		};
+
+		serial@2 {
+			reg = <2>;
+		};
 	};
 };

@@ -425,8 +425,8 @@ proto:
 
 /*
  * A device that stops answering during a software unbind would hold every
- * function driver's remove for a timeout per request: the first timeout
- * stops the core instead.
+ * function driver's remove for a timeout per request or answer: the first
+ * timeout stops the core instead.
  */
 static void obmf_core_timed_out(struct obmf_core *core)
 {
@@ -478,6 +478,8 @@ int obmf_slot_xfer(struct obmf_channel *ch, u8 cmd, size_t len,
 		scoped_guard(spinlock_irqsave, &slot->rx_lock)
 			slot->armed = false;
 		obmf_ch_count(ch, OBMF_CH_TX_ERRORS);
+		if (ret == -ETIMEDOUT)
+			obmf_core_timed_out(core);
 		return ret;
 	}
 
@@ -611,7 +613,8 @@ bool obmf_dreq_len_ok(const struct obmf_channel *ch, const u8 *data, size_t len)
 static int obmf_send_answer(struct obmf_channel *ch, u8 cmd, u8 status,
 			    const void *data, size_t len)
 {
-	struct obmf_transport *tp = ch->core->tp;
+	struct obmf_core *core = ch->core;
+	struct obmf_transport *tp = core->tp;
 	bool echo = obmf_echo_mask(ch->info.type);
 	size_t plen = len + echo;
 	size_t mlen = OBMF_HDR_LEN + plen;
@@ -620,6 +623,8 @@ static int obmf_send_answer(struct obmf_channel *ch, u8 cmd, u8 status,
 
 	if (plen > ch->info.max_req)
 		return -EMSGSIZE;
+	if (READ_ONCE(core->state) == OBMF_STOPPING)
+		return -ENODEV;
 
 	u8 *msg __free(kfree) = kmalloc(mlen, GFP_KERNEL);
 	if (!msg)
@@ -638,10 +643,13 @@ static int obmf_send_answer(struct obmf_channel *ch, u8 cmd, u8 status,
 		return ret;
 
 	ret = tp->ops->send(tp, msg, mlen, OBMF_DEFAULT_TIMEOUT_MS);
-	if (ret)
+	if (ret) {
 		obmf_ch_count(ch, OBMF_CH_TX_ERRORS);
-	else
+		if (ret == -ETIMEDOUT)
+			obmf_core_timed_out(core);
+	} else {
 		obmf_ch_count(ch, OBMF_CH_TX_ANSWERS);
+	}
 	return ret;
 }
 
@@ -670,6 +678,17 @@ static void obmf_default_answer(struct obmf_channel *ch, u8 cmd)
 	}
 	obmf_ch_count(ch, OBMF_CH_DEFAULT_ANSWERS);
 	obmf_send_answer(ch, cmd, status, body, len);
+}
+
+/*
+ * The answer for a device request that could not be decoded: invalid,
+ * with no body past an echo, so that the device does not send it again
+ * as it would after a NACK
+ */
+static void obmf_invalid_answer(struct obmf_channel *ch)
+{
+	obmf_ch_count(ch, OBMF_CH_DEFAULT_ANSWERS);
+	obmf_send_answer(ch, 0, OBMF_STATUS_INVALID, NULL, 0);
 }
 
 static void obmf_rec_put(struct obmf_channel *ch, struct obmf_dreq_rec *rec)
@@ -737,20 +756,43 @@ bool obmf_dreq_add(struct obmf_channel *ch, const u8 *data, size_t len)
 	return false;
 }
 
+/*
+ * Whether every device request of the type waits for an answer: a
+ * serial write (5.5.1, Table 22) and an IPMI request (5.9, Table 44).
+ * On GPIO the command decides (5.4.1, Table 18).
+ */
+static bool obmf_type_answers(u8 type)
+{
+	return type == OBMF_TYPE_SERIAL || type == OBMF_TYPE_IPMI;
+}
+
+/*
+ * Owes the invalid answer to a device request that cannot be decoded,
+ * where the type answers every request; under dreq_lock
+ */
+void obmf_dreq_owe_invalid(struct obmf_channel *ch)
+{
+	if (obmf_type_answers(ch->info.type))
+		ch->owed_invalid++;
+}
+
 static void obmf_rx_dreq(struct obmf_channel *ch, const u8 *data, size_t len)
 {
 	bool queued = false;
+	bool bad;
 
 	obmf_ch_count(ch, OBMF_CH_RX_DEVICE_REQUESTS);
-	if (!obmf_dreq_len_ok(ch, data, len)) {
-		obmf_ch_count(ch, OBMF_CH_PROTOCOL_ERRORS);
-		return;
+	scoped_guard(spinlock_irqsave, &ch->dreq_lock) {
+		bad = !obmf_dreq_len_ok(ch, data, len);
+		if (bad)
+			obmf_dreq_owe_invalid(ch);
+		else
+			queued = obmf_dreq_add(ch, data, len);
 	}
 
-	scoped_guard(spinlock_irqsave, &ch->dreq_lock)
-		queued = obmf_dreq_add(ch, data, len);
-
-	if (!queued)
+	if (bad)
+		obmf_count(ch->core, OBMF_IF_RX_MALFORMED);
+	else if (!queued)
 		obmf_ch_count(ch, OBMF_CH_RX_DROPPED);
 	queue_work(ch->core->wq, &ch->work);
 }
@@ -759,6 +801,7 @@ static void obmf_dreq_deliver(struct obmf_channel *ch,
 			      struct obmf_dreq_rec *rec)
 {
 	int ret = -ENODEV;
+	bool done;
 
 	scoped_guard(mutex, &ch->dispatch_lock) {
 		if (ch->ops && ch->ops->device_request)
@@ -766,30 +809,34 @@ static void obmf_dreq_deliver(struct obmf_channel *ch,
 						      &rec->dreq);
 	}
 
-	if (ret == -EINPROGRESS) {
-		scoped_guard(spinlock_irqsave, &ch->dreq_lock) {
-			if (!rec->done) {
-				rec->kept = true;
-				list_add_tail(&rec->node, &ch->kept);
-				rec = NULL;
-			}
+	scoped_guard(spinlock_irqsave, &ch->dreq_lock) {
+		done = rec->done;
+		if (ret == -EINPROGRESS && !done) {
+			rec->kept = true;
+			list_add_tail(&rec->node, &ch->kept);
+			return;
 		}
-	} else if (ret && !rec->done && rec->dreq.answer_due) {
+	}
+	if (!done && rec->dreq.answer_due) {
+		if (!ret)
+			dev_warn_once(ch->core->dev,
+				      "channel %u: request not answered\n",
+				      ch->info.number);
 		obmf_default_answer(ch, rec->dreq.cmd);
 	}
-	if (rec)
-		obmf_rec_put(ch, rec);
+	obmf_rec_put(ch, rec);
 }
 
 static void obmf_dreq_work(struct work_struct *work)
 {
 	struct obmf_channel *ch = container_of(work, struct obmf_channel, work);
 	struct obmf_dreq_rec *rec;
-	bool owed;
+	bool owed, invalid;
 	u8 cmd = 0;
 
 	for (;;) {
 		owed = false;
+		invalid = false;
 		scoped_guard(spinlock_irqsave, &ch->dreq_lock) {
 			rec = list_first_entry_or_null(&ch->queue, typeof(*rec),
 						       node);
@@ -799,6 +846,9 @@ static void obmf_dreq_work(struct work_struct *work)
 				ch->owed--;
 				cmd = ch->owed_cmd;
 				owed = true;
+			} else if (ch->owed_invalid) {
+				ch->owed_invalid--;
+				invalid = true;
 			}
 		}
 
@@ -806,6 +856,8 @@ static void obmf_dreq_work(struct work_struct *work)
 			obmf_dreq_deliver(ch, rec);
 		else if (owed)
 			obmf_default_answer(ch, cmd);
+		else if (invalid)
+			obmf_invalid_answer(ch);
 		else
 			break;
 	}
@@ -892,6 +944,9 @@ void obmf_ch_answer_leftovers(struct obmf_channel *ch)
 		}
 		if (!rec)
 			break;
+		dev_warn_once(ch->core->dev,
+			      "channel %u: device request kept at unbind\n",
+			      ch->info.number);
 		if (rec->dreq.answer_due)
 			obmf_default_answer(ch, rec->dreq.cmd);
 		obmf_rec_put(ch, rec);
@@ -1040,8 +1095,8 @@ void obmf_core_info(struct obmf_core *core, char *buf)
 {
 	const struct obmf_dialect *dialect = obmf_dialect(core);
 	const size_t room = OBMF_INFO_LEN - OBMF_INFO_MORE;
-	char kind[sizeof("type 0xff")];
-	const char *sep = ": ";
+	char num[sizeof("type 0xff")];
+	const char *sep = ": ", *kind;
 	struct obmf_channel *ch;
 	size_t len, n;
 	int i, more = 0;
@@ -1061,11 +1116,12 @@ void obmf_core_info(struct obmf_core *core, char *buf)
 			continue;
 		if (!more) {
 			type = ch->info.type;
-			if (type < ARRAY_SIZE(obmf_kinds) && obmf_kinds[type])
-				strscpy(kind, obmf_kinds[type]);
-			else
-				snprintf(kind, sizeof(kind), "type 0x%02x",
-					 type);
+			if (type < ARRAY_SIZE(obmf_kinds) && obmf_kinds[type]) {
+				kind = obmf_kinds[type];
+			} else {
+				snprintf(num, sizeof(num), "type 0x%02x", type);
+				kind = num;
+			}
 			n = snprintf(buf + len, room - len, "%s%s ch%d '%s'%s",
 				     sep, kind, i, ch->info.name,
 				     ch->fdev ? "" : " (no driver)");

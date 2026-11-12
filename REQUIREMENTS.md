@@ -6,9 +6,9 @@ platform description, and what it offers to user space.
 ## Kernel versions
 
 The code is written against the current mainline kernel interfaces.
-It was built against Linux 6.12 and 6.18 (arm64) and Linux v7.3-rc6
-(x86_64); Linux 6.12 is the oldest kernel it was built for. Older
-kernels are not supported yet.
+It was built against Linux 6.12 and 6.18 (arm64)
+and Linux v7.3-rc6 (arm64 and x86_64); Linux 6.12 is the oldest kernel
+it was built for. Older kernels are not supported yet.
 
 `compat/obmf-compat.h` lets the same sources build against kernels
 older than v7.3. The out-of-tree `Kbuild` includes it in every file.
@@ -34,16 +34,22 @@ In a kernel tree, `drivers/usb/misc/obmf/Kconfig` has:
 | `CONFIG_USB_OBMF` | tristate | `obmf.ko`; depends on `USB`, selects `AUXILIARY_BUS` |
 | `CONFIG_OBMF_DIALECTS` | bool | the dialect support |
 | `CONFIG_OBMF_LSTP` | bool | LSTP devices; depends on `OBMF_DIALECTS` |
-| `CONFIG_OBMF_KUNIT_TEST` | bool | the KUnit suites; depends on `KUNIT` |
+| `CONFIG_OBMF_KUNIT_TEST` | bool | the KUnit suites; depends on `KUNIT`, selects `DTC` |
 | `CONFIG_OBMF_LSTP_KUNIT_TEST` | bool | the LSTP suite; depends on `OBMF_LSTP` |
 
 Out of tree, the `make` switches set the same options:
 `OBMF_DIALECTS=y`, `OBMF_LSTP=y` (which also sets the dialect
 support), `OBMF_KUNIT_TEST=y` (which needs a kernel with
-`CONFIG_KUNIT`, and with `OBMF_LSTP=y` adds the LSTP suite), and
-`OBMF_DEBUG=y`, which builds every file with `DEBUG`.
+`CONFIG_KUNIT` and `CONFIG_DTC`, and with `OBMF_LSTP=y` adds the LSTP
+suite), and `OBMF_DEBUG=y`, which builds every file with `DEBUG`.
 
-The I2C and serial drivers have no Kconfig entries yet.
+The I2C and serial drivers have no Kconfig entries yet. Their KUnit
+cases are built only when the driver is built into the kernel
+(`CONFIG_I2C_OBMF=y`, `CONFIG_OBMF_TTY=y`, the names the entries will
+have), so an out-of-tree KUnit build has none of them. The serial
+cases that check the kernel log read it from the console tracepoint:
+they need `CONFIG_PRINTK` and tracepoints (`.kunitconfig` sets
+`CONFIG_FTRACE=y`) and are skipped without them.
 
 ## USB match
 
@@ -91,7 +97,8 @@ Channel 0 (OBMF-ICP 1.0.0, 5.15):
 - has, for each channel, a header whose CHANNEL_NUMBER is the
   channel's index, at an offset after the offset table, not
   overlapping another channel, with at most 32 KiB of configuration
-  data; all channels together within 256 KiB;
+  data, and ending within the 32-bit configuration space; all channels
+  together within 256 KiB;
 - keeps the device header unchanged while the host reads it; a
   device that changes it is read again, at most three times within
   30 seconds;
@@ -112,11 +119,48 @@ Per channel:
 - payload limits large enough for the type's head: at least 3 bytes
   for serial, 4 for I2C;
 - I2C controller: the configuration data of Table 79, with the bus
-  speed index; bus recovery, if offered, through CHANNEL-SPECIFIC
-  CONTROL and STATUS (Table 69);
-- serial: the configuration data of Table 78, with a nonzero speed,
-  5 to 8 data bits, 1 or 2 stop bits and a parity the table defines;
-  a request limit that holds at least one character.
+  speed index; the bus recovery option is not used: the driver
+  registers no bus recovery and writes no CHANNEL-SPECIFIC CONTROL
+  (Table 69);
+- serial: the configuration data of Table 78 (at least its first 7
+  bytes), with a nonzero speed, and a request limit that holds at
+  least one character. A speed of 0 gives no tty ("line speed 0").
+  Data bits outside 5 to 8, stop bits other than 1 or 2, or a parity
+  code above 4 give a tty at 8N1, with the warning "unsupported line
+  <data bits><parity><stop bits>, using 8N1"; the device keeps running
+  its line as it is.
+
+### Serial channels
+
+The serial driver expects this of a device:
+
+- Answer each host write at once: accept the characters, or refuse
+  some or all of them with status 0x00, the NACK bit and the count
+  accepted (5.5.2, Table 23). The host sends the rest again 10 ms
+  later, with no limit, until the device takes them or the port is
+  flushed, hung up or closed. Answer busy (status 0x03) only when
+  none of the request's characters was taken: the host sends them
+  all again 10 ms later. Use other error statuses only for real
+  failures: they drop the characters at once.
+- Answer within the wait: the default response timeout (1000 ms) plus
+  twice the characters' time on the wire at ten bits a character.
+  Without an answer in time the host sends the same characters again
+  10 ms later; a device that answers late, or that took characters it
+  answers with a timeout status, gets them twice, and a late answer
+  is taken as the answer to the next try (`ASSUMPTIONS.md`).
+- Generate a complete break for each Generate Break request; there is
+  no "break off" request.
+- Keep a device write that the host refuses, and send it again later.
+  The host refuses a write that carries characters while nobody has
+  the port open, and any write while its receive buffer is full; such
+  a refusal can last as long as the port stays closed. Resend no
+  faster than every few milliseconds, and keep the other channels
+  going meanwhile. A write with events only is taken while the port
+  is closed.
+- Send the events of a refused write again with it: the host acts on
+  none of them until the write is taken.
+- Set the overrun event only for characters lost on their way to the
+  host; Carrier Down hangs the tty up unless `CLOCAL` is set.
 
 ## Device requirements: LSTP
 
@@ -126,22 +170,38 @@ least 64 bytes; no zero-length packets are sent. Channel 0 is the
 management channel of LSTP version 1, read with READ_CONFIG. A
 channel's configuration is read up to offset 0x7fff and cut there
 with a warning, and all channels together are read within 256 KiB.
-Every response wait is at least 1000 ms. I2C and UART channels get
-function devices; the UART configuration starts with the bytes of
-OBMF-ICP Table 78 and follows the serial rules above.
+Every response wait is at least 1000 ms. A configuration ends at the
+first slice shorter than asked; a GPIO table ends at an empty slice,
+so a device answers a read at the end of a table with no data. A
+configuration answered with an error status after its first slice
+ends there; busy, or an error on the first slice, leaves the channel
+out. A channel may end at most 683 slices short, and a discovery pass
+at most 5461; past either, the channel is left out with "over
+budget".
+
+I2C and UART channels get function devices. An I2C configuration
+needs at least its first byte, the speed; the fields it lacks read as
+0. The UART configuration starts with the bytes of OBMF-ICP Table 78,
+needs at least those 7, and follows the serial rules above: the host
+sends a write again that the device answers `LSTP_NACK` (0x04),
+`LSTP_BUSY` (0x03) or `LSTP_TIMEOUT` (0x02), and drops one answered
+with another error status. The host refuses a device write with
+`LSTP_NACK`.
 
 ## Describing function devices: device tree, ACPI, software nodes
 
 A firmware node is optional. Without one, an I2C channel still gets
-its adapter, and clients can be added from user space. A node gives
-the I2C clients on the channel's bus, a `clock-frequency` to check,
-or a way to leave a channel unused. Only I2C channels are looked up;
-serial channels take no node yet.
+its adapter, and clients can be added from user space; a serial
+channel still gets its tty. A node gives the I2C clients on the
+channel's bus, a `clock-frequency` to check, properties a udev rule
+can read for a serial port, or a way to leave a channel unused. I2C
+controller and serial channels are looked up.
 
 The node of a channel is a child of the USB interface's node. On
-device tree and with software nodes, it is the child named `i2c` (the
-name before any `@`) whose `reg` is the channel number. A child with
-that `reg` and another name is ignored with the warning
+device tree and with software nodes, it is the child named `i2c` for
+an I2C channel or `serial` for a serial channel (the name before any
+`@`) whose `reg` is the channel number. A child with that `reg` and
+another name is ignored with the warning
 "channel <n>: node <name> ignored", where `<name>` is the node's name
 with its unit address, for example `spi@1`. On ACPI, it is the child
 of the interface object whose `_ADR` is the channel number (see the
@@ -151,8 +211,14 @@ A node that is disabled (`status = "disabled"`), or an ACPI object
 whose `_STA` says it is not present, means the channel gets no
 function device.
 
-If the node has `clock-frequency`, it must equal the bus speed in the
-channel's configuration; otherwise the I2C probe fails with
+A serial channel's node belongs to its function device,
+`obmf.serial.<id>`, whose add uevent carries it. The tty below it has
+no node of its own. The port is not registered through serdev, so a
+device described below a serial node (a Bluetooth or GNSS chip, for
+example) is not bound; user space can still open the tty.
+
+If an I2C channel's node has `clock-frequency`, it must equal the bus
+speed in the channel's configuration; otherwise the I2C probe fails with
 "clock-frequency <n>, channel runs at <m>". The driver cannot set the
 speed.
 
@@ -161,15 +227,17 @@ The I2C clients are the child nodes of the channel's node, or of its
 On ACPI they are the devices whose `I2cSerialBus` resource names the
 channel's object. The speed given in that resource is not checked.
 
-The examples below are derived from the code and have not yet been
-tested on a board. `1234` and `5678` stand for the device's vendor
-and product IDs.
+The examples below are derived from the code. The same layout, with
+an I2C and a serial channel, was tested in a virtual machine
+(`README.md`, "What was tested"), not on a board. `1234` and `5678`
+stand for the device's vendor and product IDs.
 
 ### Device tree example
 
 The USB device on port 1 of a hub or root hub, configuration 1,
 OBMF-ICP on interface 2; channel 1 is an I2C controller with an
-EEPROM at 0x50, and channel 3 is an I2C controller left unused:
+EEPROM at 0x50, channel 2 is a serial channel, and channel 3 is an
+I2C controller left unused:
 
 ```dts
 device@1 {
@@ -196,6 +264,10 @@ device@1 {
 			};
 		};
 
+		serial@2 {
+			reg = <2>;
+		};
+
 		i2c@3 {
 			reg = <3>;
 			status = "disabled";
@@ -208,7 +280,7 @@ The interface node follows the kernel's USB device binding
 (`Documentation/devicetree/bindings/usb/usb-device.yaml`). For a
 device with one configuration and one interface, and a device class
 of 0 or 9, the USB core uses the device node for the interface too;
-the `i2c@N` nodes then go directly below `device@1`.
+the channel nodes then go directly below `device@1`.
 
 ### ACPI example
 
@@ -219,7 +291,7 @@ object below the port object: the child whose `_ADR` is the
 interface's `bInterfaceNumber`. The channel objects are children of
 the interface object, with `_ADR` = the channel number. A device with
 a single interface still needs the interface object, with `_ADR` 0.
-The same device on root hub port 1, with the same two channels:
+The same device on root hub port 1, with the same three channels:
 
 ```asl
 Scope (\_SB.PCI0.XHC.RHUB.HS01)
@@ -255,6 +327,11 @@ Scope (\_SB.PCI0.XHC.RHUB.HS01)
         }
     }
 
+    Device (CH02)
+    {
+        Name (_ADR, 2)
+    }
+
     Device (CH03)
     {
         Name (_ADR, 3)
@@ -276,8 +353,8 @@ object, with `_ADR` 1, 2, and so on. An interface object with `_ADR`
 
 A platform driver or a board file can attach software nodes to the
 interface. The rules are those of device tree: a child named `i2c`
-with a `reg` property equal to the channel number, and the I2C
-clients below it.
+or `serial` with a `reg` property equal to the channel number, and
+the I2C clients below an `i2c` child.
 
 ## Interfaces to the kernel and user space
 
@@ -301,7 +378,12 @@ no block read yet). Its quirks: no zero-length messages, and read and
 write lengths up to the channel's payload limits less four bytes.
 Only 7-bit addresses. The adapter's timeout covers its retries.
 
-Serial: a tty `/dev/ttyOBMF<n>`, with up to 256 ports in the system.
-Its line settings are fixed by the device (`KNOWN-ISSUES.md`);
-`TIOCGICOUNT` reports received and sent characters, breaks and
-overruns. Break is supported; modem control lines are not.
+Serial: a tty `/dev/ttyOBMF<n>`, with up to 256 ports in the system,
+below its auxiliary device, in
+`/sys/bus/auxiliary/devices/obmf.serial.<id>/tty/`. Its line settings
+are fixed by the device (`KNOWN-ISSUES.md`); termios reports them,
+with `CRTSCTS` for RTS/CTS flow control. `TIOCGICOUNT` reports
+received and sent characters, breaks, overruns, Carrier Down events
+(`dcd`) and device writes refused for a full buffer (`buf_overrun`). Break is supported; modem
+control lines are not. The default termios has `CLOCAL` set, so
+Carrier Down hangs the tty up only after `stty -clocal`.

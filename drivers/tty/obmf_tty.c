@@ -9,6 +9,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/kfifo.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/serial.h>
@@ -46,46 +47,63 @@ struct obmf_tty_cfg {
 } __packed;
 
 #define OBMF_TTY_PARITY GENMASK(3, 0)
+#define OBMF_TTY_FLOW GENMASK(7, 4)
+#define OBMF_TTY_RTS_CTS 2
 
 #define OBMF_TTY_FIFO_SIZE 4096
-/* Zero-count NACKs before the bytes in flight are dropped */
+/* NACKs before a break fails */
 #define OBMF_TTY_NACK_RETRIES 20
-#define OBMF_TTY_NACK_DELAY_MS 10
+/* Between tries of a request the device refused or did not answer */
+#define OBMF_TTY_RETRY_DELAY_MS 10
+/* How long the head of the FIFO stays refused before a warning */
+#define OBMF_TTY_STALL_MS 5000
 
 /**
  * struct obmf_tty - one serial channel
  * @port: the tty port; its reference count owns this structure
- * @fdev: the function device, NULL once it is being removed
- * @tx_work: sends @fifo to the device
+ * @fdev: the function device, NULL once it is being removed; read without
+ *	@req_lock by .shutdown, which teardown's hangup runs before that
+ * @tx_work: sends @fifo to the device, delayed while the device refuses
  * @req_lock: serialises host requests and @req; covers @fdev
- * @lock: covers @fifo, @tx_inflight, @tx_flush and the counters
+ * @lock: covers @fifo, the tx_ members and the counters
  * @fifo: bytes written and not yet accepted by the device
  * @req: request buffer, Character Count and Character Data
  * @max_chars: most characters in one request
  * @tx_inflight: bytes at the head of @fifo in the request being sent
- * @tx_flush: flush_buffer ran while a request was in flight
+ * @tx_flush: bytes at the head of @fifo discarded while a request was in
+ *	flight; they leave @fifo when it is answered
+ * @tx_flush_drop: what @fifo held when a close discarded it while a
+ *	request was in flight; the answer drops and reports those of them
+ *	the device does not accept
+ * @tx_stalled: the head of @fifo has not moved since @tx_since
+ * @tx_warned: the stall was reported
+ * @tx_since: jiffies of the first try that kept the head
  * @icount: line counters for TIOCGICOUNT
- * @tx_dropped: bytes dropped after the last NACK or an error
- * @rx_dropped: bytes received while the port was closed
+ * @tx_dropped: bytes dropped after an error or at close
+ * @tx_stalls: stalls reported
  * @speed: UART_SPEED_HZ
- * @cflag: CSIZE, CSTOPB, PARENB, PARODD and CMSPAR from Table 78
+ * @cflag: CSIZE, CSTOPB, PARENB, PARODD, CMSPAR and CRTSCTS from Table 78
  * @minor: tty index, U32_MAX until allocated
- * @gone: install refuses the port
+ * @gone: install and activate refuse the port
  */
 struct obmf_tty {
 	struct tty_port port;
 	struct obmf_fdev *fdev;
-	struct work_struct tx_work;
+	struct delayed_work tx_work;
 	struct mutex req_lock; /* host requests, req, fdev */
-	spinlock_t lock; /* fifo, tx_inflight, tx_flush, counters */
+	spinlock_t lock; /* fifo, tx_*, counters */
 	DECLARE_KFIFO(fifo, u8, OBMF_TTY_FIFO_SIZE);
 	u8 *req;
 	size_t max_chars;
 	size_t tx_inflight;
-	bool tx_flush;
+	size_t tx_flush;
+	size_t tx_flush_drop;
+	bool tx_stalled;
+	bool tx_warned;
+	unsigned long tx_since;
 	struct async_icount icount;
 	unsigned long tx_dropped;
-	unsigned long rx_dropped;
+	unsigned long tx_stalls;
 	u32 speed;
 	tcflag_t cflag;
 	u32 minor;
@@ -93,7 +111,7 @@ struct obmf_tty {
 };
 
 static struct tty_driver *obmf_tty_driver;
-/* Covers the minor table and @gone for install */
+/* Covers the minor table and @gone for install and activate */
 static DEFINE_MUTEX(obmf_tty_lock);
 static DEFINE_XARRAY_ALLOC(obmf_tty_minors);
 
@@ -107,9 +125,10 @@ DEFINE_FREE(obmf_tty, struct obmf_tty *, obmf_tty_put(_T))
 
 /*
  * Send Operation/Event @ev with the first @n bytes of @req; *@done gets
- * the count the device accepted.
+ * the count the device accepted and *@nack its NACK bit.
  */
-static int obmf_tty_send(struct obmf_tty *p, u8 ev, size_t n, size_t *done)
+static int obmf_tty_send(struct obmf_tty *p, u8 ev, size_t n, size_t *done,
+			 bool *nack)
 {
 	u8 resp[OBMF_TTY_RESP_LEN];
 	unsigned int ms;
@@ -130,18 +149,78 @@ static int obmf_tty_send(struct obmf_tty *p, u8 ev, size_t n, size_t *done)
 		return -EPROTO;
 	}
 	acc = get_unaligned_le16(resp + 1);
-	*done = (resp[0] & OBMF_TTY_RESP_NACK) ? acc : n;
+	*nack = resp[0] & OBMF_TTY_RESP_NACK;
+	*done = *nack ? acc : n;
 	return 0;
 }
 
 enum { OBMF_TTY_TX_IDLE, OBMF_TTY_TX_MORE, OBMF_TTY_TX_RETRY };
 
-/* One request from the head of @fifo */
-static int obmf_tty_tx_one(struct obmf_tty *p, unsigned int *nacks)
+/*
+ * Under @lock, after a try that @kept the head of @fifo or not: whether
+ * the head has now been kept for OBMF_TTY_STALL_MS, reported once a stall.
+ * A discard ends the stall, also one during the try, whose answer then
+ * drops the head.
+ */
+static bool obmf_tty_stalled(struct obmf_tty *p, bool kept)
 {
+	if (!kept || p->tx_flush) {
+		p->tx_stalled = false;
+		return false;
+	}
+	if (!p->tx_stalled) {
+		p->tx_stalled = true;
+		p->tx_warned = false;
+		p->tx_since = jiffies;
+		return false;
+	}
+	if (p->tx_warned ||
+	    time_before(jiffies,
+			p->tx_since + msecs_to_jiffies(OBMF_TTY_STALL_MS)))
+		return false;
+	p->tx_warned = true;
+	p->tx_stalls++;
+	return true;
+}
+
+static void obmf_tty_warn_stall(struct obmf_tty *p, int ret,
+				unsigned int waiting)
+{
+	const char *why = "refused";
+
+	if (ret == -EBUSY)
+		why = "busy";
+	else if (ret)
+		why = "timed out";
+	dev_warn_ratelimited(&p->fdev->adev.dev,
+			     "transmit stalled: %s, %u characters waiting\n",
+			     why, waiting);
+}
+
+static void obmf_tty_warn_close(struct obmf_tty *p, size_t n)
+{
+	dev_warn_ratelimited(&p->fdev->adev.dev,
+			     "%zu characters not sent at close, discarded\n",
+			     n);
+}
+
+/*
+ * One request from the head of @fifo. Bytes leave @fifo when the device
+ * accepts them. A NACK of none, busy (OBMF-ICP 1.0.0, 5.2, Table 4: 0x03)
+ * or a timeout keeps them for another try: no answer, Table 4 0x02, or
+ * the line timeout (5.5, Table 21: 0x40). Any other error drops them.
+ * No request carries a tag, so an answer that comes after the timeout
+ * answers the next try, and the device may get the bytes twice; the
+ * next request can then take that try's own answer, so bytes can also
+ * be lost. A head kept for OBMF_TTY_STALL_MS gets one warning, then none
+ * until the device accepts it.
+ */
+static int obmf_tty_tx_one(struct obmf_tty *p)
+{
+	bool drop = false, stall, wake, nack;
 	int next = OBMF_TTY_TX_MORE;
-	bool drop = false;
-	size_t n, done = 0;
+	size_t n, done = 0, closed;
+	unsigned int waiting;
 	int ret;
 
 	guard(mutex)(&p->req_lock);
@@ -154,55 +233,58 @@ static int obmf_tty_tx_one(struct obmf_tty *p, unsigned int *nacks)
 	if (!n)
 		return OBMF_TTY_TX_IDLE;
 
-	ret = obmf_tty_send(p, 0, n, &done);
+	ret = obmf_tty_send(p, 0, n, &done, &nack);
 	if (ret == -EAGAIN) {
 		/* Quiesced core: obmf_tty_resume() sends the bytes */
 		next = OBMF_TTY_TX_IDLE;
-	} else if (!ret && !done && ++*nacks < OBMF_TTY_NACK_RETRIES) {
+	} else if (ret == -ETIMEDOUT || ret == -EBUSY || (!ret && !done)) {
 		next = OBMF_TTY_TX_RETRY;
-	} else if (ret || !done) {
+	} else if (ret) {
 		drop = true;
 		done = n;
 	}
 
 	scoped_guard(spinlock_irqsave, &p->lock) {
 		p->tx_inflight = 0;
-		if (p->tx_flush) {
-			kfifo_reset_out(&p->fifo);
-			p->tx_flush = false;
-		} else {
-			for (n = done; n; n--)
-				kfifo_skip(&p->fifo);
-		}
+		wake = done || p->tx_flush;
+		stall = obmf_tty_stalled(p, next == OBMF_TTY_TX_RETRY);
+		closed = p->tx_flush_drop ? p->tx_flush_drop - done : 0;
+		p->tx_dropped += closed;
+		kfifo_skip_count(&p->fifo, p->tx_flush ?: done);
+		p->tx_flush = 0;
+		p->tx_flush_drop = 0;
 		if (drop)
 			p->tx_dropped += done;
 		else
 			p->icount.tx += done;
+		waiting = kfifo_len(&p->fifo);
 	}
-	if (drop)
+	/* -ENODEV: the device is gone and every write fails */
+	if (drop && ret != -ENODEV)
 		dev_warn_ratelimited(&p->fdev->adev.dev,
-				     "dropped %zu bytes: %d\n", done,
-				     ret ?: -EIO);
-	if (done) {
-		*nacks = 0;
+				     "dropped %zu bytes: %d\n", done, ret);
+	if (stall)
+		obmf_tty_warn_stall(p, ret, waiting);
+	if (closed)
+		obmf_tty_warn_close(p, closed);
+	if (wake)
 		tty_port_tty_wakeup(&p->port);
-	}
 	return next;
 }
 
 static void obmf_tty_tx_work(struct work_struct *work)
 {
-	struct obmf_tty *p = container_of(work, struct obmf_tty, tx_work);
-	unsigned int nacks = 0;
+	struct obmf_tty *p =
+		container_of(to_delayed_work(work), struct obmf_tty, tx_work);
 	int next;
 
-	for (;;) {
-		next = obmf_tty_tx_one(p, &nacks);
-		if (next == OBMF_TTY_TX_IDLE)
-			return;
-		if (next == OBMF_TTY_TX_RETRY)
-			msleep(OBMF_TTY_NACK_DELAY_MS);
-	}
+	do {
+		next = obmf_tty_tx_one(p);
+	} while (next == OBMF_TTY_TX_MORE);
+	/* A write during the try queued this work with no delay */
+	if (next == OBMF_TTY_TX_RETRY)
+		mod_delayed_work(system_dfl_wq, &p->tx_work,
+				 msecs_to_jiffies(OBMF_TTY_RETRY_DELAY_MS));
 }
 
 static ssize_t obmf_tty_write(struct tty_struct *tty, const u8 *buf,
@@ -213,7 +295,7 @@ static ssize_t obmf_tty_write(struct tty_struct *tty, const u8 *buf,
 
 	scoped_guard(spinlock_irqsave, &p->lock)
 		n = kfifo_in(&p->fifo, buf, count);
-	queue_work(system_dfl_wq, &p->tx_work);
+	queue_delayed_work(system_dfl_wq, &p->tx_work, 0);
 	return n;
 }
 
@@ -234,31 +316,70 @@ static unsigned int obmf_tty_chars_in_buffer(struct tty_struct *tty)
 	return kfifo_len(&p->fifo);
 }
 
+/*
+ * Drops the bytes not sent; with a request in flight, the bytes @fifo
+ * holds now once it is answered, so those written later stay. A close
+ * (@drop) counts what it drops in tx_dropped and returns the count; if
+ * it is the first discard while a request is in flight, the answer does
+ * both instead.
+ */
+static unsigned int obmf_tty_discard(struct obmf_tty *p, bool drop)
+{
+	unsigned int len, n;
+
+	guard(spinlock_irqsave)(&p->lock);
+	len = kfifo_len(&p->fifo);
+	p->tx_stalled = false;
+	if (!p->tx_inflight) {
+		n = len;
+		kfifo_reset_out(&p->fifo);
+	} else if (p->tx_flush) {
+		n = len - p->tx_flush;
+		p->tx_flush = len;
+	} else {
+		p->tx_flush = len;
+		if (drop)
+			p->tx_flush_drop = len;
+		return 0;
+	}
+	if (drop)
+		p->tx_dropped += n;
+	return n;
+}
+
 static void obmf_tty_flush_buffer(struct tty_struct *tty)
 {
-	struct obmf_tty *p = tty->driver_data;
-
-	scoped_guard(spinlock_irqsave, &p->lock) {
-		if (p->tx_inflight)
-			p->tx_flush = true;
-		else
-			kfifo_reset_out(&p->fifo);
-	}
+	obmf_tty_discard(tty->driver_data, false);
 	tty_wakeup(tty);
 }
 
-/* One Generate Break per "on"; the device sets its length */
+/*
+ * One Generate Break per "on"; the device sets its length. A NACKed
+ * break is sent again, as written bytes are.
+ */
 static int obmf_tty_break_ctl(struct tty_struct *tty, int state)
 {
 	struct obmf_tty *p = tty->driver_data;
+	unsigned int tries;
 	size_t done;
+	bool nack;
+	int ret;
 
 	if (!state)
 		return 0;
-	guard(mutex)(&p->req_lock);
-	if (!p->fdev)
-		return -ENODEV;
-	return obmf_tty_send(p, OBMF_TTY_EV_GENERATE_BREAK, 0, &done);
+	for (tries = 0; tries < OBMF_TTY_NACK_RETRIES; tries++) {
+		if (tries)
+			msleep(OBMF_TTY_RETRY_DELAY_MS);
+		scoped_guard(mutex, &p->req_lock) {
+			if (!p->fdev)
+				return -ENODEV;
+			ret = obmf_tty_send(p, OBMF_TTY_EV_GENERATE_BREAK, 0,
+					    &done, &nack);
+		}
+		if (ret || !nack)
+			return ret;
+	}
+	return -EIO;
 }
 
 /* The line runs as configured; CLOCAL, CREAD and HUPCL are the user's */
@@ -335,8 +456,23 @@ static int obmf_tty_get_icount(struct tty_struct *tty,
 	icount->tx = p->icount.tx;
 	icount->brk = p->icount.brk;
 	icount->overrun = p->icount.overrun;
+	icount->dcd = p->icount.dcd;
+	icount->buf_overrun = p->icount.buf_overrun;
 	return 0;
 }
+
+#if IS_ENABLED(CONFIG_OBMF_KUNIT_TEST)
+/* For the KUnit cases: the counters get_icount() does not report */
+void obmf_tty_kunit_counts(struct tty_struct *tty, unsigned long *dropped,
+			   unsigned long *stalls)
+{
+	struct obmf_tty *p = tty->driver_data;
+
+	guard(spinlock_irqsave)(&p->lock);
+	*dropped = p->tx_dropped;
+	*stalls = p->tx_stalls;
+}
+#endif
 
 static const struct tty_operations obmf_tty_ops = {
 	.install = obmf_tty_install,
@@ -366,13 +502,50 @@ static void obmf_tty_destruct(struct tty_port *port)
 	kfree(p);
 }
 
+/*
+ * port->tty is set by now, so a teardown that has not set @gone yet will
+ * hang this tty up; one that has may have found no tty to hang up.
+ */
+static int obmf_tty_activate(struct tty_port *port, struct tty_struct *tty)
+{
+	struct obmf_tty *p = container_of(port, struct obmf_tty, port);
+	bool gone;
+
+	scoped_guard(mutex, &obmf_tty_lock)
+		gone = p->gone;
+	return gone ? -ENODEV : 0;
+}
+
+/*
+ * Hangup, or close once closing_wait is over: the bytes not sent go and
+ * count as dropped. A hangup has flushed them already. With a request in
+ * flight, its answer reports them, as the device may still take some.
+ */
+static void obmf_tty_shutdown(struct tty_port *port)
+{
+	struct obmf_tty *p = container_of(port, struct obmf_tty, port);
+	unsigned int n = obmf_tty_discard(p, true);
+
+	if (n)
+		obmf_tty_warn_close(p, n);
+}
+
 static const struct tty_port_operations obmf_tty_port_ops = {
+	.activate = obmf_tty_activate,
+	.shutdown = obmf_tty_shutdown,
 	.destruct = obmf_tty_destruct,
 };
 
 /*
- * A device write is taken whole or not at all, and dropped while the
- * port is closed, as a UART with no reader.
+ * A device write is taken whole or refused: NACKed with count 0 and not
+ * acted on, so the device sends it again and it is acted on once. It is
+ * refused while the port is closed if it has characters, so the device
+ * keeps them, and when the flip buffer has no room for its characters and
+ * the flag characters of its events. buf_overrun counts the refusals for
+ * want of room, one per NACK, so again for a write sent again; no
+ * character is lost. While the port is closed, the events of a write
+ * without characters are counted only. Carrier down hangs the tty up
+ * unless CLOCAL is set.
  */
 static int obmf_tty_device_request(struct obmf_fdev *fdev,
 				   struct obmf_dreq *dreq)
@@ -382,39 +555,46 @@ static int obmf_tty_device_request(struct obmf_fdev *fdev,
 	const u8 *chars = dreq->data + 2;
 	u8 resp[OBMF_TTY_RESP_LEN] = {};
 	bool open = tty_port_initialized(&p->port);
-	bool push = false;
+	bool brk = dreq->cmd & OBMF_TTY_EV_BREAK;
+	bool overrun = dreq->cmd & OBMF_TTY_EV_OVERRUN;
+	bool down = dreq->cmd & OBMF_TTY_EV_CARRIER_DOWN;
+	size_t room = open ? count + brk + overrun : 0;
+	bool nack = count && !open;
+
+	if (room && tty_buffer_request_room(&p->port, room) < room) {
+		nack = true;
+		scoped_guard(spinlock_irqsave, &p->lock)
+			p->icount.buf_overrun++;
+	}
+	if (nack) {
+		resp[0] = OBMF_TTY_RESP_NACK;
+		goto answer;
+	}
 
 	scoped_guard(spinlock_irqsave, &p->lock) {
-		if (dreq->cmd & OBMF_TTY_EV_BREAK)
+		if (brk)
 			p->icount.brk++;
-		if (dreq->cmd & OBMF_TTY_EV_OVERRUN)
+		if (overrun)
 			p->icount.overrun++;
-		if (count && !open)
-			p->rx_dropped += count;
+		if (down)
+			p->icount.dcd++;
+		p->icount.rx += count;
 	}
-	if (open && (dreq->cmd & OBMF_TTY_EV_BREAK))
-		push |= tty_insert_flip_char(&p->port, 0, TTY_BREAK);
-	if (open && (dreq->cmd & OBMF_TTY_EV_OVERRUN))
-		push |= tty_insert_flip_char(&p->port, 0, TTY_OVERRUN);
-
-	if (open && count) {
-		if (tty_buffer_request_room(&p->port, count) < count) {
-			resp[0] = OBMF_TTY_RESP_NACK;
-			count = 0;
-		} else {
-			tty_insert_flip_string(&p->port, chars, count);
-			scoped_guard(spinlock_irqsave, &p->lock)
-				p->icount.rx += count;
-			push = true;
-		}
-	}
-	if (push)
+	if (room) {
+		if (brk)
+			tty_insert_flip_char(&p->port, 0, TTY_BREAK);
+		if (overrun)
+			tty_insert_flip_char(&p->port, 0, TTY_OVERRUN);
+		tty_insert_flip_string(&p->port, chars, count);
 		tty_flip_buffer_push(&p->port);
-
+	}
 	put_unaligned_le16(count, resp + 1);
+answer:
 	if (dreq->answer_due)
 		obmf_respond(fdev, dreq, OBMF_STATUS_SUCCESS, resp,
 			     sizeof(resp));
+	if (open && down && !nack)
+		tty_port_tty_hangup(&p->port, true);
 	return 0;
 }
 
@@ -429,7 +609,7 @@ static void obmf_tty_teardown(void *data)
 	scoped_guard(mutex, &obmf_tty_lock)
 		p->gone = true;
 	tty_port_tty_vhangup(&p->port);
-	disable_work_sync(&p->tx_work);
+	disable_delayed_work_sync(&p->tx_work);
 	/* Waits for a break request; none starts after this */
 	scoped_guard(mutex, &p->req_lock)
 		p->fdev = NULL;
@@ -437,6 +617,10 @@ static void obmf_tty_teardown(void *data)
 	tty_port_put(&p->port);
 }
 
+/*
+ * A speed of 0 is refused, as obmf_tty_send() divides by it; data bits,
+ * stop bits or parity out of range are replaced by 8N1
+ */
 static int obmf_tty_cfg(struct device *dev,
 			const struct obmf_channel_info *info, u32 *speed,
 			tcflag_t *cflag)
@@ -456,15 +640,21 @@ static int obmf_tty_cfg(struct device *dev,
 		return dev_err_probe(dev, -EINVAL,
 				     "configuration data too short\n");
 	cfg = (const struct obmf_tty_cfg *)info->config;
-	par = FIELD_GET(OBMF_TTY_PARITY, cfg->line_control);
 	*speed = le32_to_cpu(cfg->speed_hz);
-	if (!*speed || cfg->data_bits < 5 || cfg->data_bits > 8 ||
-	    cfg->stop_bits < 1 || cfg->stop_bits > 2 ||
-	    par >= ARRAY_SIZE(parity))
-		return dev_err_probe(dev, -EINVAL,
-				     "unsupported line %u Hz %u%u%u\n", *speed,
-				     cfg->data_bits, par, cfg->stop_bits);
-	*cflag = sizes[cfg->data_bits - 5] | parity[par];
+	if (!*speed)
+		return dev_err_probe(dev, -EINVAL, "line speed 0\n");
+	*cflag = 0;
+	if (FIELD_GET(OBMF_TTY_FLOW, cfg->line_control) == OBMF_TTY_RTS_CTS)
+		*cflag = CRTSCTS;
+	par = FIELD_GET(OBMF_TTY_PARITY, cfg->line_control);
+	if (cfg->data_bits < 5 || cfg->data_bits > 8 || cfg->stop_bits < 1 ||
+	    cfg->stop_bits > 2 || par >= ARRAY_SIZE(parity)) {
+		dev_warn(dev, "unsupported line %u%u%u, using 8N1\n",
+			 cfg->data_bits, par, cfg->stop_bits);
+		*cflag |= CS8;
+		return 0;
+	}
+	*cflag |= sizes[cfg->data_bits - 5] | parity[par];
 	if (cfg->stop_bits == 2)
 		*cflag |= CSTOPB;
 	return 0;
@@ -480,6 +670,7 @@ static int obmf_tty_probe(struct auxiliary_device *adev,
 	size_t max_chars;
 	tcflag_t cflag;
 	u32 speed;
+	u64 wire;
 	u8 *req;
 	int ret;
 
@@ -494,6 +685,11 @@ static int obmf_tty_probe(struct auxiliary_device *adev,
 				     "request limit %zu too small\n",
 				     info->max_req);
 	max_chars = min_t(size_t, info->max_req - OBMF_TTY_HEAD, U16_MAX);
+	/* So that obmf_tty_send()'s wait fits the core's limit */
+	wire = div_u64((u64)speed *
+			       (OBMF_MAX_TIMEOUT_MS - OBMF_DEFAULT_TIMEOUT_MS),
+		       2 * 10 * MSEC_PER_SEC);
+	max_chars = clamp_t(u64, wire, 1, max_chars);
 	req = devm_kzalloc(dev, 2 + max_chars, GFP_KERNEL);
 	if (!req)
 		return -ENOMEM;
@@ -505,7 +701,7 @@ static int obmf_tty_probe(struct auxiliary_device *adev,
 	p->port.ops = &obmf_tty_port_ops;
 	p->minor = U32_MAX;
 	p->fdev = fdev;
-	INIT_WORK(&p->tx_work, obmf_tty_tx_work);
+	INIT_DELAYED_WORK(&p->tx_work, obmf_tty_tx_work);
 	mutex_init(&p->req_lock);
 	spin_lock_init(&p->lock);
 	INIT_KFIFO(p->fifo);
@@ -536,7 +732,7 @@ static int obmf_tty_suspend(struct device *dev)
 {
 	struct obmf_tty *p = dev_get_drvdata(dev);
 
-	cancel_work_sync(&p->tx_work);
+	cancel_delayed_work_sync(&p->tx_work);
 	return 0;
 }
 
@@ -545,7 +741,7 @@ static int obmf_tty_resume(struct device *dev)
 {
 	struct obmf_tty *p = dev_get_drvdata(dev);
 
-	queue_work(system_dfl_wq, &p->tx_work);
+	queue_delayed_work(system_dfl_wq, &p->tx_work, 0);
 	return 0;
 }
 

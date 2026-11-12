@@ -44,7 +44,9 @@ config OBMF_KUNIT_TEST
 	help
 	  KUnit tests of the OBMF-ICP message layer and channel discovery,
 	  run against a fake transport, and of the USB probe checks. They
-	  are built into the obmf module.
+	  are built into the obmf module. With the I2C controller driver
+	  or the serial driver built in, it is tested on the fake
+	  transport too.
 
 	  Select this option only if you will boot the kernel for the
 	  purpose of running unit tests (e.g. under UML or qemu).

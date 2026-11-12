@@ -2,7 +2,8 @@
 
 What is wrong or missing in this version of the driver, why, and what
 closes each item. The numbers are stable: please quote them in
-reports. Gaps in the numbering are items already closed.
+reports. Gaps in the numbering are items already closed, or items
+about code that is not in this drop.
 
 ## KI-1: a late I2C response after a timeout can answer the next request
 
@@ -27,18 +28,6 @@ reports. Gaps in the numbering are items already closed.
   this holds for every I2C bus driver.
 - Closes when: not planned. Close I2C tools first.
 
-## KI-3: an I2C timeout status and no response give the same error
-
-- Effect: the device's I2C timeout status and no response at all both
-  return `-ETIMEDOUT`, and both start a bus recovery when the channel
-  offers one. A device that stopped answering gets one bounded
-  recovery attempt, about 100 ms, per transfer. LSTP devices always
-  offer recovery, so they are affected.
-- Why: the kernel's I2C fault codes use `-ETIMEDOUT` for both; whether
-  to tell them apart is not settled yet.
-- Closes when: a decision on the two cases, and the change if any.
-- See AS-11.
-
 ## KI-4: a device that omits the zero-length packet can merge messages
 
 - Effect: a message that fills its last packet, from a device that
@@ -53,10 +42,15 @@ reports. Gaps in the numbering are items already closed.
 
 ## KI-5: dropped serial characters are not counted readably
 
-- Effect: characters the device refused 20 times, or whose write
-  failed, are dropped with a "dropped <n> bytes" warning; characters
-  that arrive while the port is closed are dropped silently. Neither
-  total can be read.
+- Effect: characters whose write the device answers with an error
+  status (other than busy or a timeout) are dropped with a "dropped
+  <n> bytes" warning, and characters a close discards with "<n>
+  characters not sent at close, discarded"; each stall of the
+  transmit path gets one "transmit stalled" line. The totals of
+  dropped characters and of stalls cannot be read. (Characters the
+  device refuses are no longer dropped: they are sent again until it
+  takes them. Device writes that arrive while the port is closed are
+  not dropped either: the host refuses them, see KI-20.)
 - Why: not built yet.
 - Closes when: a readable count, with a test.
 
@@ -89,7 +83,8 @@ reports. Gaps in the numbering are items already closed.
 ## KI-9: only the I2C and serial function drivers exist
 
 - Effect: GPIO, SPI, IPMI, memory device and the other channel types
-  are discovered and logged, but get no device.
+  are discovered and logged, but get no device. A GPIO driver is being
+  written; it is not in this drop.
 - Why: I2C and serial come first; the other types follow.
 - Closes when: each driver is added.
 
@@ -108,7 +103,7 @@ reports. Gaps in the numbering are items already closed.
 - Effect: if the device answers BUSY when a channel's configuration is
   read, an OBMF-ICP device fails to bind ("discovery failed: -16"),
   and an LSTP device binds without that channel, which is logged as
-  "channel <n>: status <status>, ignored". Unbinding and binding the
+  "channel <n>: status 0x3, ignored". Unbinding and binding the
   interface reads it again.
 - Why: discovery does not retry a busy channel read on either
   protocol, and each keeps its own rule for a failed read.
@@ -128,8 +123,40 @@ reports. Gaps in the numbering are items already closed.
 - Closes when: the USB core gives interfaces their own ACPI
   companions, or such a device appears and needs another rule.
 
+## KI-20: serial input can be lost with no kernel message
+
+- Effect: input is lost in two ways, and neither is logged.
+  - When the device reports an overrun, the characters are already
+    lost on the device. The driver counts the event in `TIOCGICOUNT`
+    and inserts a `TTY_OVERRUN` mark, but a reader in raw mode never
+    sees the mark. On one USB hub controller with LSTP management, its
+    UART looped back and written at the line rate (115200 baud), about
+    0.2 to 0.4% of the data was lost this way; paced writes came back
+    whole.
+  - On the same controller, device writes that the host refuses are
+    not sent again. With the reader stopped, input past the host's
+    buffer was lost (seen once, in one session). The refusals count
+    only in `buf_overrun`, and refusals when the channel's queue of
+    device requests is full count only in debugfs (`rx_dropped`,
+    `default_answers`).
+- Why: overruns are counted and marked only, refusals are counted
+  only, and the driver relies on the device to send a refused write
+  again (AS-25).
+- Closes when: both cases log a ratelimited warning, with tests, and
+  why the device request queue fills at the line rate is explained.
+  The overrun itself, and a refused write that is not sent again, are
+  the device firmware's to fix.
+
+## KI-21: an I2C `clock-frequency` that differs from the channel's speed fails the probe
+
+- Effect: an I2C channel whose firmware node sets `clock-frequency` to
+  a value other than the bus speed the device reports gets no
+  adapter; the log shows "clock-frequency <n>, channel runs at <m>".
+- Why: the host cannot set the bus speed, and the driver treats the
+  property as a check.
+- Closes when: the property is a limit: the adapter runs at the
+  device's speed at or below it and warns above it, with tests.
+
 ## Known limits without a number yet
 
-- The I2C adapter quirks and the bus recovery path of `i2c-obmf.ko`
-  have no unit tests yet.
 - There are no allocation-failure tests yet.

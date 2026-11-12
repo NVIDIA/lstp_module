@@ -30,8 +30,8 @@ struct obmf_fdev_type {
 
 static const struct obmf_fdev_type obmf_fdev_types[] = {
 	{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c", "i2c" },
-	{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "serial", NULL },
-	{ OBMF_TYPE_SERIAL, OBMF_ROLE_SYMMETRIC, "serial", NULL },
+	{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "serial", "serial" },
+	{ OBMF_TYPE_SERIAL, OBMF_ROLE_SYMMETRIC, "serial", "serial" },
 };
 
 static DEFINE_IDA(obmf_ida);
@@ -291,14 +291,17 @@ void obmf_bus_del(struct obmf_core *core)
 	}
 }
 
-/* Remove steps 3 and 4 */
+/*
+ * Remove steps 3 and 4. The flush comes first: a delivery still running
+ * can keep its record after unpublish has returned.
+ */
 static void obmf_fdev_disable(void *data)
 {
 	struct obmf_fdev *fdev = data;
 	struct obmf_channel *ch = fdev->ch;
 
-	obmf_ch_answer_leftovers(ch);
 	flush_work(&ch->work);
+	obmf_ch_answer_leftovers(ch);
 	ch->bound = false;
 }
 
@@ -321,6 +324,9 @@ static int obmf_fdev_usable(struct obmf_fdev *fdev)
  * Books the steps that end the binding: leftover device requests get the
  * default answer. The device enables its channels; the core never
  * switches one on or off.
+ *
+ * Return: 0 or a negative errno, -ENODEV once the device has stopped or
+ * failed.
  */
 int devm_obmf_enable(struct obmf_fdev *fdev)
 {
@@ -354,6 +360,9 @@ static void obmf_fdev_unpublish(void *data)
  *
  * From here on device requests go to @ops; before, they get the default
  * answer. Needs devm_obmf_enable() first.
+ *
+ * Return: 0 or a negative errno, -ENODEV once the device has stopped or
+ * failed, -EINVAL before devm_obmf_enable().
  */
 int devm_obmf_publish(struct obmf_fdev *fdev, const struct obmf_fdev_ops *ops)
 {

@@ -11,6 +11,7 @@
 #include <linux/jiffies.h>
 #include <linux/minmax.h>
 #include <linux/nls.h>
+#include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/stddef.h>
@@ -187,6 +188,7 @@ static int obmf_discover_channel(struct obmf_core *core,
 	size_t cfg, head, max_req, max_resp;
 	struct obmf_ch_hdr h;
 	const char *why;
+	u32 end;
 	int ret;
 
 	ret = obmf_ctrl_read(core, off, &h, sizeof(h));
@@ -204,6 +206,7 @@ static int obmf_discover_channel(struct obmf_core *core,
 		return 0;
 	}
 	if (off < hdr_end || cfg > OBMF_CONFIG_MAX ||
+	    check_add_overflow(off, sizeof(h) + cfg, &end) ||
 	    *total + cfg > OBMF_CONFIG_TOTAL ||
 	    obmf_overlaps(found, nr, off, sizeof(h) + cfg)) {
 		dev_warn(dev, "channel %d: bad layout at %#x, ignored\n", nr,
@@ -433,12 +436,13 @@ int obmf_ch_status_read(struct obmf_fdev *fdev, u8 *status, u8 *specific)
 	*specific = regs[2];
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(obmf_ch_status_read, "OBMF");
 
 /**
  * obmf_ch_control_update - read-modify-write CHANNEL_SPECIFIC_CONTROL
  * @fdev: the function device
- * @specific_mask: the bits to change
+ * @specific_mask: the bits to change; include every write-1 action bit of
+ *	the register, 0 in @specific_val for one not meant, as a device may
+ *	read it back as written
  * @specific_val: their new values
  */
 int obmf_ch_control_update(struct obmf_fdev *fdev, u8 specific_mask,
@@ -462,4 +466,3 @@ int obmf_ch_control_update(struct obmf_fdev *fdev, u8 specific_mask,
 	val = (val & ~specific_mask) | (specific_val & specific_mask);
 	return obmf_ctrl_write(core, addr, &val, 1);
 }
-EXPORT_SYMBOL_NS_GPL(obmf_ch_control_update, "OBMF");

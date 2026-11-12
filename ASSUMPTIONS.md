@@ -5,7 +5,8 @@ reading until the point is confirmed; each item says what is open, the
 readings, what this driver does, what your device needs to work with
 it, and what a device that reads it otherwise sees. The numbers are
 stable: please quote them in reports, and tell us if your device takes
-another reading.
+another reading. Gaps in the numbering are items already closed, or
+items about code or tools that are not in this drop.
 
 ## AS-1: one outstanding request per channel, channels in parallel
 
@@ -59,17 +60,25 @@ another reading.
   not the header status that goes with a NACK.
 - Options: status 0x00 with the NACK bit; or an error status.
 - This driver: a response with status 0x00 and the NACK bit gives the
-  accepted count, and the rest is sent again. A NACK that accepts
-  nothing is retried up to 20 times, 10 ms apart; after that, or on any
-  error status, the characters in flight are dropped with the warning
-  "dropped <n> bytes: <errno>". When the host has no room for a device
-  write, it answers status 0x00 with the NACK bit and a count of 0.
+  accepted count, and the rest is sent again, from the first character
+  not accepted. A NACK that accepts nothing, a busy answer (status
+  0x03, AS-49) or a timeout keeps the characters, and they are sent
+  again 10 ms later, with no limit, until the device takes them or the
+  port is flushed, hung up or closed; after 5 s one "transmit stalled"
+  line is logged. Any other error status drops the characters in
+  flight with the warning "dropped <n> bytes: <errno>". A refused
+  Generate Break is sent again up to 20 times, 10 ms apart, and then
+  fails with `-EIO`. When the host cannot take a device write (its
+  port is closed and the write carries characters, or its buffer is
+  full), it answers status 0x00 with the NACK bit and a count of 0.
 - Prerequisites: refuse a host write, fully or partly, with status
-  0x00, bit 0 of byte 0 set and the count accepted; accept some
-  characters within about 200 ms of refusing all; use error statuses
-  only for real failures; send a refused device write again.
-- If your device differs: a NACK sent as an error status loses the
-  characters at once ("dropped <n> bytes: -16" for status 0x03).
+  0x00, bit 0 of byte 0 set and the count accepted; use error
+  statuses other than busy only for real failures; send a refused
+  device write again.
+- If your device differs: a NACK sent as an error status other than
+  busy or a timeout loses the characters at once ("dropped <n> bytes:
+  <errno>"). A device that expects an error status from the host
+  takes the host's NACK (status 0x00) as success with a count of 0.
 - Closes when: the specification names the status.
 
 ## AS-4: a device does not answer busy during discovery
@@ -83,8 +92,9 @@ another reading.
 - This driver: on OBMF-ICP, a busy answer to a channel 0 read fails
   the bind with "discovery failed: -16". On LSTP, a busy device header
   is retried for a few discovery passes and then fails the bind with
-  "device busy"; a busy answer to a channel's configuration read leaves
-  that channel out with "channel <n>: status 0x3, ignored".
+  "device busy"; a busy answer to any read of a channel's
+  configuration leaves that channel out with "channel <n>: status 0x3,
+  ignored".
 - Prerequisites: answer channel 0 with status 0x00 from the first
   request after the interface is configured; if start-up takes time,
   connect to the bus later rather than answer busy.
@@ -107,7 +117,8 @@ another reading.
   The default response timeout is 1000 ms; a serial write adds twice
   its time on the line. A response that arrives with no request waiting
   is counted in `rx_late` and dropped; one that arrives while the next
-  request waits is taken as its answer.
+  request waits is taken as its answer. During a software unbind, the
+  first timeout stops the device instead.
 - Prerequisites: answer every request within the timeout; if a
   request cannot finish in time, answer it with an error status (for
   example 0x02) before the timeout rather than late; send no response
@@ -172,8 +183,11 @@ another reading.
 - Prerequisites: accept and answer a host write while the device's own
   write is still unanswered; tell the host's answer from the host's
   request by the request/response bit.
-- If your device differs: a host write it answers busy or drops loses
-  its characters ("dropped <n> bytes").
+- If your device differs: a host write it answers busy, or does not
+  answer, is kept and sent again 10 ms later until the device takes
+  it, so the host's transmit stalls while the device's own write is
+  pending ("transmit stalled" after 5 s); a device that took the
+  characters before it dropped the request gets them twice (AS-48).
 - Closes when: the specification confirms the count.
 
 ## AS-9: the host only reads channel configuration
@@ -184,10 +198,10 @@ another reading.
 - Options: read only; the host writes and applies configuration, for
   example from serial line settings.
 - This driver: reads each channel's configuration at discovery and
-  never writes `CONFIGURATION_DATA` or `APPLY_CONFIGURATION`; its only
-  channel 0 write is the channel-specific control byte (it never
-  writes the enable bit either, see `REQUIREMENTS.md`). A serial port
-  keeps the device's speed and framing.
+  never writes `CONFIGURATION_DATA` or `APPLY_CONFIGURATION`; it makes
+  no channel 0 write at all (it never writes the enable bit either,
+  see `REQUIREMENTS.md`). A serial port keeps the device's speed and
+  framing.
 - Prerequisites: provision each channel's configuration on the device
   (serial speed, data bits, stop bits and parity; I2C speed).
 - If your device differs: a device that waits to be configured runs
@@ -198,15 +212,21 @@ another reading.
 
 - Specification: LSTP 1.0, 4.5.2 (p27): "Status field in the header is
   used to indicate ACK/NACK", with no value given; 3.1.1 (p8) names
-  0x04 `LSTP_NACK` "LSTP link error or not established".
+  0x04 `LSTP_NACK` "LSTP link error or not established" and 0x06
+  `LSTP_NOT_SUPP` "Device does not support this command or option".
 - Options: 0x04 only; any nonzero status; 0x04 and 0x03.
-- This driver: retries a write the device answers with 0x04, as in
-  AS-3; any other nonzero status drops the characters. It answers a
-  device write it cannot take with 0x04.
+- This driver: keeps the characters of a write the device answers
+  with 0x04, busy 0x03 or timeout 0x02, and sends them again 10 ms
+  later, as in AS-3; any other nonzero status drops them. It answers a
+  device write it refuses (its port is closed, or its buffer is full)
+  with 0x04. A device write it cannot decode, an unknown UART command
+  for example, is answered with 0x06, so that the device does not send
+  it again.
 - Prerequisites: refuse a host write with 0x04; read 0x04 from the
-  host as "send again".
-- If your device differs: a refusal with another status loses the
-  characters ("dropped <n> bytes: <errno>").
+  host as "send again later", and 0x06 as "do not send this again".
+- If your device differs: a refusal sent as another status loses the
+  characters ("dropped <n> bytes: <errno>"). A device that sends a
+  write again after 0x06 gets 0x06 again.
 - Closes when: the specification names the value.
 
 ## AS-11: LSTP_TIMEOUT and LSTP_BUSY on I2C are the generic timeout and busy
@@ -217,12 +237,11 @@ another reading.
   p37) or the generic 0x02 and 0x03 (Table 4, p26).
 - Options: generic codes; I2C codes.
 - This driver: maps them to the generic codes. The caller gets
-  `-ETIMEDOUT` and `-EBUSY` either way, and either starts one bus
-  recovery.
+  `-ETIMEDOUT` and `-EBUSY` either way; the adapter has no bus
+  recovery, and the client decides whether to retry.
 - Prerequisites: none beyond LSTP 1.0 today.
-- If your device differs: nothing changes today. If a later version
-  starts recovery only on a bus timeout (KI-3), a device that means a
-  bus timeout by `LSTP_TIMEOUT` gets no recovery.
+- If your device differs: nothing changes today: both readings give
+  the caller the same error.
 - Closes when: the specification answers it.
 
 ## AS-12: DEVICE_ROLE 2 is symmetric, 3-255 reserved
@@ -301,3 +320,329 @@ another reading.
   out, and the kernel log does not mention the health field.
 - Closes when: the specification says whether a discovering host must
   check HEALTH_STATUS or CHANNEL_ERROR_INDICATOR.
+
+## AS-18: every LSTP I2C channel implements BUS_RECOVERY, with no side effect
+
+- Specification: LSTP 1.0, 4.4.2, lists BUS_RECOVERY (command 0x00)
+  among the I2C commands, with no further text; the I2C configuration
+  of 4.4.1 has no field that says whether a channel implements it.
+- Options: offer recovery on every LSTP I2C channel; never offer it
+  for LSTP; offer it from a firmware version or capability bit, which
+  LSTP 1.0 does not define.
+- This driver: marks every LSTP I2C channel as offering recovery, but
+  `i2c-obmf.ko` registers no bus recovery with the I2C core, so
+  nothing sends BUS_RECOVERY: no status says the bus is held, and a
+  recovery sent after a timeout could take the late response as its
+  own. A caller of `i2c_recover_bus()` gets `-EBUSY`.
+- Prerequisites: none in this version.
+- If your device differs: nothing changes in this version. A bus held
+  low stays held until the device clears it or is reset or replugged.
+- Closes when: the specification says whether BUS_RECOVERY is
+  mandatory and free of side effects, or adds a capability bit.
+
+## AS-19: a nonzero LSTP Bus Arbitration Retries means the device retries
+
+- Specification: LSTP 1.0, 4.4.1, has a Bus Arbitration Retries byte
+  (0x00 "No Multimaster Support", 0x01 "1 Retry", 0xFF "256 Retries"),
+  but does not say who retries a lost arbitration, or whether
+  `LSTP_ARB_LOST` comes only after the device's own retries.
+- Options: the device retries when the byte is nonzero, the host does
+  not; the host always retries; the host retries the configured count.
+- This driver: with a nonzero byte the I2C adapter does no retries of
+  its own; with 0, or a configuration too short to hold the byte, the
+  I2C core retries a lost arbitration up to three times.
+- Prerequisites: set the byte to 0 on a channel whose firmware does
+  not retry a lost arbitration; with a nonzero value, retry before
+  answering `LSTP_ARB_LOST`.
+- If your device differs: a device that sets the byte but does not
+  retry gets no retry at all; the client sees `-EAGAIN` at the first
+  lost arbitration. Only multimaster buses see it.
+- Closes when: the specification says who retries.
+
+## AS-20: an OBMF-ICP I2C bus recovery posts its result within 100 ms
+
+- Specification: OBMF-ICP 1.0.0, 5.15.1, Table 69 (p67), defines
+  TRIGGER_BUS_RECOVERY and the sticky BUS_RECOVERY_SUCCESS and
+  BUS_RECOVERY_FAILED bits, but no time from the trigger to either.
+- Options: poll for 100 ms; a longer window; also poll after a lost
+  trigger response.
+- This driver: registers no bus recovery, even on a channel that
+  offers one (5.15.2, Table 79, options bit 0), and never writes
+  TRIGGER_BUS_RECOVERY; a caller of `i2c_recover_bus()` gets
+  `-EBUSY`. (Drop 1 triggered a recovery and polled for its result
+  for 100 ms.)
+- Prerequisites: none in this version.
+- If your device differs: nothing changes in this version.
+- Closes when: the specification bounds the time, and a case where a
+  recovery is due is defined.
+
+## AS-22: a device whose channel configuration changes re-enumerates
+
+- Specification: OBMF-ICP 1.0.0, 5.15 (p59-60), describes the
+  configuration the host reads at discovery, but not whether the
+  channel table may change while the USB device stays enumerated.
+- Options: read the table once at bind, a change needs re-enumeration;
+  read it again after a device-side reset is seen.
+- This driver: reads the channel table once, when the interface is
+  bound, and keeps it until it is unbound. It has no USB reset
+  handling of its own, so a USB reset unbinds and binds the interface,
+  and the table is read again.
+- Prerequisites: re-enumerate, or reset the USB device, whenever the
+  channel configuration changes.
+- If your device differs: requests go to channels that changed type or
+  limits; they fail with device errors or time out, and the function
+  drivers stay bound to channels that no longer match.
+- Closes when: the specification says what may change while the
+  device stays enumerated.
+
+## AS-24: an LSTP device ends configuration slices short a bounded number of times
+
+- Specification: LSTP 1.0, 4.3.1.4, has a GPIO table of up to 255
+  blocks of a count byte and 48-byte entries, and 4.1.2 lets a
+  READ_CONFIG return "as much data as is available"; nothing bounds
+  how short a device may make each slice.
+- Options: bound the short slices of a channel and of a discovery
+  pass; bound only the bytes read; also allow a slice per field
+  boundary.
+- This driver: reads a GPIO table until an empty slice. A channel may
+  have at most 683 short slices (one 48-byte entry per slice over its
+  32 KiB space), and a discovery pass at most 5461 (its 256 KiB budget
+  over 48); full slices do not count. Past the channel's bound that
+  channel is left out, and past the pass's bound every later channel
+  of the pass too, each with "channel <n>: over budget, ignored".
+- Prerequisites: send a GPIO table in full slices, or in slices that
+  average at least 48 bytes.
+- If your device differs: a long table, or the later channels of the
+  pass, are left out with that warning.
+- Closes when: the specification bounds the slicing, or the slice
+  pattern of each device is known.
+
+## AS-25: a device keeps its serial bytes under a NACK that lasts until the port opens
+
+- Specification: OBMF-ICP 1.0.0, 5.5.2, Table 23, defines the NACK of
+  a serial write, but neither specification says what a device does
+  with a NACK that lasts minutes or hours, as for a console nobody has
+  opened.
+- Options: refuse device writes with characters while the port is
+  closed; take and drop them; keep them in the tty buffer for the next
+  open.
+- This driver: while the port is closed, a device write with
+  characters gets a NACK with a count of 0; one with events only is
+  taken. On an open port a write gets the same NACK when the buffer
+  has no room for its characters and the marks of its events. A
+  refused write is not acted on at all: its events count, and Carrier
+  Down hangs up, only when the write is sent again and taken. The host
+  keeps the characters the device refuses in the same way: until the
+  device takes them, or the port is flushed, hung up or closed (AS-3).
+- Prerequisites: keep a refused write and send it again, with its
+  events; retry no faster than every few milliseconds, and keep the
+  other channels going between retries; do not reset the channel
+  because of the refusals.
+- If your device differs: a device that retries without a delay fills
+  the bus while a port is closed; one that drops a refused write loses
+  that input (KI-20); one that resets the channel or stops its other
+  channels makes a closed port cost more than lost output.
+- Closes when: the device's retry pattern under a long NACK is known.
+
+## AS-26: a device reports a nonzero serial line speed
+
+- Specification: OBMF-ICP 1.0.0, 5.15.2, Table 78, gives the line
+  speed and framing of a serial channel; it does not say whether 0 or
+  an out-of-range field may appear.
+- Options: refuse a speed of 0; use a default speed for it.
+- This driver: refuses a channel whose speed is 0, with "line speed
+  0", because the wait for each write is computed from it. Data bits,
+  stop bits or parity out of range give 8N1, with a warning.
+- Prerequisites: report the real line speed of every serial channel.
+- If your device differs: that channel gets no tty.
+- Closes when: the specification requires a nonzero speed.
+
+## AS-27: the serial "transmit overrun" event means characters lost on their way to the host
+
+- Specification: OBMF-ICP 1.0.0, 5.5.1, Table 22, bit 2, "Transmit
+  overrun (typically remote Serial/UART interface to BMC)". It does
+  not say whether the lost characters were bound for the host or for
+  the device's remote line.
+- Options: a loss mark in the host's receive stream and a count; a
+  count only.
+- This driver: inserts a `TTY_OVERRUN` mark where the event arrives,
+  and counts it in `overrun` of `TIOCGICOUNT`.
+- Prerequisites: set the bit only when characters on their way to the
+  host were lost.
+- If your device differs: a reader with `PARMRK` sees a loss mark
+  where no character bound for the host was lost; the count is still
+  right as a count of events.
+- Closes when: the specification says which direction the bit
+  describes.
+
+## AS-28: the device chooses the length of a Generate Break
+
+- Specification: OBMF-ICP 1.0.0, 5.5.1, Table 22, bit 0, Generate
+  Break, has no length and no "break off" form.
+- Options: one request per "break on"; a request per "on" and per
+  "off", which has no form in Table 22.
+- This driver: sends one Generate Break when the tty layer turns a
+  break on, and nothing when it turns it off. A refused break is sent
+  again, up to 20 times 10 ms apart, then fails with `-EIO`.
+- Prerequisites: generate a complete break for each request.
+- If your device differs: a device that waits for an "off" holds the
+  line in break until the next request; `tcsendbreak()` lengths are
+  not honoured.
+- Closes when: the specification defines the break length.
+
+## AS-29: a device answers a serial write within the default timeout plus its wire time
+
+- Specification: OBMF-ICP 1.0.0, 5.5.2, Table 23, gives the answer to
+  a serial write, but no time for it, for example while the device's
+  own flow control holds its line.
+- Options: a wait bounded by the default timeout and the characters'
+  time on the wire, then drop the characters (drop 1); the same wait,
+  then send them again (AS-48); no bound while the device's line is
+  stopped.
+- This driver: waits the default response timeout (1000 ms) plus twice
+  the characters' time on the wire at ten bits a character, and cuts
+  each request so that the wait fits 10 s. A write that gets no answer
+  in time is kept and sent again 10 ms later, with one "transmit
+  stalled" line after 5 s. On LSTP, a device write the host cannot
+  decode, too large or with an unknown command, is answered 0x06
+  (`LSTP_NOT_SUPP`), not 0x07 (`LSTP_TOO_LARGE`).
+- Prerequisites: answer each serial write at once: accept what you can
+  take and NACK the rest; do not hold the answer until your line
+  drains. Treat 0x06 for an oversized write as 0x07.
+- If your device differs: while its remote line is stopped, writers
+  block and the transmit stalls (the "transmit stalled" line and the
+  channel's `timeouts` counter show it); a late answer can repeat or
+  lose characters (AS-48).
+- Closes when: the specification bounds the answer time.
+
+## AS-30: a device does not send again a request answered "invalid"
+
+- Specification: OBMF-ICP 1.0.0, 5.2, Table 4, defines the invalid
+  status, but no rule on whether a device may send the same request
+  again after it.
+- Options: answer an undecodable request invalid; leave it
+  unanswered; send the type's default answer, which for serial is a
+  NACK the device sends again unchanged.
+- This driver: answers a serial write or IPMI request that it cannot
+  decode with the invalid status and no body past the IPMI echo, after
+  the other answers owed on the channel, and counts it in
+  `rx_malformed`.
+- Prerequisites: treat an invalid answer as final for that request;
+  keep one outstanding request per channel.
+- If your device differs: a device that sends an invalid request again
+  loops with the driver, one answer per resend; one that has more than
+  one request outstanding may match the invalid answer to a later
+  request.
+- Closes when: the specification defines the retry rule.
+
+## AS-44: a board description puts no devices below a serial channel's node
+
+- Specification: neither specification covers firmware descriptions.
+  A serial channel's node names the channel or disables it; the
+  kernel could also bind devices described below it.
+- Options: no devices below a serial node; register the port so that
+  devices described below it bind.
+- This driver: registers the tty without serdev, so a device described
+  below a serial node (a Bluetooth chip, a GNSS receiver or a console)
+  is not bound.
+- Prerequisites: none for the device; describe no client devices
+  below a serial channel's node.
+- If your device differs: a client described below a serial node never
+  appears; user space can still open the tty.
+- Closes when: a board needs such a client.
+
+## AS-45: ACPI tables for the device use the interface-object layout
+
+- Specification: neither specification covers ACPI tables, and a USB
+  interface has no ACPI object of its own (`REQUIREMENTS.md`, "ACPI
+  example").
+- Options: only channel objects below an interface object; also
+  channel objects directly below the port object.
+- This driver: looks for channel objects only below the interface
+  object whose `_ADR` is the interface number, and says nothing when
+  there is none.
+- Prerequisites: place the channel objects below such an interface
+  object.
+- If your device differs: with channel objects directly below the port
+  object, no channel gets a node, and a channel object with `_STA` 0
+  there does not keep its channel from getting a device. If a channel
+  number equals the interface number, that channel object is taken as
+  the interface object. No warning says why.
+- Closes when: a fielded ACPI table for such a device is known.
+
+## AS-46: an LSTP status 0x04 on an I2C channel is a target NACK
+
+- Specification: LSTP 1.0, 3.1.1 (p8), names 0x04 `LSTP_NACK` "LSTP
+  link error or not established"; the I2C text of 4.4 gives no status
+  for a target that does not acknowledge.
+- Options: 0x04 is a target NACK; 0x04 is a link failure.
+- This driver: on an I2C channel, takes 0x04 as a target NACK and
+  returns `-ENXIO`, as for an absent device, without a message.
+- Prerequisites: on an I2C channel, answer a target NACK with 0x04,
+  and a link or controller failure with another nonzero status.
+- If your device differs: a link failure on an LSTP I2C channel looks
+  like an empty bus: `i2cdetect` finds nothing, and a client probe
+  fails quietly.
+- Closes when: the specification names the status of a target NACK.
+
+## AS-47: the device enables every channel the host is to use
+
+- Specification: OBMF-ICP 1.0.0, 4.3 (p22), step 3, has producer
+  channels "pre-configured in Manufacturing and always enabled", but
+  step 2a makes the host's enable the condition for channels the
+  device consumes ("If it is not met, the Device boot will not
+  proceed"), and 5.15 (p59) says the host "should enable all the
+  necessary channels".
+- Options: the device enables its channels and the host never writes
+  the enable; the host enables a valid, disabled channel it is to use.
+- This driver: leaves out, with a warning, a channel that is not
+  enabled or not valid, and never writes CHANNEL_ENABLE.
+- Prerequisites: enable every channel the host is to use, with a
+  valid configuration, before the host reads channel 0; do not wait
+  for an enable from the host.
+- If your device differs: its disabled channels get no device
+  ("channel <n>: not enabled, ignored"); a device that waits for the
+  host's enable on a channel it consumes does not finish booting.
+- Closes when: a device with consumer channels, or one that boots
+  with its channels disabled, is to be supported, or the specification
+  says the host must enable.
+
+## AS-48: a device treats a serial write it answers late as one answered in time
+
+- Specification: OBMF-ICP 1.0.0, 5.5.2, Table 23, does not say what a
+  device does with characters it answers after the host stopped
+  waiting, and no request carries a tag (6.6), so the late answer is
+  taken by the next request on the channel.
+- Options: send the same characters again after a timeout; drop them
+  on a timeout (drop 1); after a timeout, hold the channel's next
+  request until the late answer comes or one more timeout passes.
+- This driver: keeps the characters after no answer, status 0x02
+  (Table 4) or the line timeout 0x40 (Table 21), and sends them again
+  10 ms later. After a late answer, the next try takes it as its own.
+- Prerequisites: a device that answers late did not take the
+  characters, or a repeat is harmless on its line; its late answer
+  accepts what the try it answers carried.
+- If your device differs: characters it took before a late answer go
+  out twice on the line; the next try's own answer is then taken by
+  the request after it, so characters the device refused there count
+  as sent and are lost.
+- Closes when: the host holds the next request after a timeout, the
+  specification says what a device does with a late request, or
+  requests get a tag.
+
+## AS-49: a device that answers a serial write busy did not take the characters
+
+- Specification: OBMF-ICP 1.0.0, Table 4 (p26), lists 0x03 "Channel
+  not ready / busy" with no count, and LSTP 1.0, 3.1.1 (p8), says
+  "retry later"; neither says whether a serial device took any of the
+  request's characters before answering busy.
+- Options: busy means none were taken, keep them and send again; busy
+  is an error, drop them with a warning (drop 1).
+- This driver: keeps the characters and sends them again 10 ms later,
+  with no limit; after 5 s, one "transmit stalled: busy" line.
+- Prerequisites: answer busy only when you took none of the request's
+  characters, and take them on a later try.
+- If your device differs: characters it took before answering busy go
+  out twice.
+- Closes when: the specification says what busy means on a serial
+  channel.

@@ -89,9 +89,10 @@ The wait is the caller's timeout, or 1000 ms by default, at most
 10000 ms, and at least the profile's floor. A request that gets no
 response in time fails with `-ETIMEDOUT`; a response that arrives
 later is counted as late and dropped. During a software unbind, the
-first timeout stops the device ("no response during unbind, device
-stopped"), so that the removal of the function drivers does not wait
-a timeout for every request.
+first timeout, of a send or of a response, stops the device ("no
+response during unbind, device stopped"). From then on requests fail
+at once and no answer is sent, so that the removal of the function
+drivers does not wait a timeout for every request.
 
 ### Requests from the device
 
@@ -108,7 +109,9 @@ A function driver takes device requests by passing its operations to
 answered (or no answer is due), `-EINPROGRESS` to keep the request
 and answer it later with `obmf_respond()` or end it with
 `obmf_dreq_drop()`, or an error to have the core send the default
-answer.
+answer. A return of 0 that left a due answer unsent also gets the
+default answer, with the one-time warning "channel <n>: request not
+answered".
 
 The default answer is the one the core sends when no driver answers:
 
@@ -118,7 +121,18 @@ The default answer is the one the core sends when no driver answers:
   Notify Datagram waits for no answer;
 - every other request: BUSY.
 
-When a driver unbinds, the requests it kept get the default answer.
+A device request that cannot be decoded reaches no driver: a serial
+write whose Character Count runs past its data (5.5.1, Table 22), or
+an empty IPMI request. The core answers it with the invalid status
+(5.2, Table 4) and no body past the IPMI echo, so that the device does
+not send it again as it would after a NACK, and counts it in
+`rx_malformed`. On a channel, the queued requests go first, then the
+default answers owed for want of a record, then the invalid answers.
+
+When a driver unbinds, the core first lets the channel's delivery
+work finish, which answers the requests still queued by default, and
+then gives each request the driver kept the default answer, with
+the one-time warning "channel <n>: device request kept at unbind".
 
 ## Channel 0 and discovery
 
@@ -132,8 +146,9 @@ When a driver unbinds, the requests it kept get the default answer.
 
 A channel is left out, with a warning naming it, when its header gives
 another channel number, overlaps the device header or another channel,
-has a configuration above 32 KiB or beyond the 256 KiB budget of the
-pass, or has payload limits too small for its type. The other channels
+runs past the 32-bit configuration space, has a configuration above
+32 KiB or beyond the 256 KiB budget of the pass, or has payload limits
+too small for its type. The other channels
 still bind. Each channel's payload limits are cut to what the
 transport can carry.
 
@@ -152,7 +167,8 @@ CHANNEL_STATUS has CONFIG_VALID (Table 65); any other channel is left
 out with a warning and gets no function device. HEALTH_STATUS and
 CHANNEL_ERROR_INDICATOR are not checked (see `ASSUMPTIONS.md`). The
 core never writes CHANNEL_ENABLE: it does not switch channels on at
-bind or off at unbind. A channel is therefore on before its function driver binds;
+bind or off at unbind. A channel is therefore on before its function
+driver binds;
 device requests that arrive before the driver publishes its
 operations get the default answer. LSTP channels have no such bits
 and count as enabled and valid.
@@ -168,9 +184,11 @@ driver:
 | I2C controller (0x04) | producer | `obmf.i2c.<id>` |
 | serial (0x03) | producer or symmetric | `obmf.serial.<id>` |
 
-Every other channel is discovered and logged at debug level, but gets
-no device yet. `<id>` is unique across all OBMF-ICP
-interfaces in the system; it is not the channel number.
+Both kinds look for a firmware node: I2C channels a node named `i2c`,
+serial channels one named `serial`. Every other channel is discovered
+and logged at debug level, but gets no device yet. `<id>` is unique
+across all OBMF-ICP interfaces in the system; it is not the channel
+number.
 
 The steps after a successful discovery:
 
@@ -195,8 +213,6 @@ data and per-channel quirks) and calls the functions of
   last in probe, which also hands over the device request operations;
 - `obmf_request()`, one request and its response;
 - `obmf_respond()` and `obmf_dreq_drop()`, for device requests;
-- `obmf_ch_status_read()` and `obmf_ch_control_update()`, the
-  channel's status and its channel-specific control byte;
 - `obmf_fdev_label()`, a name of the form `<device name>_<channel
   name>` for what the driver registers;
 - `obmf_fdev_protocol_error()`, to count a malformed response the
@@ -211,37 +227,90 @@ followed by a Read of the same target as one Write Read (OBMF-ICP
 1.0.0, 5.6.1). Every request of a transfer but the last asks for no
 STOP. All messages are checked before the first is sent: 7-bit
 addresses only, no zero-length messages, and no message flags other
-than read (and DMA-safe). The largest read
+than read, DMA-safe and the PEC flag the SMBus emulation copies from
+a client. The largest read
 and write follow from the channel's payload limits and are set as
 adapter quirks. SMBus is emulated on top of I2C, except Quick.
 
 The bus speed comes from the channel's configuration data (5.15.2,
 Table 79). A `clock-frequency` property in the firmware node must
 match it, or the probe fails; the driver cannot change the speed.
-When the configuration offers bus recovery, a timeout or busy status
-starts one bus recovery through the channel-specific control and
-status bytes (5.15.1, Table 69), polled ten times, 10 ms apart. The I2C
-core retries a lost arbitration three times, unless the channel's
-quirks say that the device retries itself.
+The adapter registers no bus recovery with the I2C core, also when
+the configuration offers one (5.15.2, Table 79, options bit 0): no
+status says that the bus is held, and a recovery sent after a timeout
+could take the late answer as its own. `i2c_recover_bus()` therefore
+returns `-EBUSY`, and a failed transfer returns its error; the client
+decides. The I2C core retries a lost arbitration three times, unless
+the channel's quirks say that the device retries itself.
 
 ### Serial (`obmf_tty.ko`)
 
-Each serial channel gets `/dev/ttyOBMF<n>`. Host writes are queued in
-a 4 KiB buffer and sent as Write requests (5.5.1, Table 22) of up to
-the channel's limit. Characters the device does not accept are sent
-again; after 20 refusals in a row, 10 ms apart, or at once when a
-request fails, they are dropped with a "dropped <n> bytes" warning.
-A break is one Generate Break event.
+Each serial channel gets `/dev/ttyOBMF<n>`. The tty is registered
+below the serial function device and has no firmware node of its own;
+a udev rule for the tty can read the node's properties from its
+parent. The port is not registered through serdev, so no device
+described below the node is bound.
 
-Device writes are taken whole or not at all: when the tty buffer has
-no room, the answer is a NACK with no characters accepted. Characters
-that arrive while the port is closed are dropped and acknowledged, as
-on a UART with no reader. Break and overrun events are passed to the
-tty layer and counted for `TIOCGICOUNT`.
+Host writes are queued in a 4 KiB buffer and sent as Write requests
+(5.5.1, Table 22) of up to the channel's limit. The wait for each
+answer is the default response timeout plus twice the characters'
+time on the wire, at ten bits a character; at low line speeds a
+request carries fewer characters, so that the wait fits the core's
+10 s limit. Characters leave the buffer only when the device accepts
+them; after a partial accept the next request starts with the first
+character not accepted. Characters the device refuses (a NACK that
+accepts none), answers busy (status 0x03, 5.2, Table 4) or does not
+answer (no answer, status 0x02, or the line timeout 0x40, 5.5,
+Table 21) stay at the head of the buffer, and the transmit work sends
+them again 10 ms after each refusal, busy answer or timeout, with no
+limit on the tries. A write that comes in meanwhile does not cut the
+delay short. While the device refuses, the buffer fills, writers
+block and `tcdrain()` waits. When the same head has been kept for
+5 s, the port logs one rate-limited "transmit stalled: <reason>, <n>
+characters waiting" warning (reason "refused", "busy" or "timed
+out"), and none more until the device takes it; a flush ends the
+stall. The driver cannot tell a device held off by flow control (CTS)
+from one that refuses for its own reasons.
+
+Any other error status, or an answer that accepts more than was sent
+(a protocol error), drops the characters of that request with a
+rate-limited "dropped <n> bytes" warning (no warning once the device
+is gone), and the next characters go out. A flush discards what is
+not yet sent; with a request in flight, the characters it carries
+leave once it is answered, and characters written after the flush
+stay. A hangup, an unbind, or the last close after `closing_wait`
+discards the rest: a close that discards characters counts them as
+dropped and logs "<n> characters not sent at close, discarded"; for a
+request still in flight the line comes once it is answered or times
+out, and counts the characters the device did not take.
+
+Requests carry no tag (6.6). An answer that comes after the host's
+timeout is taken by the next try, so the device can get the same
+characters twice, and the answer of that try is then taken by the
+request after it, so characters the device refuses there can count
+as sent and be lost (`ASSUMPTIONS.md`).
+
+System suspend stops the tries; resume starts them again. A break is
+one Generate Break event; a refused break is sent again up to 20
+times, 10 ms apart, and then fails with `-EIO`.
+
+Device writes are taken whole or not at all. The answer is a NACK
+with no characters accepted when the port is closed and the write
+carries characters, or when the tty buffer has no room for its
+characters and the marks of its events; the device is expected to
+send the write again. A refused write is not acted on at all. While
+the port is closed, a write with events only is taken, and its events
+are counted. On an open port, Break and overrun events become
+`TTY_BREAK` and `TTY_OVERRUN` marks, and Carrier Down hangs the tty up
+unless `CLOCAL` is set. `TIOCGICOUNT` counts the characters, the three
+events, and in `buf_overrun` the refusals for a full buffer.
 
 The line settings are those of the channel's configuration data
-(Table 78). The driver reports them in termios and cannot change them
-yet (`KNOWN-ISSUES.md`).
+(Table 78). Data bits, stop bits or parity out of range give 8N1, with
+the warning "unsupported line ..., using 8N1"; a speed of 0 gives no
+tty. RTS/CTS flow control is reported as `CRTSCTS`. The driver reports
+the settings in termios and cannot change them yet
+(`KNOWN-ISSUES.md`).
 
 ## Dialects: devices with another wire protocol
 
@@ -291,17 +360,26 @@ every response wait is at least 1000 ms. What it translates:
 - discovery: the device header and each channel's configuration are
   read with READ_CONFIG (LSTP 1.0, 4.1.1 and 4.1.2), in slices that
   each fit one packet, and the device header is read again at the end
-  of the pass, as in the native pass;
+  of the pass, as in the native pass. A configuration ends at a short
+  slice, a GPIO table at an empty one (4.3.1.4). An error status after
+  the first slice ends the configuration and keeps the channel; one on
+  the first slice, or busy on any slice, leaves the channel out. Short
+  slices are bounded per channel and per pass;
 - I2C controller channels: Read, Write, Write Read and the no-STOP
   bit, both ways, and the LSTP statuses NACK and arbitration lost to
-  their OBMF-ICP I2C codes (LSTP 1.0, 4.4.2);
+  their OBMF-ICP I2C codes (LSTP 1.0, 4.4.2). A configuration shorter
+  than 4.4.1's is taken if it has the speed byte; the fields it lacks
+  read as 0;
 - UART channels as OBMF-ICP serial channels: host writes and their
   acknowledgement, device writes and the host's answers (LSTP 1.0,
   4.5.2), with the first seven configuration bytes as the line
-  settings (Table 78);
+  settings (Table 78); a shorter configuration leaves the channel out.
+  A refusal goes to the device as `LSTP_NACK`, and an answer with an
+  error status as `LSTP_NOT_SUPP`;
 - the channel header bytes, which LSTP lacks: every channel reads as
-  healthy, enabled and with a valid configuration, and an I2C bus
-  recovery request sends the LSTP bus recovery command.
+  healthy, enabled and with a valid configuration. An I2C bus
+  recovery request would be sent as the LSTP bus recovery command;
+  nothing sends one, as the I2C driver offers no bus recovery.
 
 The channel limits are the packet size less the header, plus what the
 OBMF-ICP form of the type adds. SPI, GPIO and IPMI channels get a
@@ -325,9 +403,12 @@ debug log still describe the device.
 unloading `obmf.ko`). The device is still there, so the function
 devices are removed first, while requests still work: their drivers
 answer the device requests they kept. Then the
-transfers stop. A function driver that sends a request after the
-device stopped responding stops the device at the first timeout, so
-the unbind takes at most one timeout.
+transfers stop. The first request or answer that times out, in its
+send or in its response, stops the device: later requests fail at
+once and no more answers are sent, so a device that stops answering,
+or whose bulk OUT stops completing, costs the unbind one timeout. A
+device that keeps sending device requests during the unbind gets no
+answers once the device is stopped.
 
 **Unplug.** The device is gone, so the transfers stop first. Waiting
 requests fail at once with `-ENODEV`, and then the function devices
@@ -335,9 +416,12 @@ are removed.
 
 **Module unload.** `i2c-obmf.ko` and `obmf_tty.ko` use symbols of
 `obmf.ko`, so they are unloaded first; each unbinds its devices.
-Unloading `obmf.ko` then unbinds every interface the software way. An
-open `/dev/i2c-N` holds `i2c-obmf.ko` (`KNOWN-ISSUES.md`); an
-open tty is hung up when its device goes.
+Unloading `obmf.ko` then unbinds every interface the software way,
+and waits for the device-link releases that the removed function
+devices queued, so that none runs after the module is gone. An open
+`/dev/i2c-N` holds `i2c-obmf.ko` (`KNOWN-ISSUES.md`); an open tty is
+hung up when its device goes, and an open that races the teardown
+fails with `-ENODEV`.
 
 **Transport failure.** After ten bulk IN errors in a row the device
 is stopped and every request fails with `-EIO`. The function devices
@@ -366,7 +450,7 @@ read-only counters:
 | file | counts |
 |---|---|
 | `rx_messages`, `tx_messages` | messages received and sent |
-| `rx_malformed` | received messages shorter than a header or than their header size, dropped; longer ones, kept without the extra bytes; with a dialect, messages it cannot decode |
+| `rx_malformed` | received messages shorter than a header or than their header size, dropped; longer ones, kept without the extra bytes; device requests that cannot be decoded, answered invalid; with a dialect, messages it cannot decode |
 | `rx_no_channel` | messages for a channel with no record |
 | `rx_urb_errors`, `tx_urb_errors` | failed bulk IN and bulk OUT transfers |
 | `stalls` | stalled endpoints |
@@ -385,8 +469,8 @@ a function device:
 | `tx_errors` | requests or answers that could not be sent |
 | `rx_device_requests` | device requests received |
 | `tx_answers` | answers sent by a function driver |
-| `default_answers` | default answers sent by the core |
-| `rx_dropped` | device requests dropped: no room, or no wire form for the answer |
+| `default_answers` | default and invalid answers sent by the core |
+| `rx_dropped` | device requests not delivered for want of a record (a due answer still goes out as the default answer), ended by the driver without an answer, left queued when the channel is freed, or answers with no wire form |
 | `rx_replaced` | reserved, stays 0 |
 
 With `CONFIG_FAULT_INJECTION_DEBUG_FS`, the interface directory also

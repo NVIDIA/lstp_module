@@ -583,6 +583,10 @@ static int obmf_usb_probe(struct usb_interface *intf,
 	u->tp.resp_timeout_floor_ms = pf->resp_timeout_floor_ms;
 	/* An interface shares its device's companion, the port object */
 	u->tp.acpi_adr = intf->cur_altsetting->desc.bInterfaceNumber;
+	/* The channel nodes are below the interface's, found by its number */
+	if (u->udev->dev.of_node && !intf->dev.of_node)
+		dev_dbg(&intf->dev, "interface %u has no DT node\n",
+			intf->cur_altsetting->desc.bInterfaceNumber);
 	ret = obmf_dialect_attach(&u->tp, proto);
 	if (ret)
 		return ret;
@@ -677,6 +681,12 @@ module_init(obmf_usb_init);
 static void __exit obmf_usb_exit(void)
 {
 	usb_deregister(&obmf_usb_driver);
+	/*
+	 * A device link to a function device may still hold its last
+	 * reference, put later from the device-link workqueue; the release
+	 * runs in this module.
+	 */
+	device_link_wait_removal();
 	obmf_debugfs_exit();
 }
 module_exit(obmf_usb_exit);

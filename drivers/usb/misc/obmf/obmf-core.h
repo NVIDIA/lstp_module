@@ -242,6 +242,7 @@ struct obmf_dreq_rec {
  * @queued: allocated records on @queue
  * @owed: answers owed but not queued, for want of a record
  * @owed_cmd: payload byte 0 of the last owed request
+ * @owed_invalid: invalid answers owed to requests that could not be decoded
  * @work: delivers the device requests
  * @dispatch_lock: held while a device request is delivered
  * @fdev: the function device, NULL if none
@@ -273,13 +274,14 @@ struct obmf_channel {
 	/** @dialect_data: the dialect's state for the channel, freed with it */
 	void *dialect_data;
 #endif
-	spinlock_t dreq_lock; /* queue to owed_cmd */
+	spinlock_t dreq_lock; /* queue to owed_invalid */
 	struct list_head queue;
 	struct list_head kept;
 	struct obmf_dreq_rec *reserve[OBMF_DREQ_RESERVE];
 	unsigned int queued;
 	unsigned int owed;
 	u8 owed_cmd;
+	unsigned int owed_invalid;
 	struct work_struct work;
 	struct mutex dispatch_lock; /* ops and publisher */
 	struct obmf_fdev *fdev;
@@ -379,6 +381,7 @@ int obmf_slot_xfer(struct obmf_channel *ch, u8 cmd, size_t len,
 bool obmf_dreq_len_ok(const struct obmf_channel *ch, const u8 *data,
 		      size_t len);
 bool obmf_dreq_add(struct obmf_channel *ch, const u8 *data, size_t len);
+void obmf_dreq_owe_invalid(struct obmf_channel *ch);
 
 /* A call from a function driver, waited for by obmf_core_stop() */
 DEFINE_CLASS(obmf_inflight, struct obmf_core *, obmf_inflight_exit(_T),
@@ -390,6 +393,9 @@ int obmf_ctrl_read(struct obmf_core *core, u32 addr, void *buf, size_t len);
 int obmf_ctrl_write(struct obmf_core *core, u32 addr, const void *buf,
 		    size_t len);
 int obmf_ctrl_discover(struct obmf_core *core);
+int obmf_ch_status_read(struct obmf_fdev *fdev, u8 *status, u8 *specific);
+int obmf_ch_control_update(struct obmf_fdev *fdev, u8 specific_mask,
+			   u8 specific_val);
 
 /* obmf-bus.c */
 void obmf_bus_publish(struct obmf_core *core);

@@ -7,14 +7,31 @@ send with a report. The commands need root where they show `sudo`.
 
 The unit tests run in a kernel tree with `kunit.py`. They need Linux
 v7.3-rc6 or later, because the in-tree build has no compat header.
-Copy the core driver and its header into the tree and hook it in:
+Copy the core driver, its header and the two function drivers into
+the tree and hook them in. The function drivers have no Kconfig
+entries of their own yet, so add the two entries the `.kunitconfig`
+asks for; the serial entry goes outside `if TTY`, so it names `TTY`:
 
 ```sh
 cd linux
 cp -r <drop>/drivers/usb/misc/obmf drivers/usb/misc/
 cp <drop>/include/linux/usb/obmf.h include/linux/usb/
+cp <drop>/drivers/i2c/busses/i2c-obmf.c drivers/i2c/busses/
+cp <drop>/drivers/tty/obmf_tty.c drivers/tty/
 echo 'source "drivers/usb/misc/obmf/Kconfig"' >> drivers/usb/misc/Kconfig
 echo 'obj-$(CONFIG_USB_OBMF) += obmf/' >> drivers/usb/misc/Makefile
+cat >> drivers/i2c/busses/Kconfig <<'EOF'
+config I2C_OBMF
+	tristate "OBMF-ICP I2C channels"
+	depends on USB_OBMF
+EOF
+echo 'obj-$(CONFIG_I2C_OBMF) += i2c-obmf.o' >> drivers/i2c/busses/Makefile
+cat >> drivers/tty/Kconfig <<'EOF'
+config OBMF_TTY
+	tristate "OBMF-ICP serial channels"
+	depends on TTY && USB_OBMF
+EOF
+echo 'obj-$(CONFIG_OBMF_TTY) += obmf_tty.o' >> drivers/tty/Makefile
 ```
 
 The native suites:
@@ -39,12 +56,21 @@ With the dialect support, and with LSTP:
 ```
 
 The suites are `obmf-core`, `obmf-ctrl`, `obmf-bus` and `obmf-usb`;
-`obmf-dialect` with the dialect support; `obmf-lstp` with LSTP. Every
-test must pass.
+`obmf-i2c` and `obmf-tty`, which run the I2C and serial drivers on
+the fake transport; `obmf-dialect` with the dialect support;
+`obmf-lstp` with LSTP. Every test must pass. Some cases make a driver
+warn or fail a probe on purpose, so the log has such lines; only the
+results count. The serial cases that check the kernel log read it
+from the console tracepoint, which the `.kunitconfig` enables with
+`CONFIG_FTRACE=y`; on a kernel without tracepoints or printk they are
+skipped.
 
 Out of tree, `make OBMF_KUNIT_TEST=y` against a kernel with
-`CONFIG_KUNIT` builds the same suites into `obmf.ko`, and loading the
-module runs them. That path has not been run yet.
+`CONFIG_KUNIT` and `CONFIG_DTC` builds the core suites into
+`obmf.ko`, and loading the module runs them; the `obmf-i2c` and
+`obmf-tty` suites and the LSTP cases of those drivers need them
+built in, so they are not part of it. That path has not been run
+yet.
 
 ## Build and load
 
@@ -134,8 +160,15 @@ Messages that point to a problem:
 | `no device name, label ...`, `no channel name, label ...` | the device left a name empty; harmless |
 | `transport failed (<errno>), device stopped` | repeated USB errors; unbind and bind, or replug |
 | `no response during unbind, device stopped` | the device stopped answering during an unbind |
-| `dropped <n> bytes: <errno>` | the device refused a serial write 20 times, or did not answer |
+| `channel <n>: request not answered`, `channel <n>: device request kept at unbind` | a function driver left a device request unanswered; the core sent the default answer |
+| `dropped <n> bytes: <errno>` | the device answered a serial write with an error status other than busy or a timeout, or with a malformed answer; those characters are not sent again |
+| `transmit stalled: <reason>, <n> characters waiting` | for 5 s the device has refused (`refused`), answered busy (`busy`) or not answered (`timed out`) the next serial write; one line per stall; the characters stay and go out once the device takes them. A port held off by flow control (CTS) for 5 s gets the same line |
+| `<n> characters not sent at close, discarded` | the last close found characters the device had not taken; with a write in flight, the line comes once it is answered or times out |
+| `line speed 0`, `configuration data too short`, `request limit <n> too small` | a serial channel's configuration or limits were refused; it has no tty |
+| `unsupported line <d><p><s>, using 8N1` | a serial channel's data bits, parity or stop bits are out of range; the tty runs at 8N1 |
+| `channel <n>: node <name> ignored` | a child node with the channel's `reg` has another name than `i2c` or `serial` |
 | `unsupported LSTP version <n>` | the LSTP device is not version 1; nothing binds |
+| `channel <n>: short config (<n>), ignored`, `channel <n>: over budget, ignored` | an LSTP channel's configuration was too short, or its slices too many; the others bind |
 
 Then the devices:
 
@@ -175,6 +208,10 @@ sudo i2ctransfer -y $N r1@0x50; echo rc=$?
 | `No such device or address` | NACK: no target at that address |
 | `Device or resource busy` | the device reported the bus busy; check the pull-ups before going on |
 | `Connection timed out` | no response, or the device's I2C timeout; collect the logs |
+
+The driver offers no I2C bus recovery: a bus held by a target shows
+as transfers that time out or report busy. Unplug and replug the
+device to recover it.
 
 An EEPROM through the at24 driver tests the Write Read path:
 
@@ -222,15 +259,69 @@ sleep 15; kill %1                 # 15 s covers 115200 baud
 cmp tx.bin rx.bin && echo SAME
 ```
 
-A break:
+Host writes the device refuses (NACK), answers busy, or does not
+answer stay in the driver's 4096-byte buffer and are sent again 10 ms
+after each refusal, busy answer or timeout, with no limit: a device
+that does not answer is tried about once a second. A write blocks
+once the buffer is full. A device that refuses for 5 s gets one
+`transmit stalled` line, also when flow control holds it off. A
+device that answers after the driver's timeout can get the same
+characters twice, and characters it refuses right after that can
+count as sent; report any duplicated or missing bytes in `cmp` with
+the kernel log. The last close waits up to 30 s for the characters
+the device has not taken, then discards them with `characters not
+sent at close`; `tcflush` discards them without a line.
+
+A break; a break the device keeps refusing fails with `EIO`:
 
 ```sh
 python3 -c 'import termios, os, sys
 f = os.open(sys.argv[1], os.O_RDWR); termios.tcsendbreak(f, 0)' $T
 ```
 
-Bytes the device sends while the port is closed are dropped, as on a
-UART with no reader.
+If the serial channel has a firmware node, check that the serial
+function device carries it and the tty does not:
+
+```sh
+S=$(readlink -f /sys/class/tty/${T#/dev/}/device); echo "S=$S"
+readlink -f $S/of_node                 # device tree: the serial@<n> node
+cat $S/firmware_node/path 2>/dev/null  # ACPI: the channel object
+ls /sys/class/tty/${T#/dev/}/ | grep -c node   # 0: the tty has none
+```
+
+With the node disabled, the channel has no `obmf.serial` device and
+no tty. A child with the channel's `reg` and another name logs
+"channel <n>: node <name> ignored".
+
+While the port is closed, the host refuses device writes that carry
+characters, and the device is expected to keep them and send them
+again. To check it, have the device send a known pattern while no
+program has `$T` open, then open the port and read:
+
+```sh
+(stty raw -echo clocal; cat) < $T > rx-closed.bin &
+sleep 5; kill %1
+```
+
+`rx-closed.bin` should start with the pattern. If it is missing or
+cut, the device dropped what the host refused; see `KNOWN-ISSUES.md`.
+
+The counters of the port, with the received and sent characters,
+breaks, overruns, Carrier Down events (`dcd`) and the refusals for a
+full buffer (`buf_overrun`):
+
+```sh
+python3 -c 'import fcntl, os, struct, sys
+f = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+b = fcntl.ioctl(f, 0x545D, bytes(80))  # TIOCGICOUNT
+n = ("cts dsr rng dcd rx tx frame overrun parity brk "
+     "buf_overrun").split()
+print(dict(zip(n, struct.unpack("11i", b[:44]))))' $T
+```
+
+Carrier Down hangs the tty up only when `CLOCAL` is clear. With
+`stty -F $T -clocal` and a program reading `$T`, a Carrier Down event
+from the device ends the read, and `dcd` goes up by one.
 
 ## Unbind, unplug and unload
 

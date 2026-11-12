@@ -9,7 +9,6 @@
 #include <linux/auxiliary_bus.h>
 #include <linux/bits.h>
 #include <linux/build_bug.h>
-#include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/limits.h>
 #include <linux/minmax.h>
@@ -46,17 +45,7 @@ struct obmf_i2c_cfg {
 	u8 options;
 } __packed;
 
-#define OBMF_I2C_OPT_BUS_RECOVERY BIT(0)
-
-/* OBMF-ICP 1.0.0, 5.15.1, Table 69 */
-#define OBMF_I2C_STATUS_RECOVERY_FAILED BIT(2)
-#define OBMF_I2C_STATUS_RECOVERY_SUCCESS BIT(3)
-#define OBMF_I2C_CONTROL_TRIGGER_RECOVERY BIT(2)
-#define OBMF_I2C_CONTROL_CLEAR_STATUS BIT(3)
-
 #define OBMF_I2C_RETRIES 3
-#define OBMF_I2C_RECOVERY_POLLS 10
-#define OBMF_I2C_RECOVERY_POLL_MS 10
 
 static const u32 obmf_i2c_speeds[] = { 100000, 400000, 1000000, 3400000 };
 
@@ -64,7 +53,6 @@ struct obmf_i2c {
 	struct i2c_adapter adap;
 	struct obmf_fdev *fdev;
 	struct i2c_adapter_quirks quirks;
-	struct i2c_bus_recovery_info rinfo;
 	struct obmf_i2c_req *req;
 	struct obmf_i2c_resp *resp;
 };
@@ -113,43 +101,6 @@ static int obmf_i2c_request(struct obmf_i2c *i2c, u8 cmd, u16 addr,
 	return 0;
 }
 
-/* OBMF-ICP 1.0.0, 5.15.1, Table 69: clear, trigger, poll, clear */
-static int obmf_i2c_recover(struct i2c_adapter *adap)
-{
-	struct obmf_i2c *i2c = i2c_get_adapdata(adap);
-	u8 status, specific;
-	int i, ret;
-
-	ret = obmf_ch_control_update(i2c->fdev, OBMF_I2C_CONTROL_CLEAR_STATUS,
-				     OBMF_I2C_CONTROL_CLEAR_STATUS);
-	if (!ret)
-		ret = obmf_ch_control_update(i2c->fdev,
-					     OBMF_I2C_CONTROL_TRIGGER_RECOVERY,
-					     OBMF_I2C_CONTROL_TRIGGER_RECOVERY);
-	if (ret)
-		return ret;
-
-	ret = -ETIMEDOUT;
-	for (i = 0; i < OBMF_I2C_RECOVERY_POLLS; i++) {
-		msleep(OBMF_I2C_RECOVERY_POLL_MS);
-		ret = obmf_ch_status_read(i2c->fdev, &status, &specific);
-		if (ret)
-			break;
-		ret = -ETIMEDOUT;
-		if (specific & OBMF_I2C_STATUS_RECOVERY_SUCCESS) {
-			ret = 0;
-			break;
-		}
-		if (specific & OBMF_I2C_STATUS_RECOVERY_FAILED) {
-			ret = -EBUSY;
-			break;
-		}
-	}
-	obmf_ch_control_update(i2c->fdev, OBMF_I2C_CONTROL_CLEAR_STATUS,
-			       OBMF_I2C_CONTROL_CLEAR_STATUS);
-	return ret;
-}
-
 /* Every message is checked before the first is sent */
 static int obmf_i2c_check(struct i2c_msg *msgs, int num)
 {
@@ -158,7 +109,9 @@ static int obmf_i2c_check(struct i2c_msg *msgs, int num)
 	for (i = 0; i < num; i++) {
 		if (msgs[i].flags & I2C_M_TEN)
 			return -EAFNOSUPPORT;
-		if (msgs[i].flags & ~(I2C_M_RD | I2C_M_DMA_SAFE))
+		/* The SMBus emulation copies the client's PEC flag here */
+		if (msgs[i].flags &
+		    ~(I2C_M_RD | I2C_M_DMA_SAFE | I2C_CLIENT_PEC))
 			return -EOPNOTSUPP;
 		if (msgs[i].addr > 0x7f)
 			return -EINVAL;
@@ -200,13 +153,8 @@ static int obmf_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
 			ret = obmf_i2c_request(i2c, cmd, m->addr, m->buf,
 					       m->len, r ? r->buf : NULL,
 					       r ? r->len : 0);
-		if (ret) {
-			/* A timeout or busy status, or no response */
-			if ((ret == -ETIMEDOUT || ret == -EBUSY) &&
-			    adap->bus_recovery_info)
-				i2c_recover_bus(adap);
+		if (ret)
 			return ret;
-		}
 	}
 	return num;
 }
@@ -240,10 +188,11 @@ static int obmf_i2c_cfg(struct obmf_i2c *i2c, struct device *dev)
 		return dev_err_probe(dev, -EINVAL,
 				     "clock-frequency %u, channel runs at %u\n",
 				     freq, speed);
-	if (cfg->options & OBMF_I2C_OPT_BUS_RECOVERY) {
-		i2c->rinfo.recover_bus = obmf_i2c_recover;
-		i2c->adap.bus_recovery_info = &i2c->rinfo;
-	}
+	/*
+	 * The channel's bus recovery (options bit 0) is not offered to the
+	 * I2C core: no status says the bus is held, and a recovery sent
+	 * after a timeout can take the late reply as its own
+	 */
 	return 0;
 }
 

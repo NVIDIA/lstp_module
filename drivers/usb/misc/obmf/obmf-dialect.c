@@ -217,20 +217,10 @@ static void obmf_rx_wire_response(struct obmf_channel *ch, const u8 *msg,
 }
 
 /*
- * Whether every device request of the type waits for an answer: a
- * serial write (5.5.1, Table 22) and an IPMI request (5.9, Table 44).
- * On GPIO the command decides (5.4.1, Table 18).
- */
-static bool obmf_type_answers(u8 type)
-{
-	return type == OBMF_TYPE_SERIAL || type == OBMF_TYPE_IPMI;
-}
-
-/*
  * A device request under a dialect. One the dialect cannot decode may
  * still wait for an answer where the type answers every request: the
- * type's default answer is owed, and the dialect drops it where its
- * wire protocol has none.
+ * invalid answer is owed, and the dialect drops it where its wire
+ * protocol has none.
  */
 static void obmf_rx_wire_dreq(struct obmf_channel *ch, const u8 *msg,
 			      size_t len)
@@ -249,10 +239,7 @@ static void obmf_rx_wire_dreq(struct obmf_channel *ch, const u8 *msg,
 		    !obmf_dreq_len_ok(ch, ch->dreq_dec + OBMF_HDR_LEN,
 				      n - OBMF_HDR_LEN)) {
 			bad = true;
-			if (obmf_type_answers(ch->info.type)) {
-				ch->owed++;
-				ch->owed_cmd = 0;
-			}
+			obmf_dreq_owe_invalid(ch);
 		} else {
 			queued = obmf_dreq_add(ch, ch->dreq_dec + OBMF_HDR_LEN,
 					       n - OBMF_HDR_LEN);
@@ -323,6 +310,9 @@ int obmf_dialect_status_read(struct obmf_channel *ch, u8 *status, u8 *specific)
 /* channel 1: an I2C channel whose header is here, with these limits */
 #define DT_CH 0x100
 #define DT_LIMIT 1000
+/* its configuration, OBMF-ICP 1.0.0, 5.15.2, Table 79: 100 kHz */
+#define DT_CFG (DT_CH + 0x20)
+#define DT_CFG_LEN 2
 /* the wire form of the fake dialect: the payload XOR this byte */
 #define DT_KEY 0x5a
 /* a wire status, and the errno the dialect gives it */
@@ -526,6 +516,13 @@ static int dt_discover(struct obmf_core *core, struct obmf_channel **found,
 			   DT_LIMIT - OBMF_HDR_LEN, DT_LIMIT + OBMF_HDR_LEN);
 	if (!ch)
 		return -ENOMEM;
+	ch->config = kmemdup(f->mem + DT_CFG, DT_CFG_LEN, GFP_KERNEL);
+	if (!ch->config) {
+		obmf_ch_free(ch);
+		return -ENOMEM;
+	}
+	ch->info.config = ch->config;
+	ch->info.config_len = DT_CFG_LEN;
 	ch->info.type = h[0];
 	ch->info.role = h[0x12];
 	obmf_copy_name(ch->info.name, h + 2, 16);
@@ -616,6 +613,7 @@ static struct dt_fake *dt_bind(struct kunit *test,
 	h[OBMF_CH_REG_SPECIFIC_CONTROL] = 0xa5;
 	put_unaligned_le16(DT_LIMIT, h + 0x17);
 	put_unaligned_le16(DT_LIMIT, h + 0x19);
+	put_unaligned_le32(DT_CFG_LEN, h + 0x1c);
 	f->regs[OBMF_CH_REG_STATUS] = 0x33;
 	f->regs[OBMF_CH_REG_SPECIFIC_STATUS] = 0x44;
 	f->regs[OBMF_CH_REG_SPECIFIC_CONTROL] = 0xa5;
@@ -788,6 +786,10 @@ static void dt_encode_decode(struct kunit *test)
 	dt_check(test, &dt_pair, DT_ENCODE | DT_DECODE);
 }
 
+/*
+ * Discovery reads no device name. Expected, from i2c-obmf: "no device
+ * name, label 'i2c'".
+ */
 static void dt_discover_alone(struct kunit *test)
 {
 	dt_check(test, &dt_discover_only, DT_DISCOVER);

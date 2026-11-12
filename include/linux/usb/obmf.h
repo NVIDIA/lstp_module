@@ -162,7 +162,8 @@ struct obmf_dreq {
  * @device_request: called in process context, one at a time per channel.
  *	Return 0 when answered (or not due), -EINPROGRESS to keep @dreq and
  *	answer later with obmf_respond() or obmf_dreq_drop(), or an error
- *	for the core to send the default answer.
+ *	for the core to send the default answer. A return of 0 that left
+ *	a due answer unsent gets the default answer too, with a warning.
  */
 struct obmf_fdev_ops {
 	int (*device_request)(struct obmf_fdev *fdev, struct obmf_dreq *dreq);
@@ -178,11 +179,14 @@ void obmf_dreq_drop(struct obmf_fdev *fdev, struct obmf_dreq *dreq);
 int devm_obmf_enable(struct obmf_fdev *fdev);
 int devm_obmf_publish(struct obmf_fdev *fdev, const struct obmf_fdev_ops *ops);
 
-int obmf_ch_status_read(struct obmf_fdev *fdev, u8 *status, u8 *specific);
-int obmf_ch_control_update(struct obmf_fdev *fdev, u8 specific_mask,
-			   u8 specific_val);
-
 void obmf_fdev_label(struct obmf_fdev *fdev, char *buf, size_t size);
 void obmf_fdev_protocol_error(struct obmf_fdev *fdev);
+
+#if IS_ENABLED(CONFIG_OBMF_KUNIT_TEST)
+struct tty_struct;
+
+void obmf_tty_kunit_counts(struct tty_struct *tty, unsigned long *dropped,
+			   unsigned long *stalls);
+#endif
 
 #endif /* __LINUX_USB_OBMF_H */

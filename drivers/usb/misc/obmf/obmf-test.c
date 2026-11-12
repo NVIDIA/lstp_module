@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * OBMF-ICP over USB: KUnit tests of the message layer and of channel
- * discovery, on a fake transport
+ * OBMF-ICP over USB: KUnit tests of the message layer, of channel
+ * discovery and of the I2C controller and serial drivers, on a fake
+ * transport
  */
 
 #include <kunit/device.h>
@@ -13,22 +14,29 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/hrtimer.h>
+#include <linux/i2c.h>
+#include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/of.h>
 #include <linux/property.h>
+#include <linux/serial.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/tracepoint.h>
+#include <linux/tty.h>
+#include <linux/tty_flip.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+#include <trace/events/printk.h>
 
 #include "obmf-core.h"
 
 #define FAKE_LOG_LEN 256
 #define FAKE_KEEP 72
-#define FAKE_STEPS 16
+#define FAKE_STEPS 24
 #define FAKE_DEFER 8
 #define FAKE_MSG 528
 #define FAKE_MEM SZ_8K
@@ -125,6 +133,7 @@ struct obmf_test_fn {
 	atomic_t calls;
 	bool hold;
 	bool keep;
+	bool ignore;
 	struct obmf_dreq *kept;
 	struct completion entered;
 	struct completion release;
@@ -149,15 +158,21 @@ struct obmf_fake {
 	bool quiesced;
 	int resume_ret;
 	unsigned int send_sleep_ms;
+	bool send_until_unbind;
+	int answer_ret;
 	struct fake_step steps[FAKE_STEPS];
 	unsigned int nsteps;
 	unsigned int step;
 	struct fake_step dflt;
 	struct fake_defer defer[FAKE_DEFER];
 
-	/* channel 0: the configuration space and its faults */
+	/*
+	 * channel 0: the configuration space and its faults; addresses from
+	 * hi_base up (if set) are the last bytes of mem
+	 */
 	u8 *mem;
 	size_t mem_len;
+	u32 hi_base;
 	bool head;
 	unsigned int reads;
 	unsigned int hdr_reads;
@@ -420,6 +435,8 @@ static int fake_ch0(struct obmf_fake *f, const u8 *msg, size_t len)
 	KUNIT_EXPECT_EQ(f->test, p[0] & ~7, 0);
 	KUNIT_EXPECT_EQ(f->test, p[1], 0);
 	addr = get_unaligned_le32(p + 2);
+	if (f->hi_base && addr >= f->hi_base)
+		addr = f->mem_len - (u32)-addr;
 
 	if (p[0] == FAKE_SHORT_WRITE) {
 		dlen = plen - 6;
@@ -594,7 +611,10 @@ static int fake_send(struct obmf_transport *tp, const void *buf, size_t len,
 		     unsigned int timeout_ms)
 {
 	struct obmf_fake *f = to_fake(tp);
+	/* Read before fake_log() wakes the test, which may then set it */
+	bool until = READ_ONCE(f->send_until_unbind);
 	const u8 *msg = buf;
+	int state;
 
 	if (READ_ONCE(f->stopped)) {
 		KUNIT_FAIL(f->test, "send after stop");
@@ -609,10 +629,14 @@ static int fake_send(struct obmf_transport *tp, const void *buf, size_t len,
 	fake_log(f, FAKE_SEND, msg, len, timeout_ms);
 	if (f->send_sleep_ms)
 		msleep(f->send_sleep_ms);
+	if (until &&
+	    read_poll_timeout(obmf_core_state, state, state != OBMF_LIVE, 1000,
+			      FAKE_WAIT_MS * 1000, false, tp->core))
+		KUNIT_FAIL(f->test, "send: still live");
 	if (READ_ONCE(f->quiesced))
 		return -EAGAIN;
 	if (msg[1] & OBMF_HDR_RQRESP)
-		return 0;
+		return READ_ONCE(f->answer_ret);
 	if (!msg[0])
 		return fake_ch0(f, msg, len);
 	return fake_reply_step(f, msg);
@@ -759,6 +783,12 @@ static void fake_layout(struct obmf_fake *f, const struct test_chan *c, int n)
 		put_unaligned_le32(c[i].config_len, h + 0x1c);
 		for (k = 0; k < c[i].config_len; k++)
 			h[FAKE_CH_HDR_LEN + k] = (u8)(i * 7 + k);
+		/* OBMF-ICP 1.0.0, 5.15.2, Table 79: 100 kHz, bus recovery */
+		if (c[i].type == OBMF_TYPE_I2C_CONTROLLER &&
+		    c[i].config_len >= 2) {
+			h[FAKE_CH_HDR_LEN] = 0x00;
+			h[FAKE_CH_HDR_LEN + 1] = 0x01;
+		}
 		off += ALIGN(FAKE_CH_HDR_LEN + c[i].config_len, 16);
 	}
 }
@@ -800,7 +830,7 @@ static int fake_bind(struct obmf_fake *f)
 
 /* The channels the message layer cases use */
 static const struct test_chan core_chans[] = {
-	{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c", 516 },
+	{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c", 516, 0, 2 },
 	{ OBMF_TYPE_GPIO, OBMF_ROLE_PRODUCER, "gpio", 516 },
 	{ OBMF_TYPE_IPMI, OBMF_ROLE_PRODUCER, "ipmi", 516 },
 	{ OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, "spi", 516 },
@@ -934,6 +964,8 @@ static int test_fn_request(struct obmf_fdev *fdev, struct obmf_dreq *dreq)
 		fn->kept = dreq;
 		return -EINPROGRESS;
 	}
+	if (fn->ignore)
+		return 0;
 	if (dreq->answer_due)
 		fn->answer_ret =
 			obmf_respond(fdev, dreq, OBMF_STATUS_SUCCESS, NULL, 0);
@@ -1942,7 +1974,8 @@ static void obmf_test_quiesce_armed_timeout(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_TIMEOUTS), 1);
 	q = fake_find(f, i, FAKE_QUIESCE, -1, -1);
 	KUNIT_ASSERT_GT(test, q, i);
-	KUNIT_EXPECT_GE(test, ktime_ms_delta(f->log[q].t, f->log[i].t), 200);
+	KUNIT_EXPECT_GE(test, ktime_ms_delta(f->log[q].t, f->log[i].t),
+			200 - 2 * jiffies_to_msecs(1));
 	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_QUIESCED);
 }
 
@@ -2123,12 +2156,15 @@ static void obmf_test_unbind_timeout(struct kunit *test)
 	struct test_call *quick, *slow;
 	unsigned int sends;
 
+	/* A built-in i2c-obmf holds the device */
+	device_release_driver(&chan(f, CH_I2C)->fdev->adev.dev);
 	KUNIT_ASSERT_EQ(test, auxiliary_driver_register(&test_slow_driver), 0);
 	KUNIT_ASSERT_EQ(test,
 			kunit_add_action_or_reset(test, test_slow_unregister,
 						  &test_slow_driver),
 			0);
-	KUNIT_ASSERT_NOT_NULL(test, chan(f, CH_I2C)->fdev->adev.dev.driver);
+	KUNIT_ASSERT_PTR_EQ(test, chan(f, CH_I2C)->fdev->adev.dev.driver,
+			    &test_slow_driver.driver);
 
 	fake_push(f, &s);
 	fake_push(f, &s);
@@ -2149,6 +2185,111 @@ static void obmf_test_unbind_timeout(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->stop_state, OBMF_STOPPED);
 	KUNIT_EXPECT_EQ(test, f->stop_state_after, OBMF_STOPPED);
 	KUNIT_EXPECT_EQ(test, f->stop_fatals, 0);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_STOP, -1, -1), 1);
+}
+
+/*
+ * A request whose send times out while a function driver's remove holds
+ * the core in UNBINDING stops the core as a reply timeout does: a request
+ * still waiting ends -ENODEV then, not at the end of remove
+ */
+static void obmf_test_unbind_send_timeout(struct kunit *test)
+{
+	struct obmf_fake *f = core_setup(test, 0);
+	struct fake_step never = { .how = FAKE_NEVER, .channel = -1 };
+	struct fake_step out = { .send_ret = -ETIMEDOUT };
+	struct test_call *quick, *slow;
+	unsigned int sends;
+
+	device_release_driver(&chan(f, CH_I2C)->fdev->adev.dev);
+	KUNIT_ASSERT_EQ(test, auxiliary_driver_register(&test_slow_driver), 0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, test_slow_unregister,
+						  &test_slow_driver),
+			0);
+
+	fake_push(f, &never);
+	fake_push(f, &out);
+	sends = f->sends;
+	slow = call_start(f, call_request, chan(f, CH_SPI), 1, 5000);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
+	/* the second send returns its -ETIMEDOUT once the unbind runs */
+	WRITE_ONCE(f->send_until_unbind, true);
+	quick = call_start(f, call_request, chan(f, CH_GPIO), 1, 5000);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 2));
+	fake_unbind(f);
+
+	KUNIT_ASSERT_TRUE(test, call_wait(quick));
+	KUNIT_ASSERT_TRUE(test, call_wait(slow));
+	KUNIT_EXPECT_EQ(test, quick->ret, -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, slow->ret, -ENODEV);
+	KUNIT_EXPECT_LT(test, ktime_ms_delta(slow->end, slow->start), 500);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_STOP, -1, -1), 1);
+}
+
+#define TEST_FLOOD 8
+
+/* The fake whose channel the flood driver's unbind floods */
+static struct obmf_fake *test_flood_fake;
+
+static void test_flood(void *data)
+{
+	static const u8 other[] = { 0x01, 0x00 };
+	struct obmf_fdev *fdev = data;
+	struct obmf_fake *f = test_flood_fake;
+	int i;
+
+	WRITE_ONCE(f->answer_ret, -ETIMEDOUT);
+	for (i = 0; i < TEST_FLOOD; i++)
+		fake_inject(f, fdev->info->number, 0, other, sizeof(other));
+}
+
+static int test_flood_probe(struct auxiliary_device *adev,
+			    const struct auxiliary_device_id *id)
+{
+	struct obmf_fdev *fdev = to_obmf_fdev(adev);
+	int ret;
+
+	ret = devm_obmf_enable(fdev);
+	if (ret)
+		return ret;
+	return devm_add_action_or_reset(&adev->dev, test_flood, fdev);
+}
+
+static struct auxiliary_driver test_flood_driver = {
+	.name = "test-flood",
+	.probe = test_flood_probe,
+	.id_table = test_slow_ids,
+};
+
+/*
+ * Device requests that keep coming in an attached unbind, their answers
+ * timing out: the first timeout stops the core, and no answer is sent
+ * after it, so the unbind does not wait a timeout per request
+ */
+static void obmf_test_unbind_answers(struct kunit *test)
+{
+	struct obmf_fake *f = core_setup(test, 0);
+	struct obmf_fdev *fdev = chan(f, CH_I2C)->fdev;
+	int ret, rx, answers;
+
+	/* A built-in i2c-obmf holds the device */
+	device_release_driver(&fdev->adev.dev);
+	test_flood_fake = f;
+	ret = auxiliary_driver_register(&test_flood_driver);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	ret = kunit_add_action_or_reset(test, test_slow_unregister,
+					&test_flood_driver);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_PTR_EQ(test, fdev->adev.dev.driver,
+			    &test_flood_driver.driver);
+
+	rx = fake_count(f, FAKE_RX, CH_I2C, -1);
+	answers = fake_count(f, FAKE_SEND, CH_I2C, 1);
+	fake_unbind(f);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_RX, CH_I2C, -1),
+			rx + TEST_FLOOD);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 1), answers + 1);
 	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_STOP, -1, -1), 1);
 }
 
@@ -2247,8 +2388,10 @@ static void obmf_test_dreq_datagrams(struct kunit *test)
 }
 
 /*
- * The default answers with no driver bound: a serial write is refused with
- * nothing taken, a GPIO interrupt acknowledged, anything else answered busy
+ * The default answers with no driver bound, or one that published no
+ * operations (I2C, when i2c-obmf is built in): a serial write is refused
+ * with nothing taken, a GPIO interrupt acknowledged, anything else
+ * answered busy
  */
 static void obmf_test_default_answers(struct kunit *test)
 {
@@ -2332,6 +2475,81 @@ static void obmf_test_default_answer_roles(struct kunit *test)
 }
 
 /*
+ * A serial write whose count runs past its data, or an empty IPMI request,
+ * is malformed and answered invalid with no body but IPMI's echo, so the
+ * device does not send it again; an empty GPIO request gets no answer,
+ * and a well-formed write after them still gets the NACK
+ */
+static void obmf_test_dreq_malformed(struct kunit *test)
+{
+	static const u8 write[] = { 0x00, 0x03, 0x00, 'o', 'k' };
+	static const u8 good[] = { 0x00, 0x02, 0x00, 'o', 'k' };
+	struct obmf_fake *f = core_setup(test, 0);
+	struct obmf_channel *ser = chan(f, CH_SERIAL);
+	struct fake_rec *r;
+
+	fake_inject(f, CH_SERIAL, 0, write, sizeof(write));
+	fake_inject(f, CH_IPMI, 0, NULL, 0);
+	fake_inject(f, CH_GPIO, 0, NULL, 0);
+	flush_workqueue(f->core->wq);
+
+	KUNIT_EXPECT_EQ(test, if_cnt(f->core, OBMF_IF_RX_MALFORMED), 3);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ser, OBMF_CH_PROTOCOL_ERRORS), 0);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ser, OBMF_CH_DEFAULT_ANSWERS), 1);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_SERIAL, 1), 1);
+	r = last_answer(f, CH_SERIAL);
+	KUNIT_EXPECT_EQ(test, r->msg[1], OBMF_HDR_RQRESP | OBMF_STATUS_INVALID);
+	KUNIT_EXPECT_EQ(test, r->len, OBMF_HDR_LEN);
+	r = last_answer(f, CH_IPMI);
+	KUNIT_EXPECT_EQ(test, r->msg[1], OBMF_HDR_RQRESP | OBMF_STATUS_INVALID);
+	KUNIT_EXPECT_EQ(test, r->len, OBMF_HDR_LEN + 1);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_GPIO, 1), 0);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, CH_GPIO), OBMF_CH_DEFAULT_ANSWERS),
+			0);
+
+	fake_inject(f, CH_SERIAL, 0, good, sizeof(good));
+	flush_workqueue(f->core->wq);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_SERIAL, 1), 2);
+	r = last_answer(f, CH_SERIAL);
+	KUNIT_EXPECT_EQ(test, r->msg[1], OBMF_HDR_RQRESP | OBMF_STATUS_SUCCESS);
+	KUNIT_EXPECT_EQ(test, r->len, OBMF_HDR_LEN + 3);
+	KUNIT_EXPECT_EQ(test, r->msg[4], FAKE_SERIAL_NACK);
+	KUNIT_EXPECT_EQ(test, if_cnt(f->core, OBMF_IF_RX_MALFORMED), 3);
+}
+
+/*
+ * A driver that returns 0 without answering: a request due an answer gets
+ * the default answer, a datagram none
+ */
+static void obmf_test_dreq_unanswered(struct kunit *test)
+{
+	static const u8 dgram[] = { FAKE_GPIO_DATAGRAM, 0x01 };
+	struct obmf_fake *f = core_setup(test, 0);
+	struct obmf_channel *ch = chan(f, CH_GPIO);
+	struct obmf_test_fn *fn = test_fn_publish(f, ch);
+	struct fake_rec *r;
+	u8 msg[16];
+
+	fn->ignore = true;
+	fake_rx(f, msg, gpio_notify(msg, CH_GPIO));
+	flush_workqueue(f->core->wq);
+	KUNIT_EXPECT_EQ(test, atomic_read(&fn->calls), 1);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_GPIO, 1), 1);
+	r = last_answer(f, CH_GPIO);
+	KUNIT_EXPECT_EQ(test, r->msg[1], OBMF_HDR_RQRESP | OBMF_STATUS_SUCCESS);
+	KUNIT_EXPECT_EQ(test, r->msg[4], FAKE_GPIO_INTERRUPT_NOTIFY);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_DEFAULT_ANSWERS), 1);
+	KUNIT_EXPECT_EQ(test, dreq_out(ch), 0);
+
+	fake_inject(f, CH_GPIO, 0, dgram, sizeof(dgram));
+	flush_workqueue(f->core->wq);
+	KUNIT_EXPECT_EQ(test, atomic_read(&fn->calls), 2);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_GPIO, 1), 1);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_DEFAULT_ANSWERS), 1);
+	KUNIT_EXPECT_EQ(test, dreq_out(ch), 0);
+}
+
+/*
  * obmf_respond() on a request due no answer fails -EINVAL, and once the
  * transport has stopped -ENODEV; obmf_dreq_drop() counts the request
  * dropped. Each ends the request and sends nothing.
@@ -2405,10 +2623,14 @@ static struct kunit_case obmf_core_cases[] = {
 	KUNIT_CASE(obmf_test_quiesce_delivery),
 	KUNIT_CASE(obmf_test_resume_fails),
 	KUNIT_CASE(obmf_test_unbind_timeout),
+	KUNIT_CASE(obmf_test_unbind_send_timeout),
+	KUNIT_CASE(obmf_test_unbind_answers),
 	KUNIT_CASE(obmf_test_dreq_flood),
 	KUNIT_CASE(obmf_test_dreq_datagrams),
 	KUNIT_CASE(obmf_test_default_answers),
 	KUNIT_CASE(obmf_test_default_answer_roles),
+	KUNIT_CASE(obmf_test_dreq_malformed),
+	KUNIT_CASE(obmf_test_dreq_unanswered),
 	KUNIT_CASE(obmf_test_respond_edges),
 	{}
 };
@@ -2421,7 +2643,7 @@ static struct kunit_suite obmf_core_suite = {
 /* Discovery */
 
 static const struct test_chan disc_chans[] = {
-	{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c-0", 72 },
+	{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c-0", 72, 0, 2 },
 	{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "uart\xc3\xa9", 516, 0, 100 },
 	{ OBMF_TYPE_GPIO, OBMF_ROLE_PRODUCER, NULL, 516 },
 };
@@ -2654,7 +2876,8 @@ static void obmf_test_discover_names(struct kunit *test)
  * A channel whose header gives another number, lies over channel 0's header,
  * overlaps a channel found before it, or has limits below a message header
  * and its type's head is absent; a zero offset is skipped; the other
- * channels bind
+ * channels bind. Expected, from i2c-obmf: "channel limits 4/4 too small"
+ * for i2c-8, which is kept and refused by its driver.
  */
 static void obmf_test_discover_checks(struct kunit *test)
 {
@@ -2713,6 +2936,35 @@ static void obmf_test_discover_checks(struct kunit *test)
 }
 
 /*
+ * A channel whose header is at 0xffffffe0, so its 64 bytes of
+ * configuration would run past the 32-bit space; the other channels bind.
+ * Expected: "channel 2: bad layout at 0xffffffe0, ignored".
+ */
+static void obmf_test_discover_wrap(struct kunit *test)
+{
+	static const struct test_chan c[] = {
+		{ OBMF_TYPE_GPIO, OBMF_ROLE_PRODUCER, "low", 516 },
+		{ OBMF_TYPE_GPIO, OBMF_ROLE_PRODUCER, "wrap", 516, 0, 64 },
+		{ OBMF_TYPE_GPIO, OBMF_ROLE_PRODUCER, "high", 516 },
+	};
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	const u32 off = 0xffffffe0;
+	u8 *m = f->mem;
+
+	fake_layout(f, c, ARRAY_SIZE(c));
+	memcpy(m + f->mem_len - FAKE_CH_HDR_LEN, m + fake_ch_off(f, 2),
+	       FAKE_CH_HDR_LEN);
+	put_unaligned_le32(off, m + FAKE_CH0_OFFSETS + 4);
+	f->hi_base = off;
+
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	KUNIT_EXPECT_EQ(test, disc_reads_at(f, off), 1);
+	KUNIT_EXPECT_NULL(test, f->core->chans[2]);
+	KUNIT_EXPECT_STREQ(test, chan(f, 1)->info.name, "low");
+	KUNIT_EXPECT_STREQ(test, chan(f, 3)->info.name, "high");
+}
+
+/*
  * A channel with CHANNEL_ENABLE or CONFIGURATION_VALID clear, or both, is
  * left out after its header is read, before its configuration; the other
  * channels bind. Expected: the warnings "channel 2: not enabled, ignored",
@@ -2722,7 +2974,8 @@ static void obmf_test_discover_checks(struct kunit *test)
 static void obmf_test_discover_unusable(struct kunit *test)
 {
 	static const struct test_chan c[] = {
-		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c", 516 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c", 516, 0,
+		  2 },
 		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "off", 516,
 		  FAKE_OFF_ENABLE, 64 },
 		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "invalid", 516,
@@ -2937,11 +3190,13 @@ static void obmf_test_discover_budget(struct kunit *test)
 static void obmf_test_info_line(struct kunit *test)
 {
 	static const struct test_chan kit[] = {
-		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "I2C", 516 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "I2C", 516, 0,
+		  2 },
 		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "UART", 516 },
 	};
 	static const struct test_chan gap[] = {
-		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "I2C", 516 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "I2C", 516, 0,
+		  2 },
 		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "off", 516,
 		  FAKE_OFF_ENABLE },
 		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "UART", 516 },
@@ -3031,18 +3286,61 @@ static void obmf_test_info_many(struct kunit *test)
 	}
 }
 
+/*
+ * Each channel type has its kind in the line; type 0 and the first type
+ * past the last kind give the type
+ */
+static void obmf_test_info_kinds(struct kunit *test)
+{
+	static const struct test_chan one[] = {
+		{ OBMF_TYPE_CONFIG, OBMF_ROLE_PRODUCER, NULL, 516 },
+		{ OBMF_TYPE_MMIO, OBMF_ROLE_PRODUCER, NULL, 516 },
+		{ OBMF_TYPE_I2C_TARGET, OBMF_ROLE_PRODUCER, NULL, 516 },
+		{ OBMF_TYPE_I3C, OBMF_ROLE_PRODUCER, NULL, 516 },
+		{ OBMF_TYPE_IPMI, OBMF_ROLE_PRODUCER, NULL, 516 },
+		{ OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, NULL, 516 },
+		{ OBMF_TYPE_IO, OBMF_ROLE_PRODUCER, NULL, 516 },
+	};
+	static const struct test_chan two[] = {
+		{ OBMF_TYPE_MEMDEV, OBMF_ROLE_PRODUCER, NULL, 516 },
+		{ OBMF_TYPE_TPM, OBMF_ROLE_PRODUCER, NULL, 516 },
+		{ OBMF_TYPE_RTC, OBMF_ROLE_PRODUCER, NULL, 516 },
+		{ OBMF_TYPE_RTC + 1, OBMF_ROLE_PRODUCER, NULL, 516 },
+	};
+	char buf[OBMF_INFO_LEN];
+	struct obmf_fake *f;
+
+	f = fake_create(test, FAKE_MAX_MSG, 0);
+	fake_layout(f, one, ARRAY_SIZE(one));
+	memset(f->mem + 6, 0, 32);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	obmf_core_info(f->core, buf);
+	KUNIT_EXPECT_STREQ(test, buf,
+			   "OBMF-ICP 1.0 device '': type 0x00 ch1 '' (no driver), MMIO ch2 '' (no driver), I2C-target ch3 '' (no driver), I3C ch4 '' (no driver), IPMI ch5 '' (no driver), SPI ch6 '' (no driver), IO ch7 '' (no driver)");
+
+	f = fake_create(test, FAKE_MAX_MSG, 0);
+	fake_layout(f, two, ARRAY_SIZE(two));
+	memset(f->mem + 6, 0, 32);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	obmf_core_info(f->core, buf);
+	KUNIT_EXPECT_STREQ(test, buf,
+			   "OBMF-ICP 1.0 device '': memory ch1 '' (no driver), TPM ch2 '' (no driver), RTC ch3 '' (no driver), type 0x0d ch4 '' (no driver)");
+}
+
 static struct kunit_case obmf_ctrl_cases[] = {
 	KUNIT_CASE(obmf_test_discover),
 	KUNIT_CASE(obmf_test_ch_regs),
 	KUNIT_CASE(obmf_test_discover_version),
 	KUNIT_CASE(obmf_test_discover_names),
 	KUNIT_CASE(obmf_test_discover_checks),
+	KUNIT_CASE(obmf_test_discover_wrap),
 	KUNIT_CASE(obmf_test_discover_unusable),
 	KUNIT_CASE(obmf_test_discover_fatal),
 	KUNIT_CASE(obmf_test_discover_sizes),
 	KUNIT_CASE(obmf_test_discover_enodev),
 	KUNIT_CASE(obmf_test_info_line),
 	KUNIT_CASE(obmf_test_info_many),
+	KUNIT_CASE(obmf_test_info_kinds),
 	KUNIT_CASE_SLOW(obmf_test_discover_timeout_once),
 	KUNIT_CASE_SLOW(obmf_test_discover_timeout_always),
 	KUNIT_CASE_SLOW(obmf_test_discover_header_changes),
@@ -3118,13 +3416,16 @@ static void obmf_test_debugfs(struct kunit *test)
 /*
  * A label is "<device name>_<channel name>", the device name cut on a UTF-8
  * boundary to fit; with no device name the channel name, with no channel
- * name the function device's name
+ * name the function device's name. Expected, from i2c-obmf: its "no device
+ * name" and "no channel name" warnings for the same labels.
  */
 static void obmf_test_labels(struct kunit *test)
 {
 	static const struct test_chan c[] = {
-		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "x", 516 },
-		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, NULL, 516 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "x", 516, 0,
+		  2 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, NULL, 516, 0,
+		  2 },
 	};
 	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
 	struct obmf_fdev *fdev;
@@ -3235,6 +3536,8 @@ static void obmf_test_devres_order(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
 	fdev = chan(f, 1)->fdev;
 	KUNIT_ASSERT_NOT_NULL(test, fdev);
+	/* A built-in i2c-obmf holds the device */
+	device_release_driver(&fdev->adev.dev);
 
 	KUNIT_EXPECT_EQ(test, devm_obmf_enable(fdev), -EINVAL);
 	KUNIT_EXPECT_EQ(test, devm_obmf_publish(fdev, &test_devres_ops),
@@ -3249,7 +3552,8 @@ static void obmf_test_devres_order(struct kunit *test)
 						  &test_devres_driver),
 			0);
 	KUNIT_EXPECT_EQ(test, t->probe_ret, 0);
-	KUNIT_ASSERT_NOT_NULL(test, fdev->adev.dev.driver);
+	KUNIT_ASSERT_PTR_EQ(test, fdev->adev.dev.driver,
+			    &test_devres_driver.driver);
 	KUNIT_EXPECT_TRUE(test, chan(f, 1)->bound);
 	KUNIT_EXPECT_PTR_EQ(test, chan(f, 1)->ops, &test_devres_ops);
 
@@ -3272,16 +3576,26 @@ static struct obmf_fake *node_bind(struct obmf_fake *f)
 	return f;
 }
 
-/* The I2C channel of disc_chans has a device, with @node as its own */
-static void node_check(struct obmf_fake *f, struct fwnode_handle *node)
+/* Channel @nr of disc_chans has a device, with @node as its own */
+static void ch_node_check(struct obmf_fake *f, int nr,
+			  struct fwnode_handle *node)
 {
 	struct kunit *test = f->test;
-	struct obmf_channel *ch = chan(f, 1);
+	struct obmf_channel *ch = chan(f, nr);
 
-	KUNIT_EXPECT_FALSE(test, ch->no_device);
-	KUNIT_EXPECT_PTR_EQ(test, ch->fwnode, node);
-	KUNIT_ASSERT_NOT_NULL(test, ch->fdev);
-	KUNIT_EXPECT_PTR_EQ(test, dev_fwnode(&ch->fdev->adev.dev), node);
+	KUNIT_EXPECT_FALSE_MSG(test, ch->no_device, "channel %d", nr);
+	KUNIT_EXPECT_PTR_EQ_MSG(test, ch->fwnode, node, "channel %d", nr);
+	KUNIT_ASSERT_NOT_NULL_MSG(test, ch->fdev, "channel %d", nr);
+	KUNIT_EXPECT_PTR_EQ_MSG(test, dev_fwnode(&ch->fdev->adev.dev), node,
+				"channel %d", nr);
+}
+
+/* The I2C and serial channels of disc_chans have @i2c and @serial */
+static void node_check(struct obmf_fake *f, struct fwnode_handle *i2c,
+		       struct fwnode_handle *serial)
+{
+	ch_node_check(f, 1, i2c);
+	ch_node_check(f, 2, serial);
 }
 
 /* A node of obmf-test-nodes.dtso, applied before the fake is created */
@@ -3316,60 +3630,81 @@ static struct obmf_fake *of_test_bind(struct kunit *test,
 /*
  * A channel takes the child of the interface's node whose reg is its
  * number and whose name is its class, and gives it to its function
- * device; both references go at unbind. A child with another reg, or
- * no child, leaves the channel without a node.
+ * device; all references go at unbind. This holds for the I2C and the
+ * serial channel alike. A child with another reg, or no child, leaves
+ * the channel without a node.
  */
 static void obmf_test_of_nodes(struct kunit *test)
 {
-	struct device_node *np, *i2c;
+	struct device_node *np, *i2c, *serial;
+	unsigned int refs, serial_refs;
 	struct obmf_fake *f;
-	unsigned int refs;
 
 	KUNIT_ASSERT_EQ(test, of_overlay_apply_kunit(test, obmf_test_nodes), 0);
 	np = of_test_node(test, "/obmf-test-match");
 	i2c = of_test_node(test, "/obmf-test-match/i2c@1");
+	serial = of_test_node(test, "/obmf-test-match/serial@2");
 	refs = of_test_refs(i2c);
+	serial_refs = of_test_refs(serial);
 	f = of_test_bind(test, np);
-	node_check(f, of_fwnode_handle(i2c));
+	node_check(f, of_fwnode_handle(i2c), of_fwnode_handle(serial));
 	fake_unbind(f);
 	KUNIT_EXPECT_EQ(test, of_test_refs(i2c), refs);
+	KUNIT_EXPECT_EQ(test, of_test_refs(serial), serial_refs);
 
 	node_check(of_test_bind(test, of_test_node(test, "/obmf-test-reg")),
-		   NULL);
+		   NULL, NULL);
 	node_check(of_test_bind(test, of_test_node(test, "/obmf-test-empty")),
-		   NULL);
+		   NULL, NULL);
 }
 
 /*
  * A child with the channel's reg and another class's name is not
- * attached. Expected: one "channel 1: node ... ignored" warning.
+ * attached: spi@1 for the I2C channel, i2c@2 for the serial one.
+ * Expected: a "channel 1: node spi@1 ignored" and a "channel 2: node
+ * i2c@2 ignored" warning.
  */
 static void obmf_test_of_misnamed(struct kunit *test)
 {
 	KUNIT_ASSERT_EQ(test, of_overlay_apply_kunit(test, obmf_test_nodes), 0);
 	node_check(of_test_bind(test, of_test_node(test, "/obmf-test-name")),
-		   NULL);
+		   NULL, NULL);
+}
+
+/*
+ * Bound on @parent, channel @nr's node @off is disabled: the channel has
+ * no function device and the node's reference is back at once. Channel
+ * @other still gets its device, with @on as its node.
+ */
+static void of_disabled_check(struct kunit *test, const char *parent, int nr,
+			      const char *off, int other, const char *on)
+{
+	struct device_node *np = of_test_node(test, off);
+	unsigned int refs = of_test_refs(np);
+	struct obmf_fake *f;
+
+	f = of_test_bind(test, of_test_node(test, parent));
+	KUNIT_EXPECT_TRUE(test, chan(f, nr)->no_device);
+	KUNIT_EXPECT_NULL(test, chan(f, nr)->fwnode);
+	KUNIT_EXPECT_NULL(test, chan(f, nr)->fdev);
+	KUNIT_EXPECT_EQ(test, of_test_refs(np), refs);
+	ch_node_check(f, other, of_fwnode_handle(of_test_node(test, on)));
 }
 
 /*
  * A disabled node gives its channel no function device, and its
- * reference goes at once; the other channels still get theirs
+ * reference goes at once; the other channel still gets its device and
+ * node. Once with the I2C node disabled, once with the serial node.
  */
 static void obmf_test_of_disabled(struct kunit *test)
 {
-	struct device_node *i2c;
-	struct obmf_fake *f;
-	unsigned int refs;
-
 	KUNIT_ASSERT_EQ(test, of_overlay_apply_kunit(test, obmf_test_nodes), 0);
-	i2c = of_test_node(test, "/obmf-test-disabled/i2c@1");
-	refs = of_test_refs(i2c);
-	f = of_test_bind(test, of_test_node(test, "/obmf-test-disabled"));
-	KUNIT_EXPECT_TRUE(test, chan(f, 1)->no_device);
-	KUNIT_EXPECT_NULL(test, chan(f, 1)->fwnode);
-	KUNIT_EXPECT_NULL(test, chan(f, 1)->fdev);
-	KUNIT_EXPECT_EQ(test, of_test_refs(i2c), refs);
-	KUNIT_EXPECT_NOT_NULL(test, chan(f, 2)->fdev);
+	of_disabled_check(test, "/obmf-test-disabled", 1,
+			  "/obmf-test-disabled/i2c@1", 2,
+			  "/obmf-test-disabled/serial@2");
+	of_disabled_check(test, "/obmf-test-disabled-serial", 2,
+			  "/obmf-test-disabled-serial/serial@2", 1,
+			  "/obmf-test-disabled-serial/i2c@1");
 }
 
 static const struct property_entry sw_reg1[] = {
@@ -3387,7 +3722,12 @@ static const struct property_entry sw_reg3[] = {
 	{},
 };
 
-/* The interfaces of obmf-test-nodes.dtso but the disabled one */
+static const struct property_entry sw_reg4[] = {
+	PROPERTY_ENTRY_U32("reg", 4),
+	{},
+};
+
+/* The interfaces of obmf-test-nodes.dtso but the disabled ones */
 static const struct software_node sw_match = { .name = "obmf-test-match" };
 
 static const struct software_node sw_match_serial = {
@@ -3410,6 +3750,12 @@ static const struct software_node sw_reg_i2c = {
 	.properties = sw_reg3,
 };
 
+static const struct software_node sw_reg_serial = {
+	.name = "serial@4",
+	.parent = &sw_reg,
+	.properties = sw_reg4,
+};
+
 static const struct software_node sw_name = { .name = "obmf-test-name" };
 
 static const struct software_node sw_name_spi = {
@@ -3418,11 +3764,18 @@ static const struct software_node sw_name_spi = {
 	.properties = sw_reg1,
 };
 
+static const struct software_node sw_name_i2c = {
+	.name = "i2c@2",
+	.parent = &sw_name,
+	.properties = sw_reg2,
+};
+
 static const struct software_node sw_empty = { .name = "obmf-test-empty" };
 
 static const struct software_node *const sw_nodes[] = {
-	&sw_match, &sw_match_serial, &sw_match_i2c, &sw_reg, &sw_reg_i2c,
-	&sw_name,  &sw_name_spi,     &sw_empty,	    NULL,
+	&sw_match,    &sw_match_serial, &sw_match_i2c, &sw_reg,
+	&sw_reg_i2c,  &sw_reg_serial,	&sw_name,      &sw_name_spi,
+	&sw_name_i2c, &sw_empty,	NULL,
 };
 
 /* The nodes are registered before the fake is created */
@@ -3444,21 +3797,22 @@ static void obmf_test_swnodes(struct kunit *test)
 			kunit_software_node_register_node_group(test, sw_nodes),
 			0);
 	node_check(sw_bind(test, &sw_match),
-		   software_node_fwnode(&sw_match_i2c));
-	node_check(sw_bind(test, &sw_reg), NULL);
-	node_check(sw_bind(test, &sw_empty), NULL);
+		   software_node_fwnode(&sw_match_i2c),
+		   software_node_fwnode(&sw_match_serial));
+	node_check(sw_bind(test, &sw_reg), NULL, NULL);
+	node_check(sw_bind(test, &sw_empty), NULL, NULL);
 }
 
 /*
- * obmf_test_of_misnamed() with software nodes. Expected: one "channel 1:
- * node ... ignored" warning.
+ * obmf_test_of_misnamed() with software nodes. Expected: a "channel 1:
+ * node spi@1 ignored" and a "channel 2: node i2c@2 ignored" warning.
  */
 static void obmf_test_swnode_misnamed(struct kunit *test)
 {
 	KUNIT_ASSERT_EQ(test,
 			kunit_software_node_register_node_group(test, sw_nodes),
 			0);
-	node_check(sw_bind(test, &sw_name), NULL);
+	node_check(sw_bind(test, &sw_name), NULL, NULL);
 }
 
 static struct kunit_case obmf_bus_cases[] = {
@@ -3479,3 +3833,2535 @@ static struct kunit_suite obmf_bus_suite = {
 };
 
 kunit_test_suites(&obmf_core_suite, &obmf_ctrl_suite, &obmf_bus_suite);
+
+/* The I2C controller driver on the fake transport; only when built in */
+#if IS_BUILTIN(CONFIG_I2C_OBMF)
+
+#define I2C_ADDR 0x50
+#define I2C_CMD 0x10
+
+/* Channel 1: I2C at 100 kHz, bus recovery offered (Table 79: 0x00, 0x01) */
+static const struct test_chan i2c_chans[] = {
+	{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c", 516, 0, 2 },
+};
+
+static struct obmf_fake *i2c_setup(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+
+	fake_layout(f, i2c_chans, ARRAY_SIZE(i2c_chans));
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	return f;
+}
+
+KUNIT_DEFINE_ACTION_WRAPPER(test_put_device, put_device, struct device *);
+
+/* The adapter the I2C driver registered on channel 1 */
+static struct i2c_adapter *i2c_adapter(struct obmf_fake *f)
+{
+	struct kunit *test = f->test;
+	struct obmf_channel *ch = chan(f, CH_I2C);
+	struct i2c_adapter *adap;
+	struct device *dev;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, ch->fdev);
+	dev = device_find_any_child(&ch->fdev->adev.dev);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	ret = kunit_add_action_or_reset(test, test_put_device, dev);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	adap = i2c_verify_adapter(dev);
+	KUNIT_ASSERT_NOT_NULL(test, adap);
+	return adap;
+}
+
+/* The PEC of a byte read of I2C_CMD at I2C_ADDR returning @val */
+static u8 i2c_read_pec(u8 val)
+{
+	u8 b[] = { I2C_ADDR << 1, I2C_CMD, I2C_ADDR << 1 | 1, val };
+
+	return i2c_smbus_pec(0, b, sizeof(b));
+}
+
+/* The last request on the I2C channel, after the header */
+static const u8 *i2c_sent(struct obmf_fake *f, size_t *len)
+{
+	struct fake_rec *r;
+	int i = send_index(f, CH_I2C);
+
+	KUNIT_ASSERT_GE(f->test, i, 0);
+	r = &f->log[i];
+	*len = r->len - OBMF_HDR_LEN;
+	return r->msg + OBMF_HDR_LEN;
+}
+
+/*
+ * An SMBus byte read and write of a client with PEC: one Write Read with
+ * the PEC byte read last, one Write with it written last; a wrong PEC
+ * from the device is -EBADMSG from the I2C core
+ */
+static void obmf_test_i2c_pec(struct kunit *test)
+{
+	struct obmf_fake *f = i2c_setup(test);
+	struct i2c_adapter *adap = i2c_adapter(f);
+	struct fake_step s = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.echo = true,
+		.plen = 5,
+		.payload = { 2, 0, 0, 0x5a, i2c_read_pec(0x5a) },
+	};
+	const u8 rd[] = { 0x03, I2C_ADDR, 2, 0, I2C_CMD };
+	u8 wr[] = { 0x01, I2C_ADDR, 0, 0, I2C_CMD, 0x77, 0 };
+	u8 pw[] = { I2C_ADDR << 1, I2C_CMD, 0x77 };
+	union i2c_smbus_data data;
+	const u8 *p;
+	size_t len;
+
+	fake_push(f, &s);
+	KUNIT_EXPECT_EQ(test,
+			i2c_smbus_xfer(adap, I2C_ADDR, I2C_CLIENT_PEC,
+				       I2C_SMBUS_READ, I2C_CMD,
+				       I2C_SMBUS_BYTE_DATA, &data),
+			0);
+	KUNIT_EXPECT_EQ(test, data.byte, 0x5a);
+	p = i2c_sent(f, &len);
+	KUNIT_ASSERT_EQ(test, len, sizeof(rd));
+	KUNIT_EXPECT_MEMEQ(test, p, rd, sizeof(rd));
+
+	s.payload[4] ^= 0x01;
+	fake_push(f, &s);
+	KUNIT_EXPECT_EQ(test,
+			i2c_smbus_xfer(adap, I2C_ADDR, I2C_CLIENT_PEC,
+				       I2C_SMBUS_READ, I2C_CMD,
+				       I2C_SMBUS_BYTE_DATA, &data),
+			-EBADMSG);
+
+	/* the device answers the write with the echo alone */
+	s.plen = 0;
+	fake_push(f, &s);
+	data.byte = 0x77;
+	KUNIT_EXPECT_EQ(test,
+			i2c_smbus_xfer(adap, I2C_ADDR, I2C_CLIENT_PEC,
+				       I2C_SMBUS_WRITE, I2C_CMD,
+				       I2C_SMBUS_BYTE_DATA, &data),
+			0);
+	wr[6] = i2c_smbus_pec(0, pw, sizeof(pw));
+	p = i2c_sent(f, &len);
+	KUNIT_ASSERT_EQ(test, len, sizeof(wr));
+	KUNIT_EXPECT_MEMEQ(test, p, wr, sizeof(wr));
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0), 3);
+}
+
+/*
+ * Message flags the controller does not implement are refused unsent,
+ * alone or with the PEC flag, and so is an SCCB client's transfer
+ */
+static void obmf_test_i2c_flags(struct kunit *test)
+{
+	static const u16 flags[] = {
+		I2C_M_NOSTART,
+		I2C_M_REV_DIR_ADDR,
+		I2C_M_IGNORE_NAK,
+		I2C_M_NO_RD_ACK | I2C_M_RD,
+		I2C_M_RECV_LEN | I2C_M_RD,
+		I2C_M_STOP,
+		I2C_M_STOP | I2C_CLIENT_PEC,
+	};
+	struct obmf_fake *f = i2c_setup(test);
+	struct i2c_adapter *adap = i2c_adapter(f);
+	u8 buf[1] = { I2C_CMD };
+	struct i2c_msg msg = { .addr = I2C_ADDR, .len = 1, .buf = buf };
+	union i2c_smbus_data data;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(flags); i++) {
+		msg.flags = flags[i];
+		KUNIT_EXPECT_EQ_MSG(test, i2c_transfer(adap, &msg, 1),
+				    -EOPNOTSUPP, "flags %#x", flags[i]);
+	}
+	KUNIT_EXPECT_EQ(test,
+			i2c_smbus_xfer(adap, I2C_ADDR, I2C_CLIENT_SCCB,
+				       I2C_SMBUS_READ, I2C_CMD,
+				       I2C_SMBUS_BYTE_DATA, &data),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0), 0);
+}
+
+/* An SMBus byte read of I2C_CMD at I2C_ADDR, without PEC */
+static int i2c_read_byte(struct i2c_adapter *adap, union i2c_smbus_data *data)
+{
+	return i2c_smbus_xfer(adap, I2C_ADDR, 0, I2C_SMBUS_READ, I2C_CMD,
+			      I2C_SMBUS_BYTE_DATA, data);
+}
+
+/* A recovery under the bus lock, which the transfer path holds */
+static int i2c_recover(struct i2c_adapter *adap)
+{
+	int ret;
+
+	i2c_lock_bus(adap, I2C_LOCK_SEGMENT);
+	ret = i2c_recover_bus(adap);
+	i2c_unlock_bus(adap, I2C_LOCK_SEGMENT);
+	return ret;
+}
+
+/*
+ * The channel offers bus recovery, but the adapter has none, and
+ * i2c_recover_bus() gives -EBUSY without a request. A busy or timeout
+ * status, generic or of the I2C table, or no response fails the
+ * transfer, and nothing else is sent.
+ */
+static void obmf_test_i2c_no_recovery(struct kunit *test)
+{
+	static const struct {
+		u8 status;
+		int err;
+	} st[] = {
+		{ OBMF_STATUS_BUSY, -EBUSY },
+		{ OBMF_STATUS_TIMEOUT, -ETIMEDOUT },
+		{ OBMF_STATUS_I2C_BUS_BUSY, -EBUSY },
+		{ OBMF_STATUS_I2C_TIMEOUT, -ETIMEDOUT },
+	};
+	struct obmf_fake *f = i2c_setup(test);
+	struct i2c_adapter *adap = i2c_adapter(f);
+	struct fake_step s = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.echo = true,
+	};
+	u32 opts = fake_ch_off(f, CH_I2C) + FAKE_CH_HDR_LEN + 1;
+	union i2c_smbus_data data;
+	unsigned int sends = READ_ONCE(f->sends);
+	int i;
+
+	/* Table 79 options: BUS_RECOVERY_SUPPORTED */
+	KUNIT_ASSERT_NE(test, f->mem[opts] & BIT(0), 0);
+	KUNIT_EXPECT_NULL(test, adap->bus_recovery_info);
+	KUNIT_EXPECT_EQ(test, i2c_recover(adap), -EBUSY);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends);
+	for (i = 0; i < ARRAY_SIZE(st); i++) {
+		s.status = st[i].status;
+		fake_push(f, &s);
+		KUNIT_EXPECT_EQ_MSG(test, i2c_read_byte(adap, &data), st[i].err,
+				    "status %#x", st[i].status);
+		KUNIT_EXPECT_EQ_MSG(test, READ_ONCE(f->sends), sends + i + 1,
+				    "status %#x", st[i].status);
+	}
+
+	s.how = FAKE_NEVER;
+	fake_push(f, &s);
+	KUNIT_EXPECT_EQ(test, i2c_read_byte(adap, &data), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + ARRAY_SIZE(st) + 1);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0),
+			ARRAY_SIZE(st) + 1);
+}
+
+/*
+ * No response, and the reply comes late, while the next transfer waits:
+ * nothing is sent between the two requests, and the late reply answers
+ * the next transfer, as a channel without tags cannot tell them apart
+ */
+static void obmf_test_i2c_late_reply(struct kunit *test)
+{
+	struct obmf_fake *f = i2c_setup(test);
+	struct i2c_adapter *adap = i2c_adapter(f);
+	struct fake_step s = {
+		.how = FAKE_WORK,
+		.delay_ms = OBMF_DEFAULT_TIMEOUT_MS + 500,
+		.channel = -1,
+		.echo = true,
+		.plen = 4,
+		.payload = { 1, 0, 0, 0x5a },
+	};
+	union i2c_smbus_data data = {};
+	int a, b;
+
+	fake_push(f, &s);
+	s.how = FAKE_NEVER;
+	fake_push(f, &s);
+	KUNIT_EXPECT_EQ(test, i2c_read_byte(adap, &data), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, i2c_read_byte(adap, &data), 0);
+	KUNIT_EXPECT_EQ(test, data.byte, 0x5a);
+
+	a = fake_find(f, 0, FAKE_SEND, CH_I2C, 0);
+	KUNIT_ASSERT_GE(test, a, 0);
+	b = fake_find(f, a + 1, FAKE_SEND, -1, -1);
+	KUNIT_EXPECT_GT(test, b, a);
+	KUNIT_EXPECT_EQ(test, b, fake_find(f, a + 1, FAKE_SEND, CH_I2C, 0));
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0), 2);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, CH_I2C), OBMF_CH_TIMEOUTS), 1);
+}
+
+/*
+ * With BUS_RECOVERY_SUPPORTED 0 the adapter has no recovery, and
+ * i2c_recover_bus() gives -EBUSY without a request
+ */
+static void obmf_test_i2c_recover_none(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	struct i2c_adapter *adap;
+	unsigned int n;
+
+	fake_layout(f, i2c_chans, ARRAY_SIZE(i2c_chans));
+	f->mem[fake_ch_off(f, CH_I2C) + FAKE_CH_HDR_LEN + 1] = 0;
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	adap = i2c_adapter(f);
+	KUNIT_EXPECT_NULL(test, adap->bus_recovery_info);
+	n = fake_nlog(f);
+	KUNIT_EXPECT_EQ(test, i2c_recover(adap), -EBUSY);
+	KUNIT_EXPECT_EQ(test, fake_nlog(f), n);
+}
+
+/* Whether a driver is bound to channel @nr's function device */
+static bool i2c_bound(struct obmf_fake *f, int nr)
+{
+	struct obmf_fdev *fdev = chan(f, nr)->fdev;
+
+	KUNIT_ASSERT_NOT_NULL(f->test, fdev);
+	return fdev->adev.dev.driver;
+}
+
+/*
+ * A configuration shorter than Table 79's 2 bytes gets no adapter; one of
+ * 2 bytes does. Expected: "configuration data too short" and a failed
+ * probe, for channels 1 and 2.
+ */
+static void obmf_test_i2c_short_config(struct kunit *test)
+{
+	static const struct test_chan c[] = {
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c-0", 516 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c-1", 516, 0,
+		  1 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c-2", 516, 0,
+		  2 },
+	};
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+
+	fake_layout(f, c, ARRAY_SIZE(c));
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	KUNIT_EXPECT_FALSE(test, i2c_bound(f, 1));
+	KUNIT_EXPECT_FALSE(test, i2c_bound(f, 2));
+	KUNIT_EXPECT_TRUE(test, i2c_bound(f, 3));
+}
+
+static const struct property_entry sw_speed_props1[] = {
+	PROPERTY_ENTRY_U32("reg", 1),
+	PROPERTY_ENTRY_U32("clock-frequency", 400000),
+	{},
+};
+
+static const struct property_entry sw_speed_props2[] = {
+	PROPERTY_ENTRY_U32("reg", 2),
+	PROPERTY_ENTRY_U32("clock-frequency", 400000),
+	{},
+};
+
+static const struct software_node sw_speed = { .name = "obmf-test-speed" };
+
+static const struct software_node sw_speed_i2c1 = {
+	.name = "i2c@1",
+	.parent = &sw_speed,
+	.properties = sw_speed_props1,
+};
+
+static const struct software_node sw_speed_i2c2 = {
+	.name = "i2c@2",
+	.parent = &sw_speed,
+	.properties = sw_speed_props2,
+};
+
+static const struct software_node *const sw_speed_nodes[] = {
+	&sw_speed,
+	&sw_speed_i2c1,
+	&sw_speed_i2c2,
+	NULL,
+};
+
+/* Channel @nr's Table 79 I2C_CONTROLLER_SPEED */
+static void i2c_speed_set(struct obmf_fake *f, int nr, u8 speed)
+{
+	f->mem[fake_ch_off(f, nr) + FAKE_CH_HDR_LEN] = speed;
+}
+
+/*
+ * K-I2C-012: speed codes 0 to 3 get an adapter, the reserved 4 and 0x7f
+ * none. A clock-frequency in the channel's node other than the channel's
+ * speed gets none, an equal one an adapter. Expected: "unknown bus speed
+ * 4" and "unknown bus speed 127", then "clock-frequency 400000, channel
+ * runs at 100000".
+ */
+static void obmf_test_i2c_speed(struct kunit *test)
+{
+	static const struct test_chan c[] = {
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c-1", 516, 0,
+		  2 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c-2", 516, 0,
+		  2 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c-3", 516, 0,
+		  2 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c-4", 516, 0,
+		  2 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c-5", 516, 0,
+		  2 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c-6", 516, 0,
+		  2 },
+	};
+	static const u8 speed[] = { 0, 1, 2, 3, 4, 0x7f };
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	int i, ret;
+
+	fake_layout(f, c, ARRAY_SIZE(c));
+	for (i = 0; i < ARRAY_SIZE(speed); i++)
+		i2c_speed_set(f, i + 1, speed[i]);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	for (i = 0; i < ARRAY_SIZE(speed); i++)
+		KUNIT_EXPECT_EQ_MSG(test, i2c_bound(f, i + 1), speed[i] < 4,
+				    "speed %u", speed[i]);
+
+	ret = kunit_software_node_register_node_group(test, sw_speed_nodes);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	f = fake_create(test, FAKE_MAX_MSG, 0);
+	ret = kunit_device_add_software_node(test, f->tp.dev, &sw_speed);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	fake_layout(f, c, 2);
+	i2c_speed_set(f, 1, 0);
+	i2c_speed_set(f, 2, 1);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	KUNIT_EXPECT_FALSE(test, i2c_bound(f, 1));
+	KUNIT_EXPECT_TRUE(test, i2c_bound(f, 2));
+}
+
+/* The next request on the I2C channel after log entry @i is @want */
+static int i2c_next(struct obmf_fake *f, int i, const u8 *want, size_t len)
+{
+	struct kunit *test = f->test;
+	struct fake_rec *r;
+
+	i = fake_find(f, i + 1, FAKE_SEND, CH_I2C, 0);
+	KUNIT_ASSERT_GE(test, i, 0);
+	r = &f->log[i];
+	KUNIT_ASSERT_EQ(test, r->len, OBMF_HDR_LEN + len);
+	KUNIT_EXPECT_MEMEQ(test, r->msg + OBMF_HDR_LEN, want, len);
+	return i;
+}
+
+#define I2C_ADDR2 0x51
+#define I2C_ADDR3 0x52
+
+/*
+ * K-I2C-001, K-I2C-002, K-I2C-005: a write then a read of one address is
+ * one Write Read; any other message is one Read or Write; each carries
+ * the address and the Read Length, and all but the last of a transfer
+ * "do not send STOP" (bit 7); no other command goes out. A 10-bit or an
+ * above 7-bit address is refused before anything is sent, also as the
+ * second message, and the adapter offers no SMBus Quick.
+ */
+static void obmf_test_i2c_xfer(struct kunit *test)
+{
+	static const u8 wr_rd[] = { 0x03, I2C_ADDR, 2, 0, I2C_CMD };
+	static const u8 chain[][5] = {
+		{ 0x81, I2C_ADDR, 0, 0, 1 },
+		{ 0x81, I2C_ADDR2, 0, 0, 3 },
+		{ 0x00, I2C_ADDR3, 1, 0 },
+	};
+	static const u8 rd_wr[][5] = {
+		{ 0x80, I2C_ADDR, 1, 0 },
+		{ 0x01, I2C_ADDR, 0, 0, 5 },
+	};
+	struct obmf_fake *f = i2c_setup(test);
+	struct i2c_adapter *adap = i2c_adapter(f);
+	struct fake_step rd = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.echo = true,
+		.plen = 5,
+		.payload = { 2, 0, 0, 0xaa, 0xbb },
+	};
+	struct fake_step wr = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.echo = true,
+	};
+	u8 cmd[1] = { I2C_CMD }, w1[1] = { 1 }, w3[1] = { 3 }, w5[1] = { 5 };
+	u8 r2[2] = {}, r1[1] = {};
+	struct i2c_msg m[3] = {
+		{ .addr = I2C_ADDR, .len = 1, .buf = cmd },
+		{ .addr = I2C_ADDR, .flags = I2C_M_RD, .len = 2, .buf = r2 },
+	};
+	int i = fake_nlog(f) - 1;
+
+	fake_push(f, &rd);
+	KUNIT_EXPECT_EQ(test, i2c_transfer(adap, m, 2), 2);
+	KUNIT_EXPECT_EQ(test, r2[0], 0xaa);
+	KUNIT_EXPECT_EQ(test, r2[1], 0xbb);
+	i = i2c_next(f, i, wr_rd, sizeof(wr_rd));
+
+	m[0] = (struct i2c_msg){ .addr = I2C_ADDR, .len = 1, .buf = w1 };
+	m[1] = (struct i2c_msg){ .addr = I2C_ADDR2, .len = 1, .buf = w3 };
+	m[2] = (struct i2c_msg){
+		.addr = I2C_ADDR3, .flags = I2C_M_RD, .len = 1, .buf = r1
+	};
+	fake_push(f, &wr);
+	fake_push(f, &wr);
+	rd.plen = 4;
+	rd.payload[0] = 1;
+	fake_push(f, &rd);
+	KUNIT_EXPECT_EQ(test, i2c_transfer(adap, m, 3), 3);
+	KUNIT_EXPECT_EQ(test, r1[0], 0xaa);
+	i = i2c_next(f, i, chain[0], 5);
+	i = i2c_next(f, i, chain[1], 5);
+	i = i2c_next(f, i, chain[2], 4);
+
+	m[0] = (struct i2c_msg){
+		.addr = I2C_ADDR, .flags = I2C_M_RD, .len = 1, .buf = r1
+	};
+	m[1] = (struct i2c_msg){ .addr = I2C_ADDR, .len = 1, .buf = w5 };
+	fake_push(f, &rd);
+	fake_push(f, &wr);
+	KUNIT_EXPECT_EQ(test, i2c_transfer(adap, m, 2), 2);
+	i = i2c_next(f, i, rd_wr[0], 4);
+	i = i2c_next(f, i, rd_wr[1], 5);
+	KUNIT_EXPECT_LT(test, fake_find(f, i + 1, FAKE_SEND, CH_I2C, 0), 0);
+
+	m[1].flags = I2C_M_TEN;
+	KUNIT_EXPECT_EQ(test, i2c_transfer(adap, m, 2), -EAFNOSUPPORT);
+	m[1].flags = 0;
+	m[1].addr = 0x80;
+	KUNIT_EXPECT_EQ(test, i2c_transfer(adap, m, 2), -EINVAL);
+	KUNIT_EXPECT_LT(test, fake_find(f, i + 1, FAKE_SEND, CH_I2C, 0), 0);
+
+	KUNIT_EXPECT_TRUE(test, i2c_check_functionality(adap, I2C_FUNC_I2C));
+	KUNIT_EXPECT_FALSE(test,
+			   i2c_check_functionality(adap, I2C_FUNC_SMBUS_QUICK));
+}
+
+/*
+ * K-I2C-003: a response whose Read Length is not the one asked, or that
+ * is shorter than it, is -EPROTO and a protocol error; the Reserved byte
+ * is not checked, and a write answered with Read Length 0 succeeds. The
+ * statuses that have no I2C fault code, Unknown Channel and Size Not
+ * Supported, and a stalled send are -EIO, -EOPNOTSUPP and -EIO.
+ */
+static void obmf_test_i2c_response(struct kunit *test)
+{
+	static const struct {
+		u8 status;
+		int send_ret;
+		int err;
+	} st[] = {
+		{ OBMF_STATUS_UNKNOWN_CHANNEL, 0, -EIO },
+		{ OBMF_STATUS_SIZE_UNSUPPORTED, 0, -EOPNOTSUPP },
+		{ 0, -EPIPE, -EIO },
+	};
+	struct obmf_fake *f = i2c_setup(test);
+	struct i2c_adapter *adap = i2c_adapter(f);
+	struct obmf_channel *ch = chan(f, CH_I2C);
+	struct fake_step s = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.echo = true,
+		.plen = 4,
+		.payload = { 2, 0, 0, 0x5a },
+	};
+	union i2c_smbus_data data = {};
+	long errs = ch_cnt(ch, OBMF_CH_PROTOCOL_ERRORS);
+	int i;
+
+	fake_push(f, &s);
+	KUNIT_EXPECT_EQ(test, i2c_read_byte(adap, &data), -EPROTO);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_PROTOCOL_ERRORS), errs + 1);
+	s.plen = 3;
+	s.payload[0] = 1;
+	fake_push(f, &s);
+	KUNIT_EXPECT_EQ(test, i2c_read_byte(adap, &data), -EPROTO);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_PROTOCOL_ERRORS), errs + 2);
+
+	s.plen = 4;
+	s.payload[2] = 0xff;
+	fake_push(f, &s);
+	KUNIT_EXPECT_EQ(test, i2c_read_byte(adap, &data), 0);
+	KUNIT_EXPECT_EQ(test, data.byte, 0x5a);
+	s.plen = 3;
+	s.payload[0] = 0;
+	s.payload[2] = 0;
+	fake_push(f, &s);
+	data.byte = 0x77;
+	KUNIT_EXPECT_EQ(test,
+			i2c_smbus_xfer(adap, I2C_ADDR, 0, I2C_SMBUS_WRITE,
+				       I2C_CMD, I2C_SMBUS_BYTE_DATA, &data),
+			0);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_PROTOCOL_ERRORS), errs + 2);
+
+	s.plen = 0;
+	for (i = 0; i < ARRAY_SIZE(st); i++) {
+		s.status = st[i].status;
+		s.send_ret = st[i].send_ret;
+		fake_push(f, &s);
+		KUNIT_EXPECT_EQ_MSG(test, i2c_read_byte(adap, &data), st[i].err,
+				    "status %#x send %d", st[i].status,
+				    st[i].send_ret);
+	}
+}
+
+static struct kunit_case obmf_i2c_cases[] = {
+	KUNIT_CASE(obmf_test_i2c_pec),
+	KUNIT_CASE(obmf_test_i2c_flags),
+	KUNIT_CASE_SLOW(obmf_test_i2c_no_recovery),
+	KUNIT_CASE_SLOW(obmf_test_i2c_late_reply),
+	KUNIT_CASE(obmf_test_i2c_recover_none),
+	KUNIT_CASE(obmf_test_i2c_short_config),
+	KUNIT_CASE(obmf_test_i2c_speed),
+	KUNIT_CASE(obmf_test_i2c_xfer),
+	KUNIT_CASE(obmf_test_i2c_response),
+	{}
+};
+
+static struct kunit_suite obmf_i2c_suite = {
+	.name = "obmf-i2c",
+	.test_cases = obmf_i2c_cases,
+};
+
+kunit_test_suite(obmf_i2c_suite);
+
+#endif /* IS_BUILTIN(CONFIG_I2C_OBMF) */
+
+/* The serial driver on the fake transport; only when built in */
+#if IS_BUILTIN(CONFIG_OBMF_TTY)
+
+/* OBMF-ICP 1.0.0, 5.15.2, Table 78 */
+#define TTY_CFG_LEN 7
+#define TTY_HZ 115200
+#define TTY_RTS_CTS 0x20
+#define TTY_LINE (CSIZE | CSTOPB | PARENB | PARODD | CMSPAR | CRTSCTS)
+
+/* Channel @nr's line configuration, Table 78 */
+static void tty_cfg(struct obmf_fake *f, int nr, u32 hz, u8 data, u8 stop,
+		    u8 line)
+{
+	u8 *c = f->mem + fake_ch_off(f, nr) + FAKE_CH_HDR_LEN;
+
+	put_unaligned_le32(hz, c);
+	c[4] = data;
+	c[5] = stop;
+	c[6] = line;
+}
+
+/* Whether a driver is bound to channel @nr's function device */
+static bool tty_bound(struct obmf_fake *f, int nr)
+{
+	struct obmf_fdev *fdev = chan(f, nr)->fdev;
+
+	KUNIT_ASSERT_NOT_NULL(f->test, fdev);
+	return fdev->adev.dev.driver;
+}
+
+/* A tty opened in the kernel, the way speakup opens one */
+struct tty_k {
+	struct tty_struct *tty;
+	bool open;
+};
+
+static void tty_k_close(void *data)
+{
+	struct tty_k *k = data;
+
+	if (!k->tty)
+		return;
+	tty_lock(k->tty);
+	if (k->open)
+		k->tty->ops->close(k->tty, NULL);
+	tty_unlock(k->tty);
+	tty_kclose(k->tty);
+	k->tty = NULL;
+}
+
+/* Channel @nr's tty, installed but not opened: the port stays closed */
+static struct tty_k *tty_k_get(struct obmf_fake *f, int nr)
+{
+	struct kunit *test = f->test;
+	struct obmf_fdev *fdev = chan(f, nr)->fdev;
+	struct device *dev;
+	struct tty_k *k;
+	dev_t devt;
+
+	KUNIT_ASSERT_NOT_NULL(test, fdev);
+	dev = device_find_any_child(&fdev->adev.dev);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	devt = dev->devt;
+	put_device(dev);
+	k = kunit_kzalloc(test, sizeof(*k), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, k);
+	k->tty = tty_kopen_exclusive(devt);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, k->tty);
+	tty_unlock(k->tty);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, tty_k_close, k),
+			0);
+	return k;
+}
+
+static struct ktermios tty_k_termios(struct tty_k *k)
+{
+	struct ktermios t;
+
+	down_read(&k->tty->termios_rwsem);
+	t = k->tty->termios;
+	up_read(&k->tty->termios_rwsem);
+	return t;
+}
+
+/*
+ * A line speed of 0 gets no tty, as the driver divides by it;
+ * data bits 9, stop bits 3 or parity 7 give a tty at 8N1, which reports
+ * the speed; a configuration shorter than Table 78 gets no tty.
+ * Expected: "line speed 0" for channel 1, "unsupported line ..., using
+ * 8N1" for channels 3 to 5, "configuration data too short" for 6.
+ */
+static void obmf_test_tty_line(struct kunit *test)
+{
+	static const struct test_chan c[] = {
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "s1", 516, 0,
+		  TTY_CFG_LEN },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "s2", 516, 0,
+		  TTY_CFG_LEN },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "s3", 516, 0,
+		  TTY_CFG_LEN },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "s4", 516, 0,
+		  TTY_CFG_LEN },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "s5", 516, 0,
+		  TTY_CFG_LEN },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "s6", 516, 0,
+		  TTY_CFG_LEN - 1 },
+	};
+	static const struct {
+		u32 hz;
+		u8 data, stop, line;
+		tcflag_t cflag;
+	} cfg[] = {
+		{ 0, 8, 1, 0, 0 },
+		{ TTY_HZ, 7, 2, 2, CS7 | CSTOPB | PARENB },
+		{ TTY_HZ, 9, 1, 0, CS8 },
+		{ TTY_HZ, 8, 3, 0, CS8 },
+		{ TTY_HZ, 8, 1, 7, CS8 },
+	};
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	struct ktermios t;
+	int i;
+
+	fake_layout(f, c, ARRAY_SIZE(c));
+	for (i = 0; i < ARRAY_SIZE(cfg); i++)
+		tty_cfg(f, i + 1, cfg[i].hz, cfg[i].data, cfg[i].stop,
+			cfg[i].line);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	KUNIT_EXPECT_FALSE(test, tty_bound(f, 1));
+	for (i = 1; i < ARRAY_SIZE(cfg); i++) {
+		KUNIT_ASSERT_TRUE_MSG(test, tty_bound(f, i + 1), "channel %d",
+				      i + 1);
+		t = tty_k_termios(tty_k_get(f, i + 1));
+		KUNIT_EXPECT_EQ_MSG(test, t.c_cflag & TTY_LINE, cfg[i].cflag,
+				    "channel %d", i + 1);
+		KUNIT_EXPECT_EQ_MSG(test, tty_termios_baud_rate(&t), TTY_HZ,
+				    "channel %d", i + 1);
+	}
+	KUNIT_EXPECT_FALSE(test, tty_bound(f, 6));
+}
+
+/*
+ * The tty reports CRTSCTS for Table 78 flow control 2
+ * (RTS/CTS) only, also with the 8N1 fallback (channel 5, parity 7), and
+ * leaves the input flags as the tty core set them, so never forces IXON
+ * or IXOFF. Expected: "unsupported line ..., using 8N1" for channel 5.
+ */
+static void obmf_test_tty_flow(struct kunit *test)
+{
+	static const struct test_chan c[] = {
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "none", 516, 0,
+		  TTY_CFG_LEN },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "xon", 516, 0,
+		  TTY_CFG_LEN },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "rts", 516, 0,
+		  TTY_CFG_LEN },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "dsr", 516, 0,
+		  TTY_CFG_LEN },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "rts-8n1", 516, 0,
+		  TTY_CFG_LEN },
+	};
+	static const struct {
+		u8 line;
+		tcflag_t cflag;
+	} cfg[] = {
+		{ 0x00, CS8 },
+		{ 0x10, CS8 },
+		{ TTY_RTS_CTS, CS8 | CRTSCTS },
+		{ 0x30, CS8 },
+		{ TTY_RTS_CTS | 7, CS8 | CRTSCTS },
+	};
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	struct ktermios t;
+	int i;
+
+	fake_layout(f, c, ARRAY_SIZE(c));
+	for (i = 0; i < ARRAY_SIZE(cfg); i++)
+		tty_cfg(f, i + 1, TTY_HZ, 8, 1, cfg[i].line);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	for (i = 0; i < ARRAY_SIZE(cfg); i++) {
+		KUNIT_ASSERT_TRUE_MSG(test, tty_bound(f, i + 1), "channel %d",
+				      i + 1);
+		t = tty_k_termios(tty_k_get(f, i + 1));
+		KUNIT_EXPECT_EQ_MSG(test, t.c_cflag & TTY_LINE, cfg[i].cflag,
+				    "channel %d", i + 1);
+		KUNIT_EXPECT_EQ_MSG(test, t.c_iflag, tty_std_termios.c_iflag,
+				    "channel %d", i + 1);
+	}
+}
+
+/* OBMF-ICP 1.0.0, 5.5.1, Table 22 */
+#define TTY_EV_GENERATE_BREAK BIT(0)
+#define TTY_EV_BREAK BIT(1)
+#define TTY_EV_OVERRUN BIT(2)
+#define TTY_EV_CARRIER_DOWN BIT(3)
+/*
+ * Characters in one write, so that fake_inject() takes it; not a divisor
+ * of a flip buffer's size, so a full buffer has a few bytes left
+ */
+#define TTY_CHUNK 60
+/* MIN_TTYB_SIZE: the least flip buffer memory a port may be limited to */
+#define TTY_FLIP_MIN 256
+
+/* Channel 1: serial at 115200 8N1 */
+static const struct test_chan tty_chans[] = {
+	{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "uart", 516, 0, TTY_CFG_LEN },
+};
+
+static struct obmf_fake *tty_setup(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+
+	fake_layout(f, tty_chans, ARRAY_SIZE(tty_chans));
+	tty_cfg(f, 1, TTY_HZ, 8, 1, 0);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	KUNIT_ASSERT_TRUE(test, tty_bound(f, 1));
+	return f;
+}
+
+/*
+ * Opens the port, without echo, so the line discipline sends nothing; it
+ * is closed after a failed open too, as tty_open() does
+ */
+static void tty_k_open(struct kunit *test, struct tty_k *k)
+{
+	struct ktermios t;
+	int ret;
+
+	tty_lock(k->tty);
+	k->open = true;
+	ret = k->tty->ops->open(k->tty, NULL);
+	if (!ret) {
+		t = tty_k_termios(k);
+		t.c_lflag &= ~ECHO;
+		tty_set_termios(k->tty, &t);
+	}
+	tty_unlock(k->tty);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_TRUE(test, tty_port_initialized(k->tty->port));
+}
+
+static void tty_k_clocal(struct tty_k *k, bool on)
+{
+	struct ktermios t = tty_k_termios(k);
+
+	if (on)
+		t.c_cflag |= CLOCAL;
+	else
+		t.c_cflag &= ~CLOCAL;
+	tty_set_termios(k->tty, &t);
+}
+
+static struct serial_icounter_struct tty_k_icount(struct kunit *test,
+						  struct tty_k *k)
+{
+	struct serial_icounter_struct ic = {};
+
+	KUNIT_EXPECT_EQ(test, k->tty->ops->get_icount(k->tty, &ic), 0);
+	return ic;
+}
+
+/* The transmit counters the serial driver keeps beside the icount */
+struct tty_cnt {
+	unsigned long dropped;
+	unsigned long stalls;
+};
+
+static struct tty_cnt tty_k_cnt(struct tty_k *k)
+{
+	struct tty_cnt c;
+
+	obmf_tty_kunit_counts(k->tty, &c.dropped, &c.stalls);
+	return c;
+}
+
+/*
+ * A device write on channel 1 with events @ev and @n characters; returns
+ * the answer, of which there is exactly one
+ */
+static struct fake_rec *tty_write(struct obmf_fake *f, u8 ev, size_t n)
+{
+	int answers = fake_count(f, FAKE_SEND, 1, 1);
+	u8 w[3 + TTY_CHUNK];
+	size_t i;
+
+	w[0] = ev;
+	put_unaligned_le16(n, w + 1);
+	for (i = 0; i < n; i++)
+		w[3 + i] = 'a' + i % 26;
+	fake_inject(f, 1, 0, w, 3 + n);
+	flush_workqueue(f->core->wq);
+	KUNIT_ASSERT_EQ(f->test, fake_count(f, FAKE_SEND, 1, 1), answers + 1);
+	return last_answer(f, 1);
+}
+
+/* Whether answer @r is Table 23's {@nack, @count} */
+static bool tty_answer(struct fake_rec *r, u8 nack, u16 count)
+{
+	return r->msg[1] == (OBMF_HDR_RQRESP | OBMF_STATUS_SUCCESS) &&
+	       r->len == OBMF_HDR_LEN + 3 && r->msg[4] == nack &&
+	       get_unaligned_le16(r->msg + 5) == count;
+}
+
+/*
+ * The tty core has no interface that holds a flip buffer full or shows
+ * what it holds, so the helpers below and the cases that use them read
+ * its internals: port->buf.head and .tail, and each buffer's next, read,
+ * used, size and flags, the tail room as __tty_buffer_request_room()
+ * counts it, and port->buf.mem_limit; they wait for port->buf.work and
+ * tty->hangup_work with flush_work(). tty_buffer_set_limit() is called
+ * after the buffer's first use, which its kernel-doc rules out; it only
+ * sets the limit the next allocation checks.
+ */
+KUNIT_DEFINE_ACTION_WRAPPER(tty_buf_unlock, tty_buffer_unlock_exclusive,
+			    struct tty_port *);
+
+/*
+ * The bytes the flip buffer holds, its work held off; the first @max go
+ * to @c and @fl unless they are NULL
+ */
+static int tty_held(struct tty_port *port, u8 *c, u8 *fl, int max)
+{
+	struct tty_buffer *b;
+	unsigned int i;
+	int n = 0;
+
+	for (b = port->buf.head; b; b = b->next) {
+		for (i = b->read; i < b->used; i++, n++) {
+			if (!c || n >= max)
+				continue;
+			c[n] = *char_buf_ptr(b, i);
+			fl[n] = b->flags ? *flag_buf_ptr(b, i) : TTY_NORMAL;
+		}
+	}
+	return n;
+}
+
+/* The bytes left in the flip buffer's last buffer, as the tty core counts */
+static int tty_tail_room(struct tty_port *port)
+{
+	struct tty_buffer *b = port->buf.tail;
+
+	return (b->flags ? 1 : 2) * b->size - b->used;
+}
+
+/*
+ * With the flip buffer full (its work held off and
+ * its memory limited), a device write is NACKed with count 0, counted in
+ * buf_overrun and not acted on, again when sent again; so is one whose
+ * characters fit but not with the flag characters of its events. Carrier
+ * down alone needs no room and counts dcd, with no hangup under CLOCAL;
+ * a refused write with carrier down hangs nothing up, without CLOCAL
+ * either. Nothing refused reaches the flip buffer. Once the buffer
+ * drains, the write is taken whole and its events counted once.
+ */
+static void obmf_test_tty_full(struct kunit *test)
+{
+	struct obmf_fake *f = tty_setup(test);
+	struct tty_k *k = tty_k_get(f, 1);
+	struct serial_icounter_struct ic;
+	struct tty_port *port;
+	struct fake_rec *r;
+	int limit, left, ret, i;
+
+	tty_k_open(test, k);
+	port = k->tty->port;
+	limit = port->buf.mem_limit;
+	KUNIT_ASSERT_EQ(test, tty_buffer_set_limit(port, TTY_FLIP_MIN), 0);
+	tty_buffer_lock_exclusive(port);
+	ret = kunit_add_action_or_reset(test, tty_buf_unlock, port);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	for (i = 0; i < 32; i++) {
+		r = tty_write(f, 0, TTY_CHUNK);
+		if (r->msg[4])
+			break;
+		KUNIT_EXPECT_TRUE(test, tty_answer(r, 0, TTY_CHUNK));
+	}
+	KUNIT_ASSERT_LT(test, i, 32);
+	KUNIT_EXPECT_GT(test, i, 0);
+	KUNIT_EXPECT_TRUE(test, tty_answer(r, FAKE_SERIAL_NACK, 0));
+	ic = tty_k_icount(test, k);
+	KUNIT_EXPECT_EQ(test, ic.rx, i * TTY_CHUNK);
+	KUNIT_EXPECT_EQ(test, ic.buf_overrun, 1);
+
+	left = tty_tail_room(port);
+	KUNIT_ASSERT_GE(test, left, 2);
+	KUNIT_ASSERT_LT(test, left, TTY_CHUNK);
+
+	r = tty_write(f, TTY_EV_BREAK | TTY_EV_OVERRUN, TTY_CHUNK);
+	KUNIT_EXPECT_TRUE(test, tty_answer(r, FAKE_SERIAL_NACK, 0));
+	r = tty_write(f, TTY_EV_BREAK | TTY_EV_OVERRUN, left - 1);
+	KUNIT_EXPECT_TRUE(test, tty_answer(r, FAKE_SERIAL_NACK, 0));
+	r = tty_write(f, TTY_EV_CARRIER_DOWN, 0);
+	KUNIT_EXPECT_TRUE(test, tty_answer(r, 0, 0));
+	ic = tty_k_icount(test, k);
+	KUNIT_EXPECT_EQ(test, ic.rx, i * TTY_CHUNK);
+	KUNIT_EXPECT_EQ(test, ic.buf_overrun, 3);
+	KUNIT_EXPECT_EQ(test, ic.brk, 0);
+	KUNIT_EXPECT_EQ(test, ic.overrun, 0);
+	KUNIT_EXPECT_EQ(test, ic.dcd, 1);
+	KUNIT_EXPECT_TRUE(test, tty_port_initialized(port));
+
+	tty_k_clocal(k, false);
+	r = tty_write(f, TTY_EV_CARRIER_DOWN, TTY_CHUNK);
+	KUNIT_EXPECT_TRUE(test, tty_answer(r, FAKE_SERIAL_NACK, 0));
+	flush_work(&k->tty->hangup_work);
+	KUNIT_EXPECT_TRUE(test, tty_port_initialized(port));
+	tty_k_clocal(k, true);
+	ic = tty_k_icount(test, k);
+	KUNIT_EXPECT_EQ(test, ic.buf_overrun, 4);
+	KUNIT_EXPECT_EQ(test, ic.dcd, 1);
+	KUNIT_EXPECT_EQ(test, tty_held(port, NULL, NULL, 0), i * TTY_CHUNK);
+
+	kunit_release_action(test, tty_buf_unlock, port);
+	flush_work(&port->buf.work);
+	KUNIT_EXPECT_EQ(test, tty_buffer_set_limit(port, limit), 0);
+	r = tty_write(f, TTY_EV_BREAK | TTY_EV_OVERRUN, TTY_CHUNK);
+	KUNIT_EXPECT_TRUE(test, tty_answer(r, 0, TTY_CHUNK));
+	ic = tty_k_icount(test, k);
+	KUNIT_EXPECT_EQ(test, ic.rx, (i + 1) * TTY_CHUNK);
+	KUNIT_EXPECT_EQ(test, ic.buf_overrun, 4);
+	KUNIT_EXPECT_EQ(test, ic.brk, 1);
+	KUNIT_EXPECT_EQ(test, ic.overrun, 1);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_DEFAULT_ANSWERS), 0);
+}
+
+/*
+ * With the port open and CLOCAL clear, carrier down is
+ * acknowledged, counts dcd and hangs the tty up, which closes the port
+ */
+static void obmf_test_tty_hangup(struct kunit *test)
+{
+	struct obmf_fake *f = tty_setup(test);
+	struct tty_k *k = tty_k_get(f, 1);
+	struct serial_icounter_struct ic;
+	struct fake_rec *r;
+
+	tty_k_open(test, k);
+	tty_k_clocal(k, false);
+	r = tty_write(f, TTY_EV_CARRIER_DOWN, 0);
+	KUNIT_EXPECT_TRUE(test, tty_answer(r, 0, 0));
+	flush_work(&k->tty->hangup_work);
+	KUNIT_EXPECT_TRUE(test, test_bit(TTY_HUPPED, &k->tty->flags));
+	KUNIT_EXPECT_FALSE(test, tty_port_initialized(k->tty->port));
+	ic = tty_k_icount(test, k);
+	KUNIT_EXPECT_EQ(test, ic.dcd, 1);
+	KUNIT_EXPECT_EQ(test, ic.rx, 0);
+	/* As for a hung-up file, the close does nothing more */
+	if (test_bit(TTY_HUPPED, &k->tty->flags))
+		k->open = false;
+}
+
+/*
+ * While the port is closed, a device write with
+ * characters is NACKed with count 0 and not acted on, and not counted in
+ * buf_overrun; one with events only is acknowledged and its events
+ * counted, with no flag characters. Once the port is open, the write sent
+ * again is taken, and its characters and flag characters reach the flip
+ * buffer once. The buffer is held while the port is closed and found
+ * empty, as the line discipline opened with the tty would take anything
+ * pushed then; it is let go across the open, as the tty core takes the
+ * tty lock before the buffer's.
+ */
+static void obmf_test_tty_closed(struct kunit *test)
+{
+	static const u8 ev = TTY_EV_BREAK | TTY_EV_OVERRUN |
+			     TTY_EV_CARRIER_DOWN;
+	static const u8 c_want[] = { 0, 0, 'a', 'b', 'c' };
+	static const u8 fl_want[] = { TTY_BREAK, TTY_OVERRUN, TTY_NORMAL,
+				      TTY_NORMAL, TTY_NORMAL };
+	struct obmf_fake *f = tty_setup(test);
+	struct tty_k *k = tty_k_get(f, 1);
+	struct serial_icounter_struct ic;
+	u8 c[8], fl[8];
+	struct fake_rec *r;
+	int ret, n;
+
+	KUNIT_ASSERT_FALSE(test, tty_port_initialized(k->tty->port));
+	tty_buffer_lock_exclusive(k->tty->port);
+	ret = kunit_add_action_or_reset(test, tty_buf_unlock, k->tty->port);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	r = tty_write(f, ev, 3);
+	KUNIT_EXPECT_TRUE(test, tty_answer(r, FAKE_SERIAL_NACK, 0));
+	ic = tty_k_icount(test, k);
+	KUNIT_EXPECT_EQ(test, ic.rx, 0);
+	KUNIT_EXPECT_EQ(test, ic.brk, 0);
+	KUNIT_EXPECT_EQ(test, ic.overrun, 0);
+	KUNIT_EXPECT_EQ(test, ic.dcd, 0);
+	KUNIT_EXPECT_EQ(test, ic.buf_overrun, 0);
+	r = tty_write(f, ev, 0);
+	KUNIT_EXPECT_TRUE(test, tty_answer(r, 0, 0));
+	ic = tty_k_icount(test, k);
+	KUNIT_EXPECT_EQ(test, ic.brk, 1);
+	KUNIT_EXPECT_EQ(test, ic.overrun, 1);
+	KUNIT_EXPECT_EQ(test, ic.dcd, 1);
+	KUNIT_EXPECT_EQ(test, ic.buf_overrun, 0);
+	KUNIT_EXPECT_EQ(test, tty_held(k->tty->port, NULL, NULL, 0), 0);
+	kunit_release_action(test, tty_buf_unlock, k->tty->port);
+
+	tty_k_open(test, k);
+	tty_buffer_lock_exclusive(k->tty->port);
+	ret = kunit_add_action_or_reset(test, tty_buf_unlock, k->tty->port);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	r = tty_write(f, ev, 3);
+	KUNIT_EXPECT_TRUE(test, tty_answer(r, 0, 3));
+	ic = tty_k_icount(test, k);
+	KUNIT_EXPECT_EQ(test, ic.rx, 3);
+	KUNIT_EXPECT_EQ(test, ic.brk, 2);
+	KUNIT_EXPECT_EQ(test, ic.overrun, 2);
+	KUNIT_EXPECT_EQ(test, ic.dcd, 2);
+	KUNIT_EXPECT_EQ(test, ic.buf_overrun, 0);
+	KUNIT_EXPECT_TRUE(test, tty_port_initialized(k->tty->port));
+	n = tty_held(k->tty->port, c, fl, sizeof(c));
+	KUNIT_ASSERT_EQ(test, n, sizeof(c_want));
+	KUNIT_EXPECT_MEMEQ(test, c, c_want, n);
+	KUNIT_EXPECT_MEMEQ(test, fl, fl_want, n);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_DEFAULT_ANSWERS), 0);
+	kunit_release_action(test, tty_buf_unlock, k->tty->port);
+}
+
+/* The serial driver's tries of a NACKed Generate Break and their spacing */
+#define TTY_BREAK_TRIES 20
+#define TTY_BREAK_DELAY_MS 10
+
+/*
+ * A Generate Break the device NACKs is sent again; after two
+ * NACKs it is acknowledged and the break succeeds, each of the three
+ * requests a Generate Break with count 0, and one NACKed every
+ * time fails with -EIO after the last try. Ending the break sends
+ * nothing: the device sets its length.
+ */
+static void obmf_test_tty_break(struct kunit *test)
+{
+	struct obmf_fake *f = tty_setup(test);
+	struct tty_k *k = tty_k_get(f, 1);
+	struct fake_step s = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.plen = 3,
+		.payload = { FAKE_SERIAL_NACK },
+	};
+	struct fake_rec *r;
+	unsigned int sends;
+	int i, n = 0;
+	const u8 *p;
+	ktime_t t;
+
+	tty_k_open(test, k);
+	fake_push(f, &s);
+	fake_push(f, &s);
+	s.payload[0] = 0;
+	fake_push(f, &s);
+	sends = READ_ONCE(f->sends);
+	i = fake_nlog(f) - 1;
+	t = ktime_get();
+	KUNIT_EXPECT_EQ(test, k->tty->ops->break_ctl(k->tty, -1), 0);
+	KUNIT_EXPECT_GE(test, ktime_ms_delta(ktime_get(), t),
+			2 * TTY_BREAK_DELAY_MS);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + 3);
+	while ((i = fake_find(f, i + 1, FAKE_SEND, 1, 0)) >= 0) {
+		r = &f->log[i];
+		p = r->msg + OBMF_HDR_LEN;
+		KUNIT_EXPECT_EQ_MSG(test, r->len, (size_t)OBMF_HDR_LEN + 3,
+				    "request %d", n);
+		KUNIT_EXPECT_EQ_MSG(test, p[0], TTY_EV_GENERATE_BREAK,
+				    "request %d", n);
+		KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le16(p + 1), 0,
+				    "request %d", n);
+		n++;
+	}
+	KUNIT_EXPECT_EQ(test, n, 3);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->break_ctl(k->tty, 0), 0);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + 3);
+
+	s.payload[0] = FAKE_SERIAL_NACK;
+	scoped_guard(spinlock_irqsave, &f->lock)
+		f->dflt = s;
+	sends = READ_ONCE(f->sends);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->break_ctl(k->tty, -1), -EIO);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + TTY_BREAK_TRIES);
+}
+
+#define TTY_SLOW_HZ 300
+/*
+ * Characters at TTY_SLOW_HZ whose time on the wire, twice over, fits the
+ * core's longest wait less the default timeout, ten bits a character
+ */
+#define TTY_SLOW_CHARS                                                   \
+	(TTY_SLOW_HZ * (OBMF_MAX_TIMEOUT_MS - OBMF_DEFAULT_TIMEOUT_MS) / \
+	 (2 * 10 * MSEC_PER_SEC))
+#define TTY_SLOW_LEN 200
+
+/*
+ * On a slow line, a request carries no more characters than
+ * its wait for the answer has time for within the core's limit, fewer
+ * than the channel's request size allows; the rest follows in the next
+ */
+static void obmf_test_tty_slow(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	struct fake_step s = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.plen = 3,
+	};
+	u8 buf[TTY_SLOW_LEN];
+	struct fake_rec *r;
+	int i, n = 0, t, total = 0;
+	struct tty_k *k;
+	ssize_t ret;
+	u16 c;
+
+	fake_layout(f, tty_chans, ARRAY_SIZE(tty_chans));
+	tty_cfg(f, 1, TTY_SLOW_HZ, 8, 1, 0);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	KUNIT_ASSERT_TRUE(test, tty_bound(f, 1));
+	k = tty_k_get(f, 1);
+	tty_k_open(test, k);
+	scoped_guard(spinlock_irqsave, &f->lock)
+		f->dflt = s;
+	i = fake_nlog(f) - 1;
+	memset(buf, 'x', sizeof(buf));
+	ret = k->tty->ops->write(k->tty, buf, sizeof(buf));
+	KUNIT_ASSERT_EQ(test, ret, TTY_SLOW_LEN);
+	for (t = 0; t < 50 && tty_k_icount(test, k).tx < TTY_SLOW_LEN; t++)
+		msleep(20);
+	KUNIT_EXPECT_EQ(test, tty_k_icount(test, k).tx, TTY_SLOW_LEN);
+	while ((i = fake_find(f, i + 1, FAKE_SEND, 1, 0)) >= 0) {
+		r = &f->log[i];
+		c = get_unaligned_le16(r->msg + OBMF_HDR_LEN + 1);
+		KUNIT_EXPECT_LE_MSG(test, c, TTY_SLOW_CHARS, "request %d", n);
+		total += c;
+		n++;
+	}
+	KUNIT_EXPECT_EQ(test, total, TTY_SLOW_LEN);
+	KUNIT_EXPECT_EQ(test, n, DIV_ROUND_UP(TTY_SLOW_LEN, TTY_SLOW_CHARS));
+}
+
+/*
+ * The nodes each function device below @parent had when it was added;
+ * the uevent's OF_* values come from @of_node
+ */
+static struct {
+	struct device *parent;
+	struct fwnode_handle *node[3];
+	struct device_node *of_node[3];
+} tty_node_added;
+
+static int tty_node_notify(struct notifier_block *nb, unsigned long action,
+			   void *data)
+{
+	struct device *dev = data;
+	struct obmf_fdev *fdev;
+
+	if (action != BUS_NOTIFY_ADD_DEVICE ||
+	    dev->parent != tty_node_added.parent)
+		return NOTIFY_DONE;
+	fdev = to_obmf_fdev(to_auxiliary_dev(dev));
+	if (fdev->info->number < ARRAY_SIZE(tty_node_added.node)) {
+		tty_node_added.node[fdev->info->number] = dev_fwnode(dev);
+		tty_node_added.of_node[fdev->info->number] = dev_of_node(dev);
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block tty_node_nb = {
+	.notifier_call = tty_node_notify,
+};
+
+static void tty_node_unwatch(void *bus)
+{
+	bus_unregister_notifier(bus, &tty_node_nb);
+}
+
+/*
+ * A serial channel of either role takes its node as an I2C channel does.
+ * The node is its function device's when the bus adds that device, the
+ * step whose uevent udev sees. The tty below it has no node, and its
+ * parent is the function device, which udev rules import the node from.
+ */
+static void obmf_test_tty_node(struct kunit *test)
+{
+	static const struct test_chan c[] = {
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "p", 516, 0,
+		  TTY_CFG_LEN },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_SYMMETRIC, "s", 516, 0,
+		  TTY_CFG_LEN },
+	};
+	static const char *const paths[] = {
+		"/obmf-test-tty/serial@1",
+		"/obmf-test-tty/serial@2",
+	};
+	struct obmf_fake *any = tty_setup(test);
+	const struct bus_type *bus;
+	struct fwnode_handle *node;
+	struct device_node *np;
+	struct obmf_fdev *fdev;
+	struct obmf_fake *f;
+	struct device *tty;
+	int i, nr;
+
+	/* auxiliary_bus_type is static: take it from a bound function device */
+	bus = chan(any, 1)->fdev->adev.dev.bus;
+	KUNIT_ASSERT_EQ(test, of_overlay_apply_kunit(test, obmf_test_nodes), 0);
+	f = fake_create(test, FAKE_MAX_MSG, 0);
+	device_set_node(f->tp.dev,
+			of_fwnode_handle(of_test_node(test, "/obmf-test-tty")));
+	memset(&tty_node_added, 0, sizeof(tty_node_added));
+	tty_node_added.parent = f->tp.dev;
+	KUNIT_ASSERT_EQ(test, bus_register_notifier(bus, &tty_node_nb), 0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, tty_node_unwatch,
+						  (void *)bus),
+			0);
+	fake_layout(f, c, ARRAY_SIZE(c));
+	for (i = 0; i < ARRAY_SIZE(c); i++)
+		tty_cfg(f, i + 1, TTY_HZ, 8, 1, 0);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+
+	for (i = 0; i < ARRAY_SIZE(c); i++) {
+		nr = i + 1;
+		np = of_test_node(test, paths[i]);
+		node = of_fwnode_handle(np);
+		KUNIT_EXPECT_PTR_EQ_MSG(test, tty_node_added.node[nr], node,
+					"channel %d", nr);
+		KUNIT_EXPECT_PTR_EQ_MSG(test, tty_node_added.of_node[nr], np,
+					"channel %d", nr);
+		KUNIT_ASSERT_TRUE_MSG(test, tty_bound(f, nr), "channel %d", nr);
+		fdev = chan(f, nr)->fdev;
+		KUNIT_EXPECT_PTR_EQ_MSG(test, dev_fwnode(&fdev->adev.dev), node,
+					"channel %d", nr);
+		tty = device_find_any_child(&fdev->adev.dev);
+		KUNIT_ASSERT_NOT_NULL_MSG(test, tty, "channel %d", nr);
+		KUNIT_EXPECT_NE_MSG(test, MAJOR(tty->devt), 0, "channel %d",
+				    nr);
+		KUNIT_EXPECT_NULL_MSG(test, dev_fwnode(tty), "channel %d", nr);
+		KUNIT_EXPECT_NULL_MSG(test, dev_of_node(tty), "channel %d", nr);
+		KUNIT_EXPECT_PTR_EQ_MSG(test, tty->parent, &fdev->adev.dev,
+					"channel %d", nr);
+		put_device(tty);
+	}
+}
+
+/* Characters in one request on tty_tx_chans' channel */
+#define TTY_TX_MAX 16
+#define TTY_TX_LEN 40
+/* The serial driver's transmit FIFO */
+#define TTY_FIFO 4096
+
+/* Channel 1: serial at 115200 8N1, TTY_TX_MAX characters a request */
+static const struct test_chan tty_tx_chans[] = {
+	{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "uart",
+	  OBMF_HDR_LEN + 3 + TTY_TX_MAX, 0, TTY_CFG_LEN },
+};
+
+/* Channel 1 of tty_tx_chans, its tty open */
+static struct tty_k *tty_tx_setup(struct kunit *test, struct obmf_fake **fp)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	struct tty_k *k;
+
+	fake_layout(f, tty_tx_chans, ARRAY_SIZE(tty_tx_chans));
+	tty_cfg(f, 1, TTY_HZ, 8, 1, 0);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	KUNIT_ASSERT_TRUE(test, tty_bound(f, 1));
+	k = tty_k_get(f, 1);
+	tty_k_open(test, k);
+	*fp = f;
+	return k;
+}
+
+/* Waits up to @ms for @tx characters sent in all and none left */
+static void tty_tx_wait_ms(struct kunit *test, struct tty_k *k, u32 tx,
+			   unsigned int ms)
+{
+	unsigned int t;
+
+	for (t = 0; t < ms / 20; t++) {
+		if (tty_k_icount(test, k).tx == tx &&
+		    !k->tty->ops->chars_in_buffer(k->tty))
+			break;
+		msleep(20);
+	}
+	KUNIT_EXPECT_EQ(test, tty_k_icount(test, k).tx, tx);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty), 0);
+}
+
+static void tty_tx_wait(struct kunit *test, struct tty_k *k, u32 tx)
+{
+	tty_tx_wait_ms(test, k, tx, 1000);
+}
+
+/* Request @r carries Operation/Event 0 and the @n characters at @src */
+static void tty_tx_check(struct kunit *test, struct fake_rec *r, const u8 *src,
+			 u16 n, int nr)
+{
+	const u8 *p = r->msg + OBMF_HDR_LEN;
+
+	KUNIT_ASSERT_EQ_MSG(test, r->len, (size_t)OBMF_HDR_LEN + 3 + n,
+			    "request %d", nr);
+	KUNIT_EXPECT_EQ_MSG(test, p[0], 0, "request %d", nr);
+	KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le16(p + 1), n, "request %d",
+			    nr);
+	KUNIT_EXPECT_MEMEQ_MSG(test, p + 3, src, n, "request %d", nr);
+}
+
+/*
+ * Written characters go out in order, TTY_TX_MAX a request,
+ * each request with Operation/Event 0 and its Character Count. One NACKed
+ * with count 0 is sent again, and one partly accepted again from the
+ * first character not accepted. Characters answered busy or with the
+ * request timeout status are sent again. Those whose request fails with
+ * another error status are sent once and dropped, counted as dropped and
+ * not in tx, and the next write goes out; so are those whose answer
+ * accepts more than was sent, a protocol error. Expected: "dropped 4
+ * bytes: -5" and "dropped 4 bytes: -71".
+ */
+static void obmf_test_tty_tx(struct kunit *test)
+{
+	static const struct {
+		u16 off, n;
+	} want[] = {
+		{ 0, TTY_TX_MAX },  { 0, TTY_TX_MAX },	{ 0, TTY_TX_MAX },
+		{ 16, TTY_TX_MAX }, { 21, TTY_TX_MAX }, { 37, 3 },
+	};
+	struct fake_step ack = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.plen = 3,
+	};
+	struct fake_step s = ack;
+	u8 buf[TTY_TX_LEN];
+	unsigned int sends;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	int i, n = 0;
+	long errs;
+
+	k = tty_tx_setup(test, &f);
+	for (i = 0; i < sizeof(buf); i++)
+		buf[i] = 'a' + i % 26;
+	scoped_guard(spinlock_irqsave, &f->lock)
+		f->dflt = ack;
+	s.payload[0] = FAKE_SERIAL_NACK;
+	fake_push(f, &s);
+	fake_push(f, &s);
+	fake_push(f, &ack);
+	s.payload[1] = 5;
+	fake_push(f, &s);
+	i = fake_nlog(f) - 1;
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, TTY_TX_LEN),
+			TTY_TX_LEN);
+	tty_tx_wait(test, k, TTY_TX_LEN);
+	while ((i = fake_find(f, i + 1, FAKE_SEND, 1, 0)) >= 0 &&
+	       n < ARRAY_SIZE(want)) {
+		tty_tx_check(test, &f->log[i], buf + want[n].off, want[n].n, n);
+		n++;
+	}
+	KUNIT_EXPECT_EQ(test, n, ARRAY_SIZE(want));
+	KUNIT_EXPECT_LT(test, i, 0);
+
+	s = ack;
+	s.plen = 0;
+	s.status = OBMF_STATUS_BUSY;
+	fake_push(f, &s);
+	s.status = OBMF_STATUS_TIMEOUT;
+	fake_push(f, &s);
+	sends = READ_ONCE(f->sends);
+	i = fake_nlog(f) - 1;
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	tty_tx_wait(test, k, TTY_TX_LEN + 4);
+	msleep(50);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + 3);
+	n = 0;
+	while ((i = fake_find(f, i + 1, FAKE_SEND, 1, 0)) >= 0)
+		tty_tx_check(test, &f->log[i], buf, 4, n++);
+	KUNIT_EXPECT_EQ(test, n, 3);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+
+	s.status = OBMF_STATUS_INVALID;
+	fake_push(f, &s);
+	sends = READ_ONCE(f->sends);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	tty_tx_wait(test, k, TTY_TX_LEN + 4);
+	msleep(50);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + 1);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 4);
+
+	s = ack;
+	s.payload[1] = 5;
+	fake_push(f, &s);
+	errs = ch_cnt(chan(f, 1), OBMF_CH_PROTOCOL_ERRORS);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	tty_tx_wait(test, k, TTY_TX_LEN + 4);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_PROTOCOL_ERRORS),
+			errs + 1);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 8);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	tty_tx_wait(test, k, TTY_TX_LEN + 8);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 8);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 0);
+}
+
+/*
+ * While a request is in flight its characters still count in
+ * chars_in_buffer, and write_room is the rest of the FIFO. flush_buffer
+ * then drops the characters not yet sent; those in flight count in tx
+ * once the device accepts them. Characters written after the flush and
+ * before that answer go out after it; nothing else is sent. A flush
+ * counts nothing as dropped.
+ */
+static void obmf_test_tty_tx_flush(struct kunit *test)
+{
+	struct fake_step s = {
+		.how = FAKE_WORK,
+		.delay_ms = 200,
+		.channel = -1,
+		.plen = 3,
+	};
+	static const u8 late[] = "late";
+	u8 buf[TTY_TX_LEN];
+	unsigned int sends;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	int i;
+
+	k = tty_tx_setup(test, &f);
+	memset(buf, 'x', sizeof(buf));
+	fake_push(f, &s);
+	s.how = FAKE_INLINE;
+	scoped_guard(spinlock_irqsave, &f->lock)
+		f->dflt = s;
+	sends = READ_ONCE(f->sends);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, TTY_TX_LEN),
+			TTY_TX_LEN);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
+	KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty), TTY_TX_LEN);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->write_room(k->tty),
+			TTY_FIFO - TTY_TX_LEN);
+	k->tty->ops->flush_buffer(k->tty);
+	i = fake_nlog(f) - 1;
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, late, 4), 4);
+	tty_tx_wait(test, k, TTY_TX_MAX + 4);
+	msleep(50);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + 2);
+	i = fake_find(f, i + 1, FAKE_SEND, 1, 0);
+	KUNIT_ASSERT_GE(test, i, 0);
+	tty_tx_check(test, &f->log[i], late, 4, 1);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->write_room(k->tty), TTY_FIFO);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+}
+
+/*
+ * Two flushes while one request is in flight, each followed
+ * by a write: after the answer only the write after the second flush
+ * goes out, and nothing counts as dropped.
+ */
+static void obmf_test_tty_tx_flush_twice(struct kunit *test)
+{
+	static const u8 a[] = "abcd", b[] = "ef", c[] = "gh";
+	struct fake_step s = {
+		.how = FAKE_WORK,
+		.delay_ms = 200,
+		.channel = -1,
+		.plen = 3,
+	};
+	unsigned int sends;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	int i;
+
+	k = tty_tx_setup(test, &f);
+	fake_push(f, &s);
+	s.how = FAKE_INLINE;
+	scoped_guard(spinlock_irqsave, &f->lock)
+		f->dflt = s;
+	sends = READ_ONCE(f->sends);
+	i = fake_nlog(f) - 1;
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, a, 4), 4);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
+	k->tty->ops->flush_buffer(k->tty);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, b, 2), 2);
+	k->tty->ops->flush_buffer(k->tty);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, c, 2), 2);
+	tty_tx_wait(test, k, 6);
+	i = fake_find(f, i + 1, FAKE_SEND, 1, 0);
+	KUNIT_ASSERT_GE(test, i, 0);
+	tty_tx_check(test, &f->log[i], a, 4, 0);
+	i = fake_find(f, i + 1, FAKE_SEND, 1, 0);
+	KUNIT_ASSERT_GE(test, i, 0);
+	tty_tx_check(test, &f->log[i], c, 2, 1);
+	KUNIT_EXPECT_LT(test, fake_find(f, i + 1, FAKE_SEND, 1, 0), 0);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+}
+
+/*
+ * A flush while a request is in flight that the device then
+ * accepts in part, 2 of 4, and a write after the flush: the 2 count in
+ * tx, the other 2 go, not counted as dropped, and the write goes out
+ * alone.
+ */
+static void obmf_test_tty_tx_flush_partial(struct kunit *test)
+{
+	static const u8 a[] = "abcd", c[] = "xy";
+	struct fake_step s = {
+		.how = FAKE_WORK,
+		.delay_ms = 200,
+		.channel = -1,
+		.plen = 3,
+		.payload = { FAKE_SERIAL_NACK, 2 },
+	};
+	unsigned int sends;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	int i;
+
+	k = tty_tx_setup(test, &f);
+	fake_push(f, &s);
+	s = (struct fake_step){ .how = FAKE_INLINE, .channel = -1, .plen = 3 };
+	scoped_guard(spinlock_irqsave, &f->lock)
+		f->dflt = s;
+	sends = READ_ONCE(f->sends);
+	i = fake_nlog(f) - 1;
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, a, 4), 4);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
+	k->tty->ops->flush_buffer(k->tty);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, c, 2), 2);
+	tty_tx_wait(test, k, 4);
+	i = fake_find(f, i + 1, FAKE_SEND, 1, 0);
+	KUNIT_ASSERT_GE(test, i, 0);
+	tty_tx_check(test, &f->log[i], a, 4, 0);
+	i = fake_find(f, i + 1, FAKE_SEND, 1, 0);
+	KUNIT_ASSERT_GE(test, i, 0);
+	tty_tx_check(test, &f->log[i], c, 2, 1);
+	KUNIT_EXPECT_LT(test, fake_find(f, i + 1, FAKE_SEND, 1, 0), 0);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+}
+
+/* The serial driver's delay between tries of a refused request */
+#define TTY_RETRY_MS 10
+/* NACKs after which the serial driver dropped the characters before */
+#define TTY_OLD_TRIES 20
+/* How long the refusing devices below refuse */
+#define TTY_REFUSE_MS 1000
+
+static void tty_dflt(struct obmf_fake *f, const struct fake_step *s)
+{
+	guard(spinlock_irqsave)
+		(&f->lock);
+	f->dflt = *s;
+}
+
+static const struct fake_step tty_ack = {
+	.how = FAKE_INLINE,
+	.channel = -1,
+	.plen = 3,
+};
+
+static const struct fake_step tty_nack = {
+	.how = FAKE_INLINE,
+	.channel = -1,
+	.plen = 3,
+	.payload = { FAKE_SERIAL_NACK },
+};
+
+/* How long the serial driver keeps a refused head before it warns */
+#define TTY_STALL_MS 5000
+#define TTY_LOG_LINES 32
+#define TTY_LOG_LINE 160
+
+/*
+ * The kernel log lines of channel 1's function device in the running
+ * case, as the console tracepoint passes them: the tty work logs, so a
+ * static stub would not see them. Each case has its own probe and keeps
+ * only the lines of its device, as an earlier device of the case can
+ * still log.
+ */
+struct tty_log {
+	raw_spinlock_t lock;
+	int reg;
+	char dev[48];
+	unsigned int n;
+	unsigned int lost;
+	char line[TTY_LOG_LINES][TTY_LOG_LINE];
+};
+
+/* Called with interrupts off, from every printk */
+static void tty_log_probe(void *data, const char *buf, size_t len)
+{
+	struct tty_log *log = data;
+	unsigned long flags;
+
+	/* No line of ours comes from NMI, which could find the lock held */
+	if (in_nmi())
+		return;
+	raw_spin_lock_irqsave(&log->lock, flags);
+	if (log->dev[0] && strnstr(buf, log->dev, len)) {
+		/* @buf is not NUL-terminated */
+		if (log->n < TTY_LOG_LINES)
+			strscpy(log->line[log->n++], buf,
+				min(len + 1, sizeof(log->line[0])));
+		else
+			log->lost++;
+	}
+	raw_spin_unlock_irqrestore(&log->lock, flags);
+}
+
+static int obmf_tty_test_init(struct kunit *test)
+{
+	struct tty_log *log;
+
+	log = kunit_kzalloc(test, sizeof(*log), GFP_KERNEL);
+	if (!log)
+		return -ENOMEM;
+	raw_spin_lock_init(&log->lock);
+	log->reg = register_trace_console(tty_log_probe, log);
+	test->priv = log;
+	return 0;
+}
+
+static void obmf_tty_test_exit(struct kunit *test)
+{
+	struct tty_log *log = test->priv;
+
+	if (log && !log->reg) {
+		unregister_trace_console(tty_log_probe, log);
+		tracepoint_synchronize_unregister();
+	}
+}
+
+/*
+ * From now on, keep the lines of channel 1's function device. Without
+ * printk or tracepoints there are none, and a case that counts lines is
+ * skipped here, before it acts: a skip later would hide its failures.
+ */
+static struct tty_log *tty_log_start(struct obmf_fake *f)
+{
+	struct device *dev = &chan(f, 1)->fdev->adev.dev;
+	struct tty_log *log = f->test->priv;
+
+	if (!IS_ENABLED(CONFIG_PRINTK) || log->reg)
+		kunit_skip(f->test,
+			   "needs CONFIG_PRINTK and CONFIG_TRACEPOINTS");
+	scoped_guard(raw_spinlock_irqsave, &log->lock) {
+		snprintf(log->dev, sizeof(log->dev), " %s: ", dev_name(dev));
+		log->n = 0;
+		log->lost = 0;
+	}
+	return log;
+}
+
+/* Lines in @log, since tty_log_start(), that contain @text */
+static int tty_log_lines(struct kunit *test, struct tty_log *log,
+			 const char *text)
+{
+	unsigned int i, lost;
+	int n = 0;
+
+	scoped_guard(raw_spinlock_irqsave, &log->lock) {
+		for (i = 0; i < log->n; i++)
+			if (strstr(log->line[i], text))
+				n++;
+		lost = log->lost;
+	}
+	KUNIT_ASSERT_EQ_MSG(test, lost, 0, "log lines not kept");
+	return n;
+}
+
+/* Waits up to @ms for @n lines that tty_log_lines() counts */
+static int tty_log_wait(struct kunit *test, struct tty_log *log,
+			const char *text, int n, unsigned int ms)
+{
+	unsigned int t;
+
+	for (t = 0; t < ms / 100; t++) {
+		if (tty_log_lines(test, log, text) >= n)
+			break;
+		msleep(100);
+	}
+	return tty_log_lines(test, log, text);
+}
+
+/* Every logged request from @i on carries the @n characters at @src */
+static int tty_tx_same(struct kunit *test, struct obmf_fake *f, int i,
+		       const u8 *src, u16 n)
+{
+	int nr = 0;
+
+	while ((i = fake_find(f, i + 1, FAKE_SEND, 1, 0)) >= 0)
+		tty_tx_check(test, &f->log[i], src, n, nr++);
+	return nr;
+}
+
+/*
+ * Characters the device NACKs with count 0 stay in the FIFO
+ * and are sent again, TTY_RETRY_MS apart, with no limit on the tries.
+ * After TTY_OLD_TRIES NACKs, the bound at which they were dropped before,
+ * the next try is sent and accepted. Nothing is logged.
+ */
+static void obmf_test_tty_nack_bound(struct kunit *test)
+{
+	unsigned int sends;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	u8 buf[4];
+	ktime_t t;
+	int i, n;
+
+	k = tty_tx_setup(test, &f);
+	memcpy(buf, "abcd", sizeof(buf));
+	tty_dflt(f, &tty_ack);
+	for (i = 0; i < TTY_OLD_TRIES; i++)
+		fake_push(f, &tty_nack);
+	sends = READ_ONCE(f->sends);
+	i = fake_nlog(f) - 1;
+	t = ktime_get();
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, sizeof(buf)),
+			sizeof(buf));
+	tty_tx_wait_ms(test, k, sizeof(buf), 4 * TTY_REFUSE_MS);
+	KUNIT_EXPECT_GE(test, ktime_ms_delta(ktime_get(), t),
+			TTY_OLD_TRIES * TTY_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + TTY_OLD_TRIES + 1);
+	n = tty_tx_same(test, f, i, buf, sizeof(buf));
+	KUNIT_EXPECT_EQ(test, n, TTY_OLD_TRIES + 1);
+}
+
+/*
+ * A device that NACKs every request for TTY_REFUSE_MS, then
+ * accepts: while it refuses, the characters stay counted in
+ * chars_in_buffer and out of write_room, none counts in tx, and the
+ * tries come no faster than TTY_RETRY_MS apart. Then every character
+ * is sent once more, in order, and counts in tx once: none is dropped.
+ * A refusal shorter than TTY_STALL_MS is neither logged nor counted as a
+ * stall.
+ */
+static void obmf_test_tty_nack_long(struct kunit *test)
+{
+	unsigned int sends, tries;
+	struct fake_rec *rec[8];
+	u8 buf[TTY_TX_LEN];
+	struct obmf_fake *f;
+	struct tty_k *k;
+	struct tty_log *log;
+	int i, n;
+	s64 ms;
+	ktime_t t;
+
+	k = tty_tx_setup(test, &f);
+	log = tty_log_start(f);
+	for (i = 0; i < sizeof(buf); i++)
+		buf[i] = 'a' + i % 26;
+	scoped_guard(spinlock_irqsave, &f->lock) {
+		f->dflt = tty_nack;
+		f->nolog = true;
+	}
+	sends = READ_ONCE(f->sends);
+	t = ktime_get();
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, TTY_TX_LEN),
+			TTY_TX_LEN);
+	msleep(TTY_REFUSE_MS);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty), TTY_TX_LEN);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->write_room(k->tty),
+			TTY_FIFO - TTY_TX_LEN);
+	KUNIT_EXPECT_EQ(test, tty_k_icount(test, k).tx, 0);
+	scoped_guard(spinlock_irqsave, &f->lock) {
+		tries = f->sends - sends;
+		ms = ktime_ms_delta(ktime_get(), t);
+		f->nolog = false;
+		i = f->nlog - 1;
+	}
+	KUNIT_EXPECT_GT(test, tries, TTY_OLD_TRIES);
+	KUNIT_EXPECT_LE(test, tries, ms / TTY_RETRY_MS + 1);
+	/* Tries logged before the device accepts carry the first request */
+	tty_dflt(f, &tty_ack);
+	tty_tx_wait(test, k, TTY_TX_LEN);
+	n = 0;
+	while ((i = fake_find(f, i + 1, FAKE_SEND, 1, 0)) >= 0 &&
+	       n < ARRAY_SIZE(rec))
+		rec[n++] = &f->log[i];
+	KUNIT_ASSERT_GE(test, n, 3);
+	KUNIT_EXPECT_LT(test, i, 0);
+	for (i = 0; i < n - 2; i++)
+		tty_tx_check(test, rec[i], buf, TTY_TX_MAX, i);
+	tty_tx_check(test, rec[n - 2], buf + TTY_TX_MAX, TTY_TX_MAX, n - 2);
+	tty_tx_check(test, rec[n - 1], buf + 2 * TTY_TX_MAX,
+		     TTY_TX_LEN - 2 * TTY_TX_MAX, n - 1);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 0);
+	KUNIT_EXPECT_EQ(test, tty_log_lines(test, log, "transmit stalled"), 0);
+}
+
+/*
+ * Characters whose request times out stay in the FIFO and are
+ * sent again: after two requests the device does not answer, and after
+ * more than TTY_OLD_TRIES answered with the line timeout status. An
+ * answer that comes after the timeout answers the next try, so the
+ * device gets those characters twice; they count in tx once, and the
+ * answer is not counted late. Nothing is logged or counted as dropped.
+ */
+static void obmf_test_tty_timeout(struct kunit *test)
+{
+	struct fake_step s = tty_ack;
+	unsigned int sends;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	long to, late;
+	u8 buf[12];
+	int i, n;
+
+	k = tty_tx_setup(test, &f);
+	for (i = 0; i < sizeof(buf); i++)
+		buf[i] = 'a' + i;
+	tty_dflt(f, &tty_ack);
+	s.how = FAKE_NEVER;
+	fake_push(f, &s);
+	fake_push(f, &s);
+	to = ch_cnt(chan(f, 1), OBMF_CH_TIMEOUTS);
+	sends = READ_ONCE(f->sends);
+	i = fake_nlog(f) - 1;
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	tty_tx_wait_ms(test, k, 4, 4 * OBMF_DEFAULT_TIMEOUT_MS);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + 3);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_TIMEOUTS), to + 2);
+	n = tty_tx_same(test, f, i, buf, 4);
+	KUNIT_EXPECT_EQ(test, n, 3);
+
+	s = tty_ack;
+	s.status = OBMF_STATUS_SERIAL_LINE_TIMEOUT;
+	s.plen = 0;
+	tty_dflt(f, &s);
+	sends = READ_ONCE(f->sends);
+	i = fake_nlog(f) - 1;
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf + 4, 4), 4);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + TTY_OLD_TRIES + 1));
+	KUNIT_EXPECT_EQ(test, tty_k_icount(test, k).tx, 4);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty), 4);
+	tty_dflt(f, &tty_ack);
+	tty_tx_wait(test, k, 8);
+	n = tty_tx_same(test, f, i, buf + 4, 4);
+	KUNIT_EXPECT_GT(test, n, TTY_OLD_TRIES + 1);
+
+	s = tty_ack;
+	s.how = FAKE_WORK;
+	s.delay_ms = OBMF_DEFAULT_TIMEOUT_MS + 300;
+	fake_push(f, &s);
+	s.how = FAKE_NEVER;
+	tty_dflt(f, &s);
+	to = ch_cnt(chan(f, 1), OBMF_CH_TIMEOUTS);
+	late = ch_cnt(chan(f, 1), OBMF_CH_RX_LATE);
+	sends = READ_ONCE(f->sends);
+	i = fake_nlog(f) - 1;
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf + 8, 4), 4);
+	tty_tx_wait_ms(test, k, 12, 2 * s.delay_ms);
+	tty_dflt(f, &tty_ack);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + 2);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_TIMEOUTS), to + 1);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_RX_LATE), late);
+	n = tty_tx_same(test, f, i, buf + 8, 4);
+	KUNIT_EXPECT_EQ(test, n, 2);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+}
+
+/*
+ * While the device refuses, a write that fills the FIFO is
+ * taken whole, write_room falls to 0 and the next write takes nothing;
+ * tcdrain waits, for its timeout. Once the device accepts, the FIFO
+ * empties, write_room comes back and tcdrain returns.
+ */
+static void obmf_test_tty_refused_room(struct kunit *test)
+{
+	struct obmf_fake *f;
+	struct tty_k *k;
+	u8 *buf;
+	ktime_t t;
+
+	k = tty_tx_setup(test, &f);
+	buf = kunit_kzalloc(test, TTY_FIFO, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	memset(buf, 'x', TTY_FIFO);
+	scoped_guard(spinlock_irqsave, &f->lock) {
+		f->dflt = tty_nack;
+		f->nolog = true;
+	}
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, TTY_FIFO),
+			TTY_FIFO);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->write_room(k->tty), 0);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->write(k->tty, buf, 1), 0);
+	t = ktime_get();
+	tty_wait_until_sent(k->tty, msecs_to_jiffies(200));
+	KUNIT_EXPECT_GE(test, ktime_ms_delta(ktime_get(), t), 150);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty), TTY_FIFO);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->write_room(k->tty), 0);
+	KUNIT_EXPECT_EQ(test, tty_k_icount(test, k).tx, 0);
+
+	tty_dflt(f, &tty_ack);
+	t = ktime_get();
+	tty_wait_until_sent(k->tty, msecs_to_jiffies(5 * TTY_REFUSE_MS));
+	KUNIT_EXPECT_LT(test, ktime_ms_delta(ktime_get(), t),
+			5 * TTY_REFUSE_MS);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty), 0);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->write_room(k->tty), TTY_FIFO);
+	KUNIT_EXPECT_EQ(test, tty_k_icount(test, k).tx, TTY_FIFO);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+}
+
+enum tty_stop {
+	TTY_STOP_FLUSH,
+	TTY_STOP_HANGUP,
+	TTY_STOP_CLOSE,
+	TTY_STOP_UNBIND
+};
+
+/*
+ * A device that refuses every request, stopped by @how while
+ * it does: the characters not sent go, nothing is sent after, and none
+ * counts in tx. The flush comes while a request waits for its NACK, and
+ * tcdrain returns once it comes. Only the close logs the characters it
+ * discards and counts them as dropped; a hangup has flushed them.
+ */
+static void tty_refused_stop(struct kunit *test, enum tty_stop how)
+{
+	static const char closed[] = "characters not sent at close";
+	struct fake_step s = tty_nack;
+	unsigned int sends;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	u8 buf[TTY_TX_LEN];
+	struct tty_log *log;
+	ktime_t t;
+	int i;
+
+	k = tty_tx_setup(test, &f);
+	log = tty_log_start(f);
+	memset(buf, 'x', sizeof(buf));
+	if (how == TTY_STOP_FLUSH) {
+		s.how = FAKE_WORK;
+		s.delay_ms = 100;
+	}
+	scoped_guard(spinlock_irqsave, &f->lock) {
+		f->dflt = s;
+		f->nolog = true;
+	}
+	sends = READ_ONCE(f->sends);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, TTY_TX_LEN),
+			TTY_TX_LEN);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 3));
+	switch (how) {
+	case TTY_STOP_FLUSH:
+		k->tty->ops->flush_buffer(k->tty);
+		/* The FIFO is reset when the answer comes */
+		KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty),
+				TTY_TX_LEN);
+		t = ktime_get();
+		tty_wait_until_sent(k->tty, msecs_to_jiffies(TTY_REFUSE_MS));
+		KUNIT_EXPECT_LT(test, ktime_ms_delta(ktime_get(), t),
+				TTY_REFUSE_MS);
+		break;
+	case TTY_STOP_HANGUP:
+		tty_vhangup(k->tty);
+		k->open = false;
+		break;
+	case TTY_STOP_CLOSE:
+		k->tty->port->closing_wait = msecs_to_jiffies(200);
+		t = ktime_get();
+		tty_lock(k->tty);
+		k->tty->ops->close(k->tty, NULL);
+		k->open = false;
+		tty_unlock(k->tty);
+		KUNIT_EXPECT_GE(test, ktime_ms_delta(ktime_get(), t), 150);
+		KUNIT_EXPECT_FALSE(test, tty_port_initialized(k->tty->port));
+		break;
+	case TTY_STOP_UNBIND:
+		fake_unbind(f);
+		k->open = false;
+		break;
+	}
+	/* The request in flight, if any, is answered, then its characters go */
+	for (i = 0; i < 50 && k->tty->ops->chars_in_buffer(k->tty); i++)
+		msleep(TTY_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty), 0);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->write_room(k->tty), TTY_FIFO);
+	KUNIT_EXPECT_EQ(test, tty_k_icount(test, k).tx, 0);
+	sends = READ_ONCE(f->sends);
+	msleep(10 * TTY_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends);
+	KUNIT_EXPECT_EQ_MSG(test, tty_k_cnt(k).dropped,
+			    how == TTY_STOP_CLOSE ? TTY_TX_LEN : 0, "stop %d",
+			    how);
+	KUNIT_EXPECT_EQ_MSG(test, tty_log_lines(test, log, closed),
+			    how == TTY_STOP_CLOSE, "stop %d", how);
+}
+
+static void obmf_test_tty_refused_stop(struct kunit *test)
+{
+	tty_refused_stop(test, TTY_STOP_FLUSH);
+	tty_refused_stop(test, TTY_STOP_HANGUP);
+	tty_refused_stop(test, TTY_STOP_CLOSE);
+	tty_refused_stop(test, TTY_STOP_UNBIND);
+}
+
+/*
+ * A close while a request is in flight. Once it is answered,
+ * one line counts every character the close discarded that the device
+ * did not take, those in the request too: all of them when the device
+ * does not answer, all but 2 when it accepts 2 of the request; they
+ * count as dropped. After a reopen, the next answer logs and counts
+ * nothing. A hangup while a request is in flight logs and counts
+ * nothing.
+ */
+static void obmf_test_tty_close_try(struct kunit *test)
+{
+	static const char closed[] = "characters not sent at close";
+	unsigned int sends, r;
+	struct fake_step s;
+	u8 buf[TTY_TX_LEN];
+	struct obmf_fake *f;
+	struct tty_log *log;
+	struct tty_k *k;
+	char want[48];
+
+	memset(buf, 'x', sizeof(buf));
+	for (r = 0; r < 3; r++) {
+		k = tty_tx_setup(test, &f);
+		log = tty_log_start(f);
+		tty_dflt(f, &tty_ack);
+		if (r == 1) {
+			s = tty_nack;
+			s.how = FAKE_WORK;
+			s.delay_ms = 500;
+			s.payload[1] = 2;
+		} else {
+			s = tty_ack;
+			s.how = FAKE_NEVER;
+		}
+		fake_push(f, &s);
+		sends = READ_ONCE(f->sends);
+		KUNIT_ASSERT_EQ(test,
+				k->tty->ops->write(k->tty, buf, TTY_TX_LEN),
+				TTY_TX_LEN);
+		KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
+		if (r == 2)
+			break;
+		k->tty->port->closing_wait = msecs_to_jiffies(100);
+		tty_lock(k->tty);
+		k->tty->ops->close(k->tty, NULL);
+		k->open = false;
+		tty_unlock(k->tty);
+		KUNIT_EXPECT_FALSE(test, tty_port_initialized(k->tty->port));
+		KUNIT_EXPECT_EQ(test, tty_log_lines(test, log, closed), 0);
+		snprintf(want, sizeof(want), ": %d %s",
+			 r ? TTY_TX_LEN - 2 : TTY_TX_LEN, closed);
+		KUNIT_EXPECT_EQ_MSG(test,
+				    tty_log_wait(test, log, want, 1,
+						 2 * OBMF_DEFAULT_TIMEOUT_MS),
+				    1, "round %u", r);
+		KUNIT_EXPECT_EQ(test, tty_log_lines(test, log, closed), 1);
+		KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty), 0);
+		KUNIT_EXPECT_EQ(test, tty_k_icount(test, k).tx, r ? 2 : 0);
+		KUNIT_EXPECT_EQ_MSG(test, tty_k_cnt(k).dropped,
+				    r ? TTY_TX_LEN - 2 : TTY_TX_LEN, "round %u",
+				    r);
+		tty_k_open(test, k);
+		KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+		tty_tx_wait(test, k, r ? 6 : 4);
+		KUNIT_EXPECT_EQ(test, tty_log_lines(test, log, closed), 1);
+		KUNIT_EXPECT_EQ_MSG(test, tty_k_cnt(k).dropped,
+				    r ? TTY_TX_LEN - 2 : TTY_TX_LEN, "round %u",
+				    r);
+	}
+	/* The last round hangs up instead */
+	tty_vhangup(k->tty);
+	k->open = false;
+	msleep(OBMF_DEFAULT_TIMEOUT_MS + 300);
+	KUNIT_EXPECT_EQ(test, tty_log_lines(test, log, closed), 0);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty), 0);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+}
+
+/*
+ * Characters the device keeps refusing get one warning once
+ * they have waited TTY_STALL_MS, within a second, naming why and how
+ * many wait, and none after while the refusal goes on, also when its
+ * reason changes; none for a shorter refusal. Once the device takes
+ * them, the next stall gets its own warning: busy, then no answer. Each
+ * warning counts one stall; nothing counts as dropped. The same text
+ * logged by another device is not counted.
+ */
+static void obmf_test_tty_stall(struct kunit *test)
+{
+	static const char refused[] =
+		"transmit stalled: refused, 4 characters waiting";
+	static const char busy[] =
+		"transmit stalled: busy, 4 characters waiting";
+	static const char quiet[] =
+		"transmit stalled: timed out, 4 characters waiting";
+	unsigned int wait = TTY_STALL_MS + 3 * OBMF_DEFAULT_TIMEOUT_MS;
+	struct fake_step s = tty_ack;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	struct tty_log *log;
+	u8 buf[4];
+
+	k = tty_tx_setup(test, &f);
+	log = tty_log_start(f);
+	dev_warn(f->tp.dev, "%s\n", refused);
+	KUNIT_EXPECT_EQ(test, tty_log_lines(test, log, refused), 0);
+	memcpy(buf, "abcd", sizeof(buf));
+	scoped_guard(spinlock_irqsave, &f->lock) {
+		f->dflt = tty_nack;
+		f->nolog = true;
+	}
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	msleep(TTY_STALL_MS - 1000);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 0);
+	KUNIT_EXPECT_EQ(test, tty_log_lines(test, log, "transmit stalled"), 0);
+	KUNIT_EXPECT_EQ(test, tty_log_wait(test, log, refused, 1, 2000), 1);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 1);
+	s.status = OBMF_STATUS_BUSY;
+	s.plen = 0;
+	tty_dflt(f, &s);
+	msleep(1000);
+	KUNIT_EXPECT_EQ(test, tty_log_lines(test, log, "transmit stalled"), 1);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 1);
+	tty_dflt(f, &tty_ack);
+	tty_tx_wait(test, k, 4);
+
+	tty_dflt(f, &s);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	KUNIT_EXPECT_EQ(test, tty_log_wait(test, log, busy, 1, wait), 1);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 2);
+	tty_dflt(f, &tty_ack);
+	tty_tx_wait(test, k, 8);
+
+	s = tty_ack;
+	s.how = FAKE_NEVER;
+	tty_dflt(f, &s);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	KUNIT_EXPECT_EQ(test, tty_log_wait(test, log, quiet, 1, wait), 1);
+	tty_dflt(f, &tty_ack);
+	tty_tx_wait_ms(test, k, 12, 3 * OBMF_DEFAULT_TIMEOUT_MS);
+	KUNIT_EXPECT_EQ(test, tty_log_lines(test, log, "transmit stalled"), 3);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 3);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+}
+
+/*
+ * A flush ends a stall: characters written after it, under
+ * the same refusal, get their own warning TTY_STALL_MS later, counted as
+ * a second stall. The flush counts nothing as dropped.
+ */
+static void obmf_test_tty_stall_flush(struct kunit *test)
+{
+	static const char stalled[] = "transmit stalled: refused";
+	unsigned int wait = TTY_STALL_MS + 2000;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	struct tty_log *log;
+	u8 buf[4];
+
+	k = tty_tx_setup(test, &f);
+	log = tty_log_start(f);
+	memcpy(buf, "abcd", sizeof(buf));
+	scoped_guard(spinlock_irqsave, &f->lock) {
+		f->dflt = tty_nack;
+		f->nolog = true;
+	}
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	KUNIT_ASSERT_EQ(test, tty_log_wait(test, log, stalled, 1, wait), 1);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 1);
+	k->tty->ops->flush_buffer(k->tty);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	msleep(TTY_STALL_MS - 1000);
+	KUNIT_EXPECT_EQ(test, tty_log_lines(test, log, stalled), 1);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 1);
+	KUNIT_EXPECT_EQ(test, tty_log_wait(test, log, stalled, 2, 2000), 2);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 2);
+	tty_dflt(f, &tty_ack);
+	tty_tx_wait(test, k, 4);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+}
+
+/*
+ * A flush while a request is in flight that the device then
+ * refuses starts no stall: TTY_STALL_MS later, characters the device
+ * refuses once get no warning, and no stall is counted.
+ */
+static void obmf_test_tty_stall_flush_try(struct kunit *test)
+{
+	static const u8 buf[] = "abcd";
+	struct fake_step s = tty_nack;
+	unsigned int sends;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	struct tty_log *log;
+
+	k = tty_tx_setup(test, &f);
+	log = tty_log_start(f);
+	tty_dflt(f, &tty_ack);
+	s.how = FAKE_WORK;
+	s.delay_ms = 200;
+	fake_push(f, &s);
+	sends = READ_ONCE(f->sends);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
+	k->tty->ops->flush_buffer(k->tty);
+	msleep(TTY_STALL_MS + 500);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty), 0);
+	fake_push(f, &tty_nack);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	tty_tx_wait(test, k, 4);
+	msleep(100);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 0);
+	KUNIT_EXPECT_EQ(test, tty_log_lines(test, log, "transmit stalled"), 0);
+}
+
+/*
+ * A write while a request waits for its NACK does not cut
+ * the back-off short: the next try comes TTY_RETRY_MS after the NACK,
+ * and carries both writes.
+ */
+static void obmf_test_tty_backoff(struct kunit *test)
+{
+	static const u8 buf[] = "abcdefgh";
+	struct fake_step s = tty_nack;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	int i, rx, tx;
+
+	k = tty_tx_setup(test, &f);
+	tty_dflt(f, &tty_ack);
+	s.how = FAKE_WORK;
+	s.delay_ms = 50;
+	fake_push(f, &s);
+	i = fake_nlog(f) - 1;
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	msleep(s.delay_ms / 2);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf + 4, 4), 4);
+	tty_tx_wait(test, k, 8);
+	rx = fake_find(f, i + 1, FAKE_RX, 1, -1);
+	KUNIT_ASSERT_GE(test, rx, 0);
+	tx = fake_find(f, rx + 1, FAKE_SEND, 1, 0);
+	KUNIT_ASSERT_GE(test, tx, 0);
+	KUNIT_EXPECT_GE(test, ktime_ms_delta(f->log[tx].t, f->log[rx].t),
+			TTY_RETRY_MS / 2);
+	tty_tx_check(test, &f->log[tx], buf, 8, 1);
+	KUNIT_EXPECT_LT(test, fake_find(f, tx + 1, FAKE_SEND, 1, 0), 0);
+}
+
+/*
+ * System suspend stops the tries of a refused head, and a
+ * write while the core is quiesced sends nothing; the characters stay.
+ * Resume, the core first, tries again, and they go out.
+ */
+static void obmf_test_tty_suspend(struct kunit *test)
+{
+	const struct dev_pm_ops *pm;
+	struct obmf_fake *f;
+	unsigned int sends;
+	struct device *dev;
+	struct tty_k *k;
+	u8 buf[4];
+
+	if (!IS_ENABLED(CONFIG_PM_SLEEP))
+		kunit_skip(test, "needs CONFIG_PM_SLEEP");
+	k = tty_tx_setup(test, &f);
+	dev = &chan(f, 1)->fdev->adev.dev;
+	pm = dev->driver->pm;
+	KUNIT_ASSERT_NOT_NULL(test, pm);
+	memcpy(buf, "abcd", sizeof(buf));
+	scoped_guard(spinlock_irqsave, &f->lock) {
+		f->dflt = tty_nack;
+		f->nolog = true;
+	}
+	sends = READ_ONCE(f->sends);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 3));
+	KUNIT_ASSERT_EQ(test, pm->suspend(dev), 0);
+	sends = READ_ONCE(f->sends);
+	msleep(5 * TTY_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends);
+	KUNIT_ASSERT_EQ(test, obmf_core_quiesce(f->core), 0);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	msleep(5 * TTY_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends);
+	KUNIT_EXPECT_EQ(test, k->tty->ops->chars_in_buffer(k->tty), 8);
+	tty_dflt(f, &tty_ack);
+	KUNIT_ASSERT_EQ(test, obmf_core_resume(f->core), 0);
+	KUNIT_ASSERT_EQ(test, pm->resume(dev), 0);
+	tty_tx_wait(test, k, 8);
+}
+
+/*
+ * An unbind while a refused head waits for its next try, and
+ * the last close of the tty right after, which frees the port: no try
+ * runs after. Its timer firing on freed memory fails only under KASAN,
+ * and no report is made on the test's own thread: the gate reads the
+ * log.
+ */
+static void obmf_test_tty_unbind_backoff(struct kunit *test)
+{
+	unsigned int sends;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	u8 buf[4];
+	int i;
+
+	memcpy(buf, "abcd", sizeof(buf));
+	for (i = 0; i < 10; i++) {
+		k = tty_tx_setup(test, &f);
+		scoped_guard(spinlock_irqsave, &f->lock) {
+			f->dflt = tty_nack;
+			f->nolog = true;
+		}
+		sends = READ_ONCE(f->sends);
+		KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+		KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 2));
+		fake_unbind(f);
+		k->open = false;
+		tty_k_close(k);
+		sends = READ_ONCE(f->sends);
+		msleep(3 * TTY_RETRY_MS);
+		KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends);
+	}
+}
+
+/*
+ * Today's behaviour, not a goal: no request carries a tag.
+ * The first try of "abcd" is answered after its timeout, so that answer
+ * accepts the second try, whose own answer then accepts the first try
+ * of "efgh". The device NACKs that one, too late: "efgh" counts in tx
+ * and is lost, not as dropped, the NACK counts as late, and nothing is
+ * sent again.
+ */
+static void obmf_test_tty_shift(struct kunit *test)
+{
+	struct fake_step s = tty_ack;
+	unsigned int sends, to, late;
+	struct obmf_fake *f;
+	struct tty_k *k;
+	u8 buf[8];
+	int i, n;
+
+	k = tty_tx_setup(test, &f);
+	tty_dflt(f, &tty_ack);
+	memcpy(buf, "abcdefgh", sizeof(buf));
+	s.how = FAKE_WORK;
+	s.delay_ms = OBMF_DEFAULT_TIMEOUT_MS + 300;
+	fake_push(f, &s);
+	s.delay_ms = 600;
+	fake_push(f, &s);
+	s = tty_nack;
+	s.how = FAKE_WORK;
+	s.delay_ms = 900;
+	fake_push(f, &s);
+	to = ch_cnt(chan(f, 1), OBMF_CH_TIMEOUTS);
+	late = ch_cnt(chan(f, 1), OBMF_CH_RX_LATE);
+	sends = READ_ONCE(f->sends);
+	i = fake_nlog(f) - 1;
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	tty_tx_wait_ms(test, k, 4, 2 * OBMF_DEFAULT_TIMEOUT_MS);
+	KUNIT_ASSERT_EQ(test, READ_ONCE(f->sends), sends + 2);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf + 4, 4), 4);
+	tty_tx_wait_ms(test, k, 8, OBMF_DEFAULT_TIMEOUT_MS);
+	msleep(s.delay_ms + 300);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + 3);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_TIMEOUTS), to + 1);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_RX_LATE), late + 1);
+	KUNIT_EXPECT_EQ(test, tty_k_icount(test, k).tx, 8);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+	for (n = 0; n < 3; n++) {
+		i = fake_find(f, i + 1, FAKE_SEND, 1, 0);
+		KUNIT_ASSERT_GE(test, i, 0);
+		tty_tx_check(test, &f->log[i], buf + (n / 2) * 4, 4, n);
+	}
+}
+
+/*
+ * A serial channel whose request limit leaves no room for a character
+ * gets no tty, and one with room for one gets one. Expected: "request
+ * limit 3 too small" for channel 1.
+ */
+static void obmf_test_tty_limit(struct kunit *test)
+{
+	static const struct test_chan c[] = {
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "s1", OBMF_HDR_LEN + 3,
+		  0, TTY_CFG_LEN },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "s2", OBMF_HDR_LEN + 4,
+		  0, TTY_CFG_LEN },
+	};
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	int i;
+
+	fake_layout(f, c, ARRAY_SIZE(c));
+	for (i = 0; i < ARRAY_SIZE(c); i++)
+		tty_cfg(f, i + 1, TTY_HZ, 8, 1, 0);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	KUNIT_EXPECT_FALSE(test, tty_bound(f, 1));
+	KUNIT_EXPECT_TRUE(test, tty_bound(f, 2));
+}
+
+static struct kunit_case obmf_tty_cases[] = {
+	KUNIT_CASE(obmf_test_tty_line),
+	KUNIT_CASE(obmf_test_tty_flow),
+	KUNIT_CASE(obmf_test_tty_full),
+	KUNIT_CASE(obmf_test_tty_hangup),
+	KUNIT_CASE(obmf_test_tty_closed),
+	KUNIT_CASE(obmf_test_tty_break),
+	KUNIT_CASE(obmf_test_tty_slow),
+	KUNIT_CASE(obmf_test_tty_node),
+	KUNIT_CASE(obmf_test_tty_tx),
+	KUNIT_CASE(obmf_test_tty_tx_flush),
+	KUNIT_CASE(obmf_test_tty_tx_flush_twice),
+	KUNIT_CASE(obmf_test_tty_tx_flush_partial),
+	KUNIT_CASE(obmf_test_tty_nack_bound),
+	KUNIT_CASE_SLOW(obmf_test_tty_nack_long),
+	KUNIT_CASE_SLOW(obmf_test_tty_timeout),
+	KUNIT_CASE(obmf_test_tty_refused_room),
+	KUNIT_CASE_SLOW(obmf_test_tty_refused_stop),
+	KUNIT_CASE_SLOW(obmf_test_tty_close_try),
+	KUNIT_CASE_SLOW(obmf_test_tty_stall),
+	KUNIT_CASE_SLOW(obmf_test_tty_stall_flush),
+	KUNIT_CASE_SLOW(obmf_test_tty_stall_flush_try),
+	KUNIT_CASE(obmf_test_tty_backoff),
+	KUNIT_CASE(obmf_test_tty_suspend),
+	KUNIT_CASE(obmf_test_tty_unbind_backoff),
+	KUNIT_CASE_SLOW(obmf_test_tty_shift),
+	KUNIT_CASE(obmf_test_tty_limit),
+	{}
+};
+
+static struct kunit_suite obmf_tty_suite = {
+	.name = "obmf-tty",
+	.init = obmf_tty_test_init,
+	.exit = obmf_tty_test_exit,
+	.test_cases = obmf_tty_cases,
+};
+
+kunit_test_suite(obmf_tty_suite);
+
+#endif /* IS_BUILTIN(CONFIG_OBMF_TTY) */
