@@ -13,6 +13,7 @@
 #include <linux/completion.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/ratelimit_types.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/usb/obmf.h>
@@ -163,6 +164,7 @@ enum obmf_ch_counter {
 	OBMF_CH_DEFAULT_ANSWERS, /* due, counted before the send */
 	OBMF_CH_RX_DROPPED,
 	OBMF_CH_RX_REPLACED,
+	OBMF_CH_DREQ_MAX_DEPTH, /* most records in use at once */
 	OBMF_CH_NR,
 };
 
@@ -177,6 +179,9 @@ enum obmf_ch_counter {
  * @buf: response payload
  * @cap: size of @buf
  * @len: length of the response payload in @buf
+ * @held: the last request timed out; the next one waits for its late
+ *	reply, or until @held_until
+ * @held_until: in jiffies
  * @done: completed by the upcall or by the core
  */
 struct obmf_slot {
@@ -195,8 +200,20 @@ struct obmf_slot {
 	u8 *buf;
 	size_t cap;
 	size_t len;
+	bool held;
+	unsigned long held_until;
 	struct completion done;
 };
+
+/* A late reply, taken by nobody, ends the wait obmf_slot_xfer() holds */
+static inline void obmf_slot_late(struct obmf_slot *slot)
+{
+	lockdep_assert_held(&slot->rx_lock);
+	if (slot->held) {
+		slot->held = false;
+		complete(&slot->done);
+	}
+}
 
 /**
  * struct obmf_dreq_rec - a queued device request
@@ -240,6 +257,7 @@ struct obmf_dreq_rec {
  * @kept: device requests a driver kept to answer later
  * @reserve: the reserved records not in use
  * @queued: allocated records on @queue
+ * @used: records not in @reserve, queued, delivered or kept
  * @owed: answers owed but not queued, for want of a record
  * @owed_cmd: payload byte 0 of the last owed request
  * @owed_invalid: invalid answers owed to requests that could not be decoded
@@ -279,6 +297,7 @@ struct obmf_channel {
 	struct list_head kept;
 	struct obmf_dreq_rec *reserve[OBMF_DREQ_RESERVE];
 	unsigned int queued;
+	unsigned int used;
 	unsigned int owed;
 	u8 owed_cmd;
 	unsigned int owed_invalid;
@@ -303,6 +322,8 @@ struct obmf_channel {
  * @inflight_wq: woken when @inflight drops to zero
  * @ch0_lock: serializes channel 0 read-modify-write sequences
  * @wq: device request delivery
+ * @fail_work: calls each published driver's failed operation after a
+ *	transport error stopped the device
  * @ch0: channel 0
  * @chans: discovered channels by number, published by @table
  * @table: set once @chans is complete
@@ -316,6 +337,7 @@ struct obmf_channel {
  * @ch0_chunk: largest channel 0 read
  * @mmio_form: enum obmf_mmio_form, the last read response's
  * @cnt: interface counters
+ * @events: reported events, logged or not
  * @dbg: debugfs directory
  */
 struct obmf_core {
@@ -327,6 +349,7 @@ struct obmf_core {
 	wait_queue_head_t inflight_wq;
 	struct mutex ch0_lock; /* channel 0 read-modify-write */
 	struct workqueue_struct *wq;
+	struct work_struct fail_work;
 	struct obmf_channel *ch0;
 	struct obmf_channel *chans[OBMF_NR_CHANNELS];
 	bool table;
@@ -338,12 +361,40 @@ struct obmf_core {
 	size_t ch0_chunk;
 	int mmio_form;
 	atomic_long_t cnt[OBMF_IF_NR];
+	atomic_long_t events[OBMF_EV_NR];
 	struct dentry *dbg;
 };
 
 static inline void obmf_count(struct obmf_core *core, enum obmf_if_counter c)
 {
 	atomic_long_inc(&core->cnt[c]);
+}
+
+void obmf_report_log(struct device *dev, enum obmf_event ev, int ch, long a,
+		     long b, struct ratelimit_state *rs, const char *func);
+
+/*
+ * Counts @ev, then logs it on @dev: at most DEFAULT_RATELIMIT_BURST lines
+ * per DEFAULT_RATELIMIT_INTERVAL from this call site, for all devices.
+ * @ch is the channel or -1, @a and @b the event's values. Any context.
+ */
+#define obmf_report(core, dev, ev, ch, a, b)                                   \
+	do {                                                                   \
+		static DEFINE_RATELIMIT_STATE(_rs, DEFAULT_RATELIMIT_INTERVAL, \
+					      DEFAULT_RATELIMIT_BURST);        \
+		enum obmf_event _ev = (ev);                                    \
+									       \
+		atomic_long_inc(&(core)->events[_ev]);                         \
+		obmf_report_log(dev, _ev, ch, a, b, &_rs, __func__);           \
+	} while (0)
+
+/* An event the core's state machine bounds: counted, always logged */
+static inline void obmf_report_bounded(struct obmf_core *core,
+				       struct device *dev, enum obmf_event ev,
+				       int ch, long a, long b)
+{
+	atomic_long_inc(&core->events[ev]);
+	obmf_report_log(dev, ev, ch, a, b, NULL, NULL);
 }
 
 static inline void obmf_ch_count(struct obmf_channel *ch,
@@ -365,6 +416,17 @@ void obmf_core_fatal(struct obmf_core *core, int err);
 int obmf_core_quiesce(struct obmf_core *core);
 int obmf_core_resume(struct obmf_core *core);
 int obmf_core_state(struct obmf_core *core);
+
+/*
+ * Discovery runs before the core is live and takes timeouts, malformed
+ * replies and strays as leftovers of an earlier binding; its own failure
+ * is logged. Response and message events stay quiet until then.
+ */
+static inline bool obmf_core_discovering(struct obmf_core *core)
+{
+	return READ_ONCE(core->state) == OBMF_INIT;
+}
+
 struct obmf_channel *obmf_ch_alloc(struct obmf_core *core, u8 number,
 				   size_t max_req, size_t max_resp,
 				   size_t rx_cap);
@@ -380,7 +442,9 @@ int obmf_slot_xfer(struct obmf_channel *ch, u8 cmd, size_t len,
 		   unsigned int timeout_ms);
 bool obmf_dreq_len_ok(const struct obmf_channel *ch, const u8 *data,
 		      size_t len);
-bool obmf_dreq_add(struct obmf_channel *ch, const u8 *data, size_t len);
+bool obmf_dreq_add(struct obmf_channel *ch, const u8 *data, size_t len,
+		   bool *due);
+void obmf_dreq_full(struct obmf_channel *ch, bool due);
 void obmf_dreq_owe_invalid(struct obmf_channel *ch);
 
 /* A call from a function driver, waited for by obmf_core_stop() */

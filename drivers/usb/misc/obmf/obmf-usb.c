@@ -9,6 +9,7 @@
 #include <linux/bitops.h>
 #include <linux/completion.h>
 #include <linux/debugfs.h>
+#include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/fault-inject.h>
 #include <linux/jiffies.h>
@@ -229,12 +230,16 @@ static void obmf_usb_rx_complete(struct urb *urb)
 	case -EPIPE:
 		/* OBMF-ICP over USB 1.0, 8.2: clear the halt, then go on */
 		obmf_count(u->tp.core, OBMF_IF_STALLS);
+		obmf_report(u->tp.core, &u->intf->dev, OBMF_EV_IN_STALL, -1, 0,
+			    0);
 		set_bit(i, &u->rx_idle);
 		set_bit(OBMF_USB_STALL_IN, &u->flags);
 		obmf_usb_retry(u);
 		return;
 	default:
 		/* Wait: on an unplug these come before the disconnect does */
+		dev_dbg_ratelimited(&u->intf->dev, "bulk in error: %pe\n",
+				    ERR_PTR(urb->status));
 		obmf_count(u->tp.core, OBMF_IF_RX_URB_ERRORS);
 		set_bit(i, &u->rx_idle);
 		obmf_usb_retry(u);
@@ -256,7 +261,9 @@ static void obmf_usb_recover(struct work_struct *work)
 			usb_kill_urb(u->rx_urb[i]);
 		ret = usb_clear_halt(u->udev, u->in_pipe);
 		if (ret) {
-			dev_dbg(&u->intf->dev, "clear halt failed: %d\n", ret);
+			if (ret != -ENODEV)
+				obmf_report(u->tp.core, &u->intf->dev,
+					    OBMF_EV_IN_CLEAR_HALT, -1, ret, 0);
 			obmf_count(u->tp.core, OBMF_IF_RX_URB_ERRORS);
 			set_bit(OBMF_USB_STALL_IN, &u->flags);
 			obmf_usb_retry(u);
@@ -280,6 +287,7 @@ static int obmf_usb_tx_status(struct obmf_usb *u, size_t len)
 {
 	struct urb *urb = u->tx_urb;
 	struct obmf_core *core = u->tp.core;
+	int ret;
 
 	switch (urb->status) {
 	case 0:
@@ -290,7 +298,14 @@ static int obmf_usb_tx_status(struct obmf_usb *u, size_t len)
 		break;
 	case -EPIPE:
 		obmf_count(core, OBMF_IF_STALLS);
-		usb_clear_halt(u->udev, u->out_pipe);
+		obmf_report(core, &u->intf->dev, OBMF_EV_OUT_STALL, -1, 0, 0);
+		ret = usb_clear_halt(u->udev, u->out_pipe);
+		if (ret) {
+			if (ret != -ENODEV)
+				obmf_report(core, &u->intf->dev,
+					    OBMF_EV_OUT_CLEAR_HALT, -1, ret, 0);
+			obmf_count(core, OBMF_IF_TX_URB_ERRORS);
+		}
 		return -EPIPE;
 	case -ENOENT:
 	case -ECONNRESET:
@@ -298,6 +313,8 @@ static int obmf_usb_tx_status(struct obmf_usb *u, size_t len)
 	case -ENODEV:
 		return -ENODEV;
 	}
+	dev_dbg(&u->intf->dev, "bulk out failed: %pe, %u of %zu bytes\n",
+		ERR_PTR(urb->status), urb->actual_length, len);
 	obmf_count(core, OBMF_IF_TX_URB_ERRORS);
 	return -EIO;
 }
@@ -326,6 +343,8 @@ static int obmf_usb_send(struct obmf_transport *tp, const void *buf, size_t len,
 	if (ret == -EPERM || ret == -ENODEV)
 		return -ENODEV;
 	if (ret) {
+		dev_dbg(&u->intf->dev, "bulk out submit failed: %pe\n",
+			ERR_PTR(ret));
 		obmf_count(tp->core, OBMF_IF_TX_URB_ERRORS);
 		return -EIO;
 	}
@@ -338,6 +357,7 @@ static int obmf_usb_send(struct obmf_transport *tp, const void *buf, size_t len,
 		return obmf_usb_tx_status(u, len);
 	if (test_bit(OBMF_USB_STOPPED, &u->flags))
 		return -ENODEV;
+	dev_dbg(&u->intf->dev, "bulk out timed out after %u ms\n", timeout_ms);
 	obmf_count(tp->core, OBMF_IF_TX_URB_ERRORS);
 	return -ETIMEDOUT;
 }

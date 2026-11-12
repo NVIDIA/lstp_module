@@ -186,6 +186,10 @@ static void obmf_rx_wire_response(struct obmf_channel *ch, const u8 *msg,
 	guard(spinlock_irqsave)(&slot->rx_lock);
 	if (!slot->armed) {
 		obmf_ch_count(ch, OBMF_CH_RX_LATE);
+		dev_dbg_ratelimited(ch->core->dev,
+				    "channel %u: late response dropped\n",
+				    ch->info.number);
+		obmf_slot_late(slot);
 		return;
 	}
 	slot->armed = false;
@@ -207,6 +211,7 @@ static void obmf_rx_wire_response(struct obmf_channel *ch, const u8 *msg,
 		n = -EPROTO;
 	if (n < 0) {
 		slot->err = n;
+		slot->len = len;
 		obmf_ch_count(ch, OBMF_CH_PROTOCOL_ERRORS);
 	} else {
 		memcpy(slot->buf, body, n);
@@ -227,8 +232,7 @@ static void obmf_rx_wire_dreq(struct obmf_channel *ch, const u8 *msg,
 {
 	const struct obmf_dialect *dialect = obmf_dialect(ch->core);
 	struct obmf_core *core = ch->core;
-	bool queued = false;
-	bool bad = false;
+	bool bad = false, queued = true, due = false;
 	ssize_t n;
 
 	obmf_ch_count(ch, OBMF_CH_RX_DEVICE_REQUESTS);
@@ -242,14 +246,18 @@ static void obmf_rx_wire_dreq(struct obmf_channel *ch, const u8 *msg,
 			obmf_dreq_owe_invalid(ch);
 		} else {
 			queued = obmf_dreq_add(ch, ch->dreq_dec + OBMF_HDR_LEN,
-					       n - OBMF_HDR_LEN);
+					       n - OBMF_HDR_LEN, &due);
 		}
 	}
 
-	if (bad)
+	if (bad) {
 		obmf_count(core, OBMF_IF_RX_MALFORMED);
-	else if (!queued)
-		obmf_ch_count(ch, OBMF_CH_RX_DROPPED);
+		if (!obmf_core_discovering(core))
+			obmf_report(core, core->dev, OBMF_EV_BAD_DREQ,
+				    ch->info.number, len, 0);
+	} else if (!queued) {
+		obmf_dreq_full(ch, due);
+	}
 	queue_work(core->wq, &ch->work);
 }
 

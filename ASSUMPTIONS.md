@@ -90,7 +90,7 @@ items about code or tools that are not in this drop.
 - Options: no busy during discovery; busy with a bounded host retry;
   busy leaving the channel out.
 - This driver: on OBMF-ICP, a busy answer to a channel 0 read fails
-  the bind with "discovery failed: -16". On LSTP, a busy device header
+  the bind with "discovery failed: -EBUSY". On LSTP, a busy device header
   is retried for a few discovery passes and then fails the bind with
   "device busy"; a busy answer to any read of a channel's
   configuration leaves that channel out with "channel <n>: status 0x3,
@@ -113,19 +113,21 @@ items about code or tools that are not in this drop.
   after each timeout and wait for `CHANNEL_RESET_DONE`; a flush message
   or a tag in a later specification.
 - This driver: a request that gets no response in time fails with
-  `-ETIMEDOUT` and is counted in `timeouts`; the channel is not reset.
-  The default response timeout is 1000 ms; a serial write adds twice
-  its time on the line. A response that arrives with no request waiting
-  is counted in `rx_late` and dropped; one that arrives while the next
-  request waits is taken as its answer. During a software unbind, the
+  `-ETIMEDOUT`, is counted in `timeouts` and logs "channel <n>: no
+  response in <ms> ms"; the channel is not reset. The default response
+  timeout is 1000 ms; a serial write adds twice its time on the line.
+  The channel's next request waits until the late response arrives or
+  one default timeout (1000 ms) passes. A response that arrives with no
+  request waiting is counted in `rx_late` and dropped; one that arrives
+  later, while the next request waits, is taken as its answer. During a software unbind, the
   first timeout stops the device instead.
 - Prerequisites: answer every request within the timeout; if a
   request cannot finish in time, answer it with an error status (for
   example 0x02) before the timeout rather than late; send no response
   to a request after the timeout.
-- If your device differs: the next request on that channel gets the
-  late answer: on I2C a false ACK, or data read from the earlier
-  address (KI-1).
+- If your device differs: an answer more than one default timeout
+  late is taken by the next request on that channel: on I2C a false
+  ACK, or data read from the earlier address (KI-1, AS-52).
 - Closes when: the specification says what a channel reset does to a
   pending response, or adds a flush or a tag.
 
@@ -139,9 +141,12 @@ items about code or tools that are not in this drop.
   driver resets the device.
 - Options: fail the message, no reset; resend it once; reset the device
   after repeated stalls.
-- This driver: on a bulk OUT stall it clears the halt and fails the
-  message with `-EPIPE` (`-EIO` on I2C); a message is never sent twice.
-  On a bulk IN stall it clears the halt and goes on reading. It resets
+- This driver: on a bulk OUT stall it logs "bulk out stalled", clears
+  the halt and fails the message with `-EPIPE` (`-EIO` on I2C); a
+  message is never sent twice. On a bulk IN stall it logs "bulk in
+  stalled", clears the halt and goes on reading. A halt clear that
+  fails logs "bulk in clear halt failed: <errno>" or "bulk out clear
+  halt failed: <errno>". It resets
   neither the device nor the port; only the USB core does that, on its
   own errors.
 - Prerequisites: after `CLEAR_FEATURE(ENDPOINT_HALT)` on either bulk
@@ -308,16 +313,17 @@ items about code or tools that are not in this drop.
   are set; also require HEALTH_STATUS 1; also leave out a channel
   with CHANNEL_ERROR_INDICATOR set or HEALTH_STATUS 15.
 - This driver: uses every channel with CHANNEL_ENABLE and
-  CONFIGURATION_VALID set, and does not read HEALTH_STATUS or
-  CHANNEL_ERROR_INDICATOR. HEALTH_STATUS sums up several conditions,
+  CONFIGURATION_VALID set. HEALTH_STATUS sums up several conditions,
   some of which a host cannot act on at discovery, so it is not used
-  to leave a channel out.
+  to leave a channel out. A channel with HEALTH_STATUS 3 or 15, or
+  with CHANNEL_ERROR_INDICATOR set, binds with one warning per bind:
+  "channel <n>: health <h>, error indicator <i>".
 - Prerequisites: clear CHANNEL_ENABLE or CONFIGURATION_VALID on a
   channel the host must not use; while an enabled, valid channel is
   not ready, answer its requests with the channel type's status codes.
 - If your device differs: the host binds a channel the device reports
   unhealthy; its requests fail with the device's status codes or time
-  out, and the kernel log does not mention the health field.
+  out, after the warning at bind.
 - Closes when: the specification says whether a discovering host must
   check HEALTH_STATUS or CHANNEL_ERROR_INDICATOR.
 
@@ -503,7 +509,9 @@ items about code or tools that are not in this drop.
   the characters' time on the wire at ten bits a character, and cuts
   each request so that the wait fits 10 s. A write that gets no answer
   in time is kept and sent again 10 ms later, with one "transmit
-  stalled" line after 5 s. On LSTP, a device write the host cannot
+  stalled" line after 5 s. Each timeout doubles the default part of
+  the wait for the answers after it, up to 10 s in all, until the port
+  is opened again (AS-56). On LSTP, a device write the host cannot
   decode, too large or with an unknown command, is answered 0x06
   (`LSTP_NOT_SUPP`), not 0x07 (`LSTP_TOO_LARGE`).
 - Prerequisites: answer each serial write at once: accept what you can
@@ -618,17 +626,21 @@ items about code or tools that are not in this drop.
   request until the late answer comes or one more timeout passes.
 - This driver: keeps the characters after no answer, status 0x02
   (Table 4) or the line timeout 0x40 (Table 21), and sends them again
-  10 ms later. After a late answer, the next try takes it as its own.
+  10 ms later. Since drop 3 the next try waits up to one default
+  timeout (1000 ms) for the late answer, which is dropped, and each
+  timeout doubles the wait of the tries after it, up to 10 s, until
+  the port is opened again: a device slower than the default timeout
+  gets one repeat per open, not one per write. An answer later than
+  that is taken by the next try as its own.
 - Prerequisites: a device that answers late did not take the
   characters, or a repeat is harmless on its line; its late answer
   accepts what the try it answers carried.
-- If your device differs: characters it took before a late answer go
-  out twice on the line; the next try's own answer is then taken by
+- If your device differs: characters it took before an answer later
+  than that go out twice on the line; the next try's own answer is then taken by
   the request after it, so characters the device refused there count
   as sent and are lost.
-- Closes when: the host holds the next request after a timeout, the
-  specification says what a device does with a late request, or
-  requests get a tag.
+- Closes when: the specification says what a device does with a late
+  request, or requests get a tag.
 
 ## AS-49: a device that answers a serial write busy did not take the characters
 
@@ -646,3 +658,182 @@ items about code or tools that are not in this drop.
   out twice.
 - Closes when: the specification says what busy means on a serial
   channel.
+
+## AS-50: ten lines per five seconds per place in the code are enough to diagnose a device
+
+- Specification: none; OBMF-ICP does not say how a host reports a
+  device's faults.
+- Options: one rate limit per place in the code, shared by all
+  devices, with a counter per event; a rate limit per device; none.
+- This driver: counts every event in the interface's `events/`
+  directory in debugfs and logs it at most 10 times per 5 s from each
+  place in the code, for all devices together.
+- Prerequisites: a report carries the first lines and the `events/`
+  counters (`TESTING.md`, "What to send with a report").
+- If your setup differs: with several devices failing at once, the
+  lines of all but the first few are suppressed; the counters still
+  count each device.
+- Closes when: reports show the lines are enough, or need more.
+
+## AS-51: a request whose send timed out has no answer worth waiting for
+
+- Specification: OBMF-ICP does not say what a device does with a
+  message it received only in part.
+- Options: wait for a late answer only after a response timeout; wait
+  after every timeout, of the send too.
+- This driver: holds the channel's next request only after a response
+  timeout; a send that times out fails at once and holds nothing.
+- Prerequisites: do not answer a message whose transfer did not
+  complete.
+- If your device differs: its late answer to such a message is taken
+  by the next request on the channel (KI-1).
+- Closes when: the specification says what a partly received message
+  gets.
+
+## AS-52: a device answers a timed-out request, if at all, within one second after the timeout
+
+- Specification: OBMF-ICP 1.0.0 gives no time limit for a late answer,
+  and no request carries a tag (6.6).
+- Options: hold the next request for one default timeout; hold it as
+  long as the timed-out request waited, up to 10 s.
+- This driver: after a response timeout the channel's next request
+  waits for the late answer, which is dropped, or for 1000 ms.
+- Prerequisites: answer a request you could not answer in time within
+  1000 ms after the host's timeout, or not at all.
+- If your device differs: a later answer is taken by the next request
+  on the channel (KI-1, AS-48).
+- Closes when: the specification bounds a late answer or adds a tag.
+
+## AS-53: a function driver's `failed` operation does not unbind, publish or wait for its own device requests
+
+- Specification: none; a rule of this driver's interface for function
+  drivers.
+- Options: call the operation under the lock that delivers device
+  requests, with the rule documented; call it without the lock.
+- This driver: calls each published function driver's `failed`
+  operation once after a transport failure, under that lock; the
+  serial driver only marks its port failed and hangs it up.
+- Prerequisites: a function driver's `failed` operation only marks
+  its state and wakes or hangs up its users.
+- If a driver differs: an operation that unbinds or waits for one of
+  its own device requests deadlocks the channel when the device fails.
+- Closes when: the operation is called without the lock.
+
+## AS-54: every response on a channel held after a timeout is the late one
+
+- Specification: responses carry no tag (OBMF-ICP 1.0.0, Table 3,
+  p26).
+- Options: take any response as the late one; match it to the
+  timed-out request first.
+- This driver: a response that comes while the channel is held and no
+  request waits is counted in `rx_late`, dropped, and ends the hold.
+- Prerequisites: send a response only to a request.
+- If your device differs: an unsolicited response ends the hold early,
+  and a late answer after it is taken by the next request (KI-1).
+- Closes when: the specification adds a tag.
+
+## AS-55: a device does not answer, after a suspend and resume, a request that timed out before it
+
+- Specification: OBMF-ICP does not say what a device does with an
+  answer it still owes when the host suspends it.
+- Options: end the hold after a timeout when the device is suspended;
+  keep it over the resume.
+- This driver: a system suspend ends a hold it finds, so the first
+  request after resume is sent at once. The bulk IN transfers stop at
+  suspend, so an answer the device has not sent yet stays with it and
+  can come after resume.
+- Prerequisites: drop, or send before the suspend, an answer the host
+  stopped waiting for.
+- If your device differs: its late answer is taken by the first
+  request after resume (KI-1).
+- Closes when: the specification says what a suspend does to a pending
+  answer.
+
+## AS-56: a device answers a serial write within 10 s, wire time included
+
+- Specification: OBMF-ICP 1.0.0, 5.5.2, gives no time for a serial
+  answer.
+- Options: cap the growing serial wait at the core's 10 s limit; a
+  longer cap for serial channels.
+- This driver: each timeout doubles the serial wait, up to 10 s for
+  the wait and the wire time together, until the port is opened again.
+- Prerequisites: answer every serial write within 10 s.
+- If your device differs: every write times out at the cap and is
+  sent again, and the port logs a "transmit stalled" line for each
+  stall (AS-48).
+- Closes when: the specification bounds the answer time.
+
+## AS-57: a device sends serial writes to the host without waiting for each answer
+
+- Specification: OBMF-ICP 1.0.0, 5.5, does not say whether a device
+  waits for the host's answer to a device write before it sends the
+  next.
+- Options: a queue per channel with a reported limit; one device
+  request in flight per channel.
+- This driver: queues up to 16 device requests per channel beyond 3
+  reserved; a request that finds no room is refused with the default
+  answer and logs "channel <n>: device request queue full, request
+  refused"; `dreq_max_depth` in debugfs shows the most it held.
+- Prerequisites: send a refused write again later.
+- If your device differs: a device that waits for each answer never
+  fills the queue, and a queue-full line then points to another cause
+  (KI-20).
+- Closes when: the specification says how many device requests may be
+  in flight.
+
+## AS-58: a device that times out once is slow, not losing answers
+
+- Specification: a timeout does not tell a slow device from one that
+  lost the request.
+- Options: double the serial wait after each timeout until the port
+  is opened again; keep a fixed wait.
+- This driver: doubles the wait for the next answers after each
+  timeout, up to 10 s.
+- Prerequisites: a device that missed one answer is slow on the next
+  as well, or the longer wait costs little on its line.
+- If your device differs: after lost answers the host tries less and
+  less often, up to 10 s apart, until the port is opened again; a
+  silent device's "transmit stalled" line comes at about 9 s, not 7 s.
+- Closes when: the specification bounds the answer time.
+
+## AS-59: a function driver never needs to report one of the core's events itself
+
+- Specification: none; a rule of this driver's interface for function
+  drivers.
+- Options: function drivers report their own events, and a malformed
+  response through `obmf_fdev_protocol_error()`; export the core's
+  report for any event.
+- This driver: `obmf_fdev_report()` takes only the function drivers'
+  events and warns once for one of the core's; a malformed response
+  is reported as the core's bad response.
+- Prerequisites: a function driver sees no core-level fault other
+  than a malformed response.
+- If a driver differs: that fault is not counted as the core's event
+  until the interface gains a way to report it.
+- Closes when: a function driver needs another core event.
+
+## AS-60: an LSTP I2C channel has no target mode
+
+- Specification: LSTP 1.0 I2C (4.4.2, pages 23-25) describes the
+  channel as a controller only.
+- Options: no target mode; a target mode over device requests, which
+  needs a specification.
+- This driver: the I2C adapter does not offer target registration.
+- Prerequisites: a board does not use an LSTP I2C channel as a target.
+- If your board differs: registering an I2C target on the channel
+  fails with `-EOPNOTSUPP`.
+- Closes when: LSTP or OBMF-ICP defines a target mode.
+
+## AS-61: two devices' I2C adapters can have the same name
+
+- Specification: none; the I2C core does not require unique adapter
+  names.
+- Options: "<device name>_<channel name>"; add the USB path to the
+  name.
+- This driver: names each adapter "<device name>_<channel name>", from
+  the names the device reports; the I2C core numbers the buses.
+- Prerequisites: on a board with two identical devices, find a bus by
+  its firmware node, its USB path or its number, not by name alone.
+- If your board differs: a lookup by name finds one of the two
+  adapters, so a tool can talk to the wrong device.
+- Closes when: a board needs unique names.

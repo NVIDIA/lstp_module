@@ -268,8 +268,8 @@ void obmf_bus_add(struct obmf_core *core)
 			continue;
 		ret = obmf_fdev_add(core, ch, t);
 		if (ret)
-			dev_warn(core->dev, "channel %d: no device: %d\n", i,
-				 ret);
+			dev_warn(core->dev, "channel %d: no device: %pe\n", i,
+				 ERR_PTR(ret));
 		else
 			obmf_debugfs_ch(core, ch);
 	}
@@ -375,7 +375,11 @@ int devm_obmf_publish(struct obmf_fdev *fdev, const struct obmf_fdev_ops *ops)
 	if (WARN_ON_ONCE(!ch->bound))
 		return -EINVAL;
 
+	/* A stop after this check queues the failed operation behind it */
 	scoped_guard(mutex, &ch->dispatch_lock) {
+		ret = obmf_fdev_usable(fdev);
+		if (ret)
+			return ret;
 		ch->ops = ops;
 		ch->publisher = fdev;
 	}
@@ -421,13 +425,30 @@ void obmf_fdev_label(struct obmf_fdev *fdev, char *buf, size_t size)
 }
 EXPORT_SYMBOL_NS_GPL(obmf_fdev_label, "OBMF");
 
+/* The body of obmf_fdev_report(); @rs is its call site's state */
+void __obmf_fdev_report(struct obmf_fdev *fdev, enum obmf_event ev, long a,
+			long b, struct ratelimit_state *rs, const char *func)
+{
+	struct obmf_channel *ch = fdev->ch;
+
+	if (WARN_ON_ONCE(ev < OBMF_EV_FDEV_FIRST || ev >= OBMF_EV_NR))
+		return;
+	atomic_long_inc(&ch->core->events[ev]);
+	obmf_report_log(&fdev->adev.dev, ev, ch->info.number, a, b, rs, func);
+}
+EXPORT_SYMBOL_NS_GPL(__obmf_fdev_report, "OBMF");
+
 /**
  * obmf_fdev_protocol_error - count a malformed message a driver found
  * @fdev: the function device
  */
 void obmf_fdev_protocol_error(struct obmf_fdev *fdev)
 {
-	obmf_ch_count(fdev->ch, OBMF_CH_PROTOCOL_ERRORS);
+	struct obmf_channel *ch = fdev->ch;
+
+	obmf_ch_count(ch, OBMF_CH_PROTOCOL_ERRORS);
+	obmf_report(ch->core, &fdev->adev.dev, OBMF_EV_BAD_RESPONSE,
+		    ch->info.number, -1, 0);
 }
 EXPORT_SYMBOL_NS_GPL(obmf_fdev_protocol_error, "OBMF");
 
@@ -457,6 +478,27 @@ static const char *const obmf_ch_names[OBMF_CH_NR] = {
 	[OBMF_CH_DEFAULT_ANSWERS] = "default_answers",
 	[OBMF_CH_RX_DROPPED] = "rx_dropped",
 	[OBMF_CH_RX_REPLACED] = "rx_replaced",
+	[OBMF_CH_DREQ_MAX_DEPTH] = "dreq_max_depth",
+};
+
+static const char *const obmf_ev_names[OBMF_EV_NR] = {
+	[OBMF_EV_FATAL] = "transport_failed",
+	[OBMF_EV_IN_STALL] = "in_stalled",
+	[OBMF_EV_OUT_STALL] = "out_stalled",
+	[OBMF_EV_IN_CLEAR_HALT] = "in_clear_halt_failed",
+	[OBMF_EV_OUT_CLEAR_HALT] = "out_clear_halt_failed",
+	[OBMF_EV_NO_RESPONSE] = "no_response",
+	[OBMF_EV_DEVICE_ERROR] = "device_error",
+	[OBMF_EV_BAD_RESPONSE] = "bad_response",
+	[OBMF_EV_RX_SHORT] = "rx_short",
+	[OBMF_EV_RX_OVERSIZE] = "rx_size_over_transfer",
+	[OBMF_EV_RX_TRAILING] = "rx_trailing_bytes",
+	[OBMF_EV_RX_NO_CHANNEL] = "rx_unknown_channel",
+	[OBMF_EV_BAD_DREQ] = "bad_device_request",
+	[OBMF_EV_ANSWER_NOT_SENT] = "answer_not_sent",
+	[OBMF_EV_CH_HEALTH] = "channel_health",
+	[OBMF_EV_QUEUE_FULL] = "device_request_queue_full",
+	[OBMF_EV_TX_DROPPED] = "tx_dropped",
 };
 
 static int obmf_counter_get(void *data, u64 *val)
@@ -482,6 +524,7 @@ static void obmf_debugfs_ch(struct obmf_core *core, struct obmf_channel *ch)
 
 void obmf_debugfs_add(struct obmf_core *core)
 {
+	struct dentry *dir;
 	int i;
 
 	if (!obmf_debugfs_root)
@@ -490,6 +533,11 @@ void obmf_debugfs_add(struct obmf_core *core)
 	for (i = 0; i < OBMF_IF_NR; i++)
 		debugfs_create_file_unsafe(obmf_if_names[i], 0444, core->dbg,
 					   &core->cnt[i], &obmf_counter_fops);
+	dir = debugfs_create_dir("events", core->dbg);
+	for (i = 0; i < OBMF_EV_NR; i++)
+		debugfs_create_file_unsafe(obmf_ev_names[i], 0444, dir,
+					   &core->events[i],
+					   &obmf_counter_fops);
 	obmf_debugfs_ch(core, core->ch0);
 }
 

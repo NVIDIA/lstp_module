@@ -86,7 +86,10 @@ Messages:
   USB 1.0, 6.1). The host sends one;
 - every host request gets its response within the caller's timeout,
   1000 ms unless the function driver gives another. The host sends
-  one request per channel at a time.
+  one request per channel at a time. After a timeout the host waits
+  up to 1000 ms more for the late response, which it drops, before
+  the channel's next request; a response later than that is taken as
+  the answer to the next request (`ASSUMPTIONS.md`).
 
 Channel 0 (OBMF-ICP 1.0.0, 5.15):
 
@@ -113,6 +116,10 @@ Channel 0 (OBMF-ICP 1.0.0, 5.15):
   host to enable a channel, in particular a consumer channel its boot
   depends on, waits for good, and the driver leaves the channel out
   with "channel <n>: not enabled, ignored".
+- reports a channel it wants used as healthy: a kept channel with
+  HEALTH_STATUS 3 (not ready) or 15 (channel error), or with
+  CHANNEL_ERROR_INDICATOR set, still binds, with the warning
+  "channel <n>: health <h>, error indicator <i>" at each bind.
 
 Per channel:
 
@@ -145,9 +152,13 @@ The serial driver expects this of a device:
 - Answer within the wait: the default response timeout (1000 ms) plus
   twice the characters' time on the wire at ten bits a character.
   Without an answer in time the host sends the same characters again
-  10 ms later; a device that answers late, or that took characters it
-  answers with a timeout status, gets them twice, and a late answer
-  is taken as the answer to the next try (`ASSUMPTIONS.md`).
+  10 ms later, after waiting up to 1000 ms for the late answer; each
+  timeout, or timeout status, doubles the default part of the wait
+  for the next answers, up to 10 s in all, until the port is opened
+  again. A device that answers later than that, or that took
+  characters it answers with a timeout status, gets them twice, and
+  the late answer is taken as the answer to the next try
+  (`ASSUMPTIONS.md`).
 - Generate a complete break for each Generate Break request; there is
   no "break off" request.
 - Keep a device write that the host refuses, and send it again later.
@@ -362,7 +373,8 @@ On the USB interface:
 
 - `obmf/name`, a sysfs attribute group with the device name from the
   device header;
-- `usb/obmf/<interface>/` in debugfs (`ARCHITECTURE.md`, "Counters").
+- `usb/obmf/<interface>/` in debugfs, with its `events/` directory
+  (`ARCHITECTURE.md`, "Counters").
 
 On the auxiliary bus, one device per function channel, named
 `obmf.i2c.<id>` or `obmf.serial.<id>` in
@@ -386,4 +398,8 @@ with `CRTSCTS` for RTS/CTS flow control. `TIOCGICOUNT` reports
 received and sent characters, breaks, overruns, Carrier Down events
 (`dcd`) and device writes refused for a full buffer (`buf_overrun`). Break is supported; modem
 control lines are not. The default termios has `CLOCAL` set, so
-Carrier Down hangs the tty up only after `stty -clocal`.
+Carrier Down hangs the tty up only after `stty -clocal`. After a
+transport failure the tty is hung up and an open fails with `EIO`
+until the interface is bound again. In debugfs,
+`obmf_tty/<tty>/tx_dropped` and `tx_stalls` count the characters the
+port dropped and its stall lines.

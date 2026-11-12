@@ -10,7 +10,9 @@ about code that is not in this drop.
 - Effect: after an I2C request times out, its late response can
   complete the next request with the same command: a false ACK, or
   data read from the earlier address. It can only happen after a
-  timeout.
+  timeout. Since drop 3 the next request after a timeout waits for the
+  late response, which is dropped, or for one default timeout (1 s);
+  only a response later than that can still answer it.
 - Why: OBMF-ICP responses carry no tag, so a late response that
   passes the echo and length checks looks like the right one.
 - Closes when: the specification gives a way to flush or tag a
@@ -39,20 +41,6 @@ about code that is not in this drop.
 - Closes when: the specification settles it, and the buffer is sized
   to match.
 - See AS-2.
-
-## KI-5: dropped serial characters are not counted readably
-
-- Effect: characters whose write the device answers with an error
-  status (other than busy or a timeout) are dropped with a "dropped
-  <n> bytes" warning, and characters a close discards with "<n>
-  characters not sent at close, discarded"; each stall of the
-  transmit path gets one "transmit stalled" line. The totals of
-  dropped characters and of stalls cannot be read. (Characters the
-  device refuses are no longer dropped: they are sent again until it
-  takes them. Device writes that arrive while the port is closed are
-  not dropped either: the host refuses them, see KI-20.)
-- Why: not built yet.
-- Closes when: a readable count, with a test.
 
 ## KI-6: serial line settings cannot be changed
 
@@ -96,6 +84,9 @@ about code that is not in this drop.
 - Why: the driver follows OBMF-ICP over USB 1.0, 8.2 and leaves port
   and device resets to the USB core.
 - Closes when: the device firmware keeps working after a clear-halt.
+- Since drop 3 the stall is visible: "bulk in stalled", "bulk out
+  stalled", "bulk ... clear halt failed: <errno>", and the `events/`
+  counters in debugfs. The behaviour is unchanged.
 - See AS-6.
 
 ## KI-14: a channel that answers busy during discovery
@@ -125,7 +116,8 @@ about code that is not in this drop.
 
 ## KI-20: serial input can be lost with no kernel message
 
-- Effect: input is lost in two ways, and neither is logged.
+- Effect: input is lost in two ways; only the second is logged, since
+  drop 3.
   - When the device reports an overrun, the characters are already
     lost on the device. The driver counts the event in `TIOCGICOUNT`
     and inserts a `TTY_OVERRUN` mark, but a reader in raw mode never
@@ -136,16 +128,15 @@ about code that is not in this drop.
   - On the same controller, device writes that the host refuses are
     not sent again. With the reader stopped, input past the host's
     buffer was lost (seen once, in one session). The refusals count
-    only in `buf_overrun`, and refusals when the channel's queue of
-    device requests is full count only in debugfs (`rx_dropped`,
-    `default_answers`).
-- Why: overruns are counted and marked only, refusals are counted
-  only, and the driver relies on the device to send a refused write
-  again (AS-25).
-- Closes when: both cases log a ratelimited warning, with tests, and
-  why the device request queue fills at the line rate is explained.
-  The overrun itself, and a refused write that is not sent again, are
-  the device firmware's to fix.
+    only in `buf_overrun`. Since drop 3 a refusal when the channel's
+    queue of device requests is full logs "channel <n>: device request
+    queue full, request refused", rate limited, and the channel's
+    `dreq_max_depth` in debugfs shows the queue's highest depth.
+- Why: overruns are counted and marked only, and the driver relies on
+  the device to send a refused write again (AS-25, AS-57).
+- Closes when: why the device request queue fills at the line rate is
+  explained. The overrun itself, and a refused write that is not sent
+  again, are the device firmware's to fix.
 
 ## KI-21: an I2C `clock-frequency` that differs from the channel's speed fails the probe
 
@@ -156,6 +147,18 @@ about code that is not in this drop.
   property as a check.
 - Closes when: the property is a limit: the adapter runs at the
   device's speed at or below it and warns above it, with tests.
+
+## KI-22: a device timeout status on a serial write also lengthens the wait
+
+- Effect: each timeout on a serial write doubles the wait for the
+  answers after it, up to 10 s, until the port is opened again. A
+  device answer with status 0x02 (timeout) or 0x40 (line timeout)
+  does the same, though the device answered in time, so the host then
+  waits longer than needed. No characters are lost.
+- Why: both give the same error as no answer.
+- Closes when: the wait doubles only when no answer comes (planned for
+  a later drop).
+- See AS-56.
 
 ## Known limits without a number yet
 

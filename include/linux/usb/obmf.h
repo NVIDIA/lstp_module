@@ -13,6 +13,7 @@
 
 #include <linux/auxiliary_bus.h>
 #include <linux/bits.h>
+#include <linux/ratelimit_types.h>
 #include <linux/types.h>
 
 /* OBMF-ICP 1.0.0, 5.15, Table 65: CHANNEL_TYPE */
@@ -164,9 +165,18 @@ struct obmf_dreq {
  *	answer later with obmf_respond() or obmf_dreq_drop(), or an error
  *	for the core to send the default answer. A return of 0 that left
  *	a due answer unsent gets the default answer too, with a warning.
+ * @failed: optional; called once in process context after a transport
+ *	error stopped the device. It can run while the function device is
+ *	being removed, until the action devm_obmf_publish() added has run.
+ *	Every request fails from then on; obmf_fdev_errno() gives its errno.
+ *	It runs under the lock that delivers @device_request: it may sleep
+ *	and call obmf_request(), obmf_respond() and obmf_dreq_drop(), but
+ *	must not unbind its device, publish, or wait for a @device_request
+ *	call to return.
  */
 struct obmf_fdev_ops {
 	int (*device_request)(struct obmf_fdev *fdev, struct obmf_dreq *dreq);
+	void (*failed)(struct obmf_fdev *fdev);
 };
 
 int obmf_request(struct obmf_fdev *fdev, u8 cmd, const void *req,
@@ -181,6 +191,49 @@ int devm_obmf_publish(struct obmf_fdev *fdev, const struct obmf_fdev_ops *ops);
 
 void obmf_fdev_label(struct obmf_fdev *fdev, char *buf, size_t size);
 void obmf_fdev_protocol_error(struct obmf_fdev *fdev);
+int obmf_fdev_errno(struct obmf_fdev *fdev);
+
+/*
+ * What the core counts and logs; the names are in obmf-bus.c. A function
+ * driver reports only the events from OBMF_EV_FDEV_FIRST on.
+ */
+enum obmf_event {
+	OBMF_EV_FATAL,
+	OBMF_EV_IN_STALL,
+	OBMF_EV_OUT_STALL,
+	OBMF_EV_IN_CLEAR_HALT,
+	OBMF_EV_OUT_CLEAR_HALT,
+	OBMF_EV_NO_RESPONSE,
+	OBMF_EV_DEVICE_ERROR,
+	OBMF_EV_BAD_RESPONSE,
+	OBMF_EV_RX_SHORT,
+	OBMF_EV_RX_OVERSIZE,
+	OBMF_EV_RX_TRAILING,
+	OBMF_EV_RX_NO_CHANNEL,
+	OBMF_EV_BAD_DREQ,
+	OBMF_EV_ANSWER_NOT_SENT,
+	OBMF_EV_CH_HEALTH,
+	OBMF_EV_QUEUE_FULL,
+	OBMF_EV_FDEV_FIRST,
+	OBMF_EV_TX_DROPPED = OBMF_EV_FDEV_FIRST,
+	OBMF_EV_NR,
+};
+
+void __obmf_fdev_report(struct obmf_fdev *fdev, enum obmf_event ev, long a,
+			long b, struct ratelimit_state *rs, const char *func);
+
+/*
+ * Counts @ev, then logs it on @fdev: at most DEFAULT_RATELIMIT_BURST
+ * lines per DEFAULT_RATELIMIT_INTERVAL from this call site, for all
+ * devices. @a and @b are the event's values. Any context.
+ */
+#define obmf_fdev_report(fdev, ev, a, b)                                       \
+	do {                                                                   \
+		static DEFINE_RATELIMIT_STATE(_rs, DEFAULT_RATELIMIT_INTERVAL, \
+					      DEFAULT_RATELIMIT_BURST);        \
+									       \
+		__obmf_fdev_report(fdev, ev, a, b, &_rs, __func__);            \
+	} while (0)
 
 #if IS_ENABLED(CONFIG_OBMF_KUNIT_TEST)
 struct tty_struct;

@@ -153,15 +153,24 @@ Messages that point to a problem:
 | message | meaning |
 |---|---|
 | `no OBMF-ICP functional descriptor`, `unsupported OBMF-ICP version`, `transfer sizes ... too small`, `no bulk endpoints` | the interface was refused; nothing binds |
-| `discovery failed: <errno>`, `channel 0 changed during discovery` | channel 0 could not be read; nothing binds |
+| `discovery failed: <errno>`, `channel 0 changed during discovery` | channel 0 could not be read; nothing binds. With the debug messages on, a reply of neither layout first logs `channel 0: <n> bytes, <m> or <m+2> expected` |
 | `device busy` | an LSTP device stayed busy during discovery; nothing binds |
 | `channel <n>: not enabled, ignored`, `channel <n>: configuration not valid, ignored`, `channel <n>: not enabled, configuration not valid, ignored` | the device left that channel disabled or without a valid configuration (set both in its manufacturing configuration); the others bind |
 | `channel <n>: ... ignored` (other reasons) | one channel's header was refused; the others bind |
+| `channel <n>: health <h>, error indicator <e>` | at bind the channel reported HEALTH_STATUS 3 (not ready) or 15 (channel error), or set its error indicator; it binds anyway |
 | `no device name, label ...`, `no channel name, label ...` | the device left a name empty; harmless |
-| `transport failed (<errno>), device stopped` | repeated USB errors; unbind and bind, or replug |
+| `transport failed: <errno>, device stopped` | repeated USB errors; unbind and bind, or replug. An open tty is hung up, and opening it fails with `EIO` until the interface is bound again |
+| `bulk in stalled`, `bulk out stalled` | the device stalled an endpoint; the driver clears the halt and goes on; a request that met an OUT stall fails |
+| `bulk in clear halt failed: <errno>`, `bulk out clear halt failed: <errno>` | clearing the halt failed; on the IN endpoint the driver tries again, and repeated failures end in `transport failed` |
 | `no response during unbind, device stopped` | the device stopped answering during an unbind |
+| `channel <n>: no response in <ms> ms` | a request timed out; its function driver got `ETIMEDOUT`. On a serial port each timeout doubles the wait of the requests after it, up to 10 s, until the port is opened again, so `<ms>` grows. After a timeout the channel's next request waits until the late response comes, which is dropped and counted in `rx_late`, or until one default timeout (1 s) has passed; a stop or a suspend ends the wait. A response later than that can still be taken by the next request |
+| `channel <n>: device error <status>` | the device failed a request with a status that says it could not do it (invalid, permanent error, unknown channel, or a code this driver does not know); the statuses a function driver acts on (busy, timeout, NACK) print nothing |
+| `channel <n>: bad response, <len> bytes`, `channel <n>: bad response` | a reply that does not fit its request |
+| `malformed message: short, ...`, `malformed message: size over the transfer, ...`, `malformed message: trailing bytes, ...`, `message for unknown channel <n>`, `channel <n>: bad device request, ...` | a message from the device the driver could not take |
+| `channel <n>: answer not sent: <errno>` | the answer to a device request could not be sent |
+| `channel <n>: device request queue full, request refused` | the device sent requests faster than the host answered them, and the host refused one with the default answer (a serial write gets a NACK of count 0, so the device can send it again); `request dropped` for one that needs no answer. `dreq_max_depth` (see "Counters") shows how close a channel came |
 | `channel <n>: request not answered`, `channel <n>: device request kept at unbind` | a function driver left a device request unanswered; the core sent the default answer |
-| `dropped <n> bytes: <errno>` | the device answered a serial write with an error status other than busy or a timeout, or with a malformed answer; those characters are not sent again |
+| `dropped <n> bytes: <errno>` | the device answered a serial write with an error status other than busy or a timeout, or with a malformed answer; those characters are not sent again; they count in the port's `tx_dropped` (see "Counters") |
 | `transmit stalled: <reason>, <n> characters waiting` | for 5 s the device has refused (`refused`), answered busy (`busy`) or not answered (`timed out`) the next serial write; one line per stall; the characters stay and go out once the device takes them. A port held off by flow control (CTS) for 5 s gets the same line |
 | `<n> characters not sent at close, discarded` | the last close found characters the device had not taken; with a write in flight, the line comes once it is answered or times out |
 | `line speed 0`, `configuration data too short`, `request limit <n> too small` | a serial channel's configuration or limits were refused; it has no tty |
@@ -169,6 +178,12 @@ Messages that point to a problem:
 | `channel <n>: node <name> ignored` | a child node with the channel's `reg` has another name than `i2c` or `serial` |
 | `unsupported LSTP version <n>` | the LSTP device is not version 1; nothing binds |
 | `channel <n>: short config (<n>), ignored`, `channel <n>: over budget, ignored` | an LSTP channel's configuration was too short, or its slices too many; the others bind |
+
+An error is printed by name (`-EPROTO`), or as a number (`-71`) on a
+kernel built without `CONFIG_SYMBOLIC_ERRNAME`. Each line is rate
+limited and also counted; see "Counters". During discovery the
+response and message lines stay quiet: a reply left from an earlier
+binding is expected there, and discovery runs its pass again.
 
 Then the devices:
 
@@ -233,8 +248,12 @@ sudo i2cdetect -y -r $N
 
 `i2cdetect` prints `--` for every error alike, so read the channel's
 counters afterwards: NACKs and busy statuses count as
-`status_errors`, and `timeouts` should stay 0. If `timeouts` is above
-0, see `KNOWN-ISSUES.md`, "a late I2C response".
+`status_errors`, and `timeouts` should stay 0. After a timeout, a
+response within the hold (1 s, see `no response in` in "The bind log")
+is dropped and counted in `rx_late`; one that comes later can still
+complete the next request (`KNOWN-ISSUES.md`, "a late I2C response").
+If `timeouts` or `rx_late` keep rising, treat later I2C results as
+suspect: unload and reload before going on.
 
 An open `/dev/i2c-N` delays an unplug or unload until it is closed
 (`KNOWN-ISSUES.md`): do not leave an I2C tool running.
@@ -261,13 +280,15 @@ cmp tx.bin rx.bin && echo SAME
 
 Host writes the device refuses (NACK), answers busy, or does not
 answer stay in the driver's 4096-byte buffer and are sent again 10 ms
-after each refusal, busy answer or timeout, with no limit: a device
-that does not answer is tried about once a second. A write blocks
-once the buffer is full. A device that refuses for 5 s gets one
+after each refusal, busy answer or timeout, with no limit. Each
+timeout doubles the wait for the answers after it, up to 10 s, until
+the port is opened again, so a device that does not answer is tried
+less and less often, at last about every 10 s. A write blocks once
+the buffer is full. A device that refuses for 5 s gets one
 `transmit stalled` line, also when flow control holds it off. A
-device that answers after the driver's timeout can get the same
-characters twice, and characters it refuses right after that can
-count as sent; report any duplicated or missing bytes in `cmp` with
+device that answers more than 1 s after the driver's timeout can get
+the same characters twice, and characters it refuses right after that
+can count as sent; report any duplicated or missing bytes in `cmp` with
 the kernel log. The last close waits up to 30 s for the characters
 the device has not taken, then discards them with `characters not
 sent at close`; `tcflush` discards them without a line.
@@ -335,7 +356,9 @@ echo -n $IF | sudo tee /sys/bus/usb/drivers/obmf/bind
 Repeat it during traffic, for example with a loop of I2C reads or the
 serial loopback running, and also unplug the device during traffic.
 The transfers in progress fail, an open tty is hung up, and the
-interface binds again on replug. An oops, a warning, or a task that
+interface binds again on replug. After `transport failed` an open
+tty is hung up too, and opening it fails with `EIO` until the
+interface is bound again. An oops, a warning, or a task that
 hangs is a finding.
 
 Unload in reverse order:
@@ -361,6 +384,44 @@ sudo sh -c "grep . /sys/kernel/debug/usb/obmf/$IF/ch*/*"   # channels
 The shell runs as root because debugfs is usually readable by root
 only, so a glob of the calling user finds nothing.
 
+The interface's `events` directory has one file per event of this
+table. Each counts its lines of the table in "The bind log", also
+those the rate limit kept out of the log, but not the ones discovery
+keeps quiet. After a bind every file should read 0.
+
+| file | line |
+|---|---|
+| `transport_failed` | `transport failed: <errno>, device stopped` |
+| `in_stalled`, `out_stalled` | `bulk in stalled`, `bulk out stalled` |
+| `in_clear_halt_failed`, `out_clear_halt_failed` | `bulk in clear halt failed: <errno>`, `bulk out clear halt failed: <errno>` |
+| `no_response` | `channel <n>: no response in <ms> ms` |
+| `device_error` | `channel <n>: device error <status>` |
+| `bad_response` | `channel <n>: bad response, <len> bytes`, `channel <n>: bad response` |
+| `rx_short` | `malformed message: short, ...` |
+| `rx_size_over_transfer` | `malformed message: size over the transfer, ...` |
+| `rx_trailing_bytes` | `malformed message: trailing bytes, ...` |
+| `rx_unknown_channel` | `message for unknown channel <n>` |
+| `bad_device_request` | `channel <n>: bad device request, ...` |
+| `answer_not_sent` | `channel <n>: answer not sent: <errno>` |
+| `channel_health` | `channel <n>: health <h>, error indicator <e>` |
+| `device_request_queue_full` | `channel <n>: device request queue full, request refused` or `request dropped` |
+| `tx_dropped` | `dropped <n> bytes: <errno>` |
+
+```sh
+sudo sh -c "grep . /sys/kernel/debug/usb/obmf/$IF/events/*"
+```
+
+A channel's `dreq_max_depth` is the most device requests it held at
+once; 19 is the most it can hold.
+
+Each serial port has its own counters, under its tty's name:
+`tx_dropped`, the characters dropped after an error or at close, and
+`tx_stalls`, the `transmit stalled` lines:
+
+```sh
+sudo sh -c "grep . /sys/kernel/debug/obmf_tty/ttyOBMF*/*"
+```
+
 `ARCHITECTURE.md` explains each counter. After a clean run, only the
 message, request, response and answer counts are above 0, and
 `status_errors` counts the NACKs of a scan.
@@ -376,6 +437,7 @@ modinfo obmf.ko > obmf-logs/modinfo.txt
 lsusb -v -d <vid>:<pid> > obmf-logs/lsusb.txt 2>&1
 ls -lR /sys/bus/auxiliary/devices/ > obmf-logs/aux.txt
 sudo grep -r . /sys/kernel/debug/usb/obmf/ > obmf-logs/counters.txt
+sudo grep -r . /sys/kernel/debug/obmf_tty/ > obmf-logs/tty-counters.txt
 tar czf obmf-logs.tgz obmf-logs
 ```
 

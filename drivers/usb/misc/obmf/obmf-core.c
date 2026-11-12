@@ -8,13 +8,16 @@
  * the channel type's default answer.
  */
 
+#include <kunit/static_stub.h>
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/jiffies.h>
 #include <linux/minmax.h>
 #include <linux/overflow.h>
 #include <linux/property.h>
+#include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
@@ -186,12 +189,50 @@ static int obmf_state_errno(int state)
 	return -ENODEV;
 }
 
+/**
+ * obmf_fdev_errno - what a request on the function device fails with now
+ * @fdev: the function device
+ *
+ * Any context. Return: 0 while requests go out, -EAGAIN while the device
+ * is suspended, -EIO after a transport error stopped it, -ENODEV once it
+ * is gone.
+ */
+int obmf_fdev_errno(struct obmf_fdev *fdev)
+{
+	return obmf_state_errno(READ_ONCE(fdev->ch->core->state));
+}
+EXPORT_SYMBOL_NS_GPL(obmf_fdev_errno, "OBMF");
+
+/* The failed operation of every published driver, once, after the stop */
+static void obmf_core_fail_work(struct work_struct *work)
+{
+	struct obmf_core *core =
+		container_of(work, struct obmf_core, fail_work);
+	struct obmf_channel *ch;
+	int i;
+
+	/* Pairs with obmf_bus_publish(): the table is complete */
+	if (!smp_load_acquire(&core->table))
+		return;
+	for (i = 1; i < OBMF_NR_CHANNELS; i++) {
+		ch = core->chans[i];
+		if (!ch)
+			continue;
+		guard(mutex)
+			(&ch->dispatch_lock);
+		if (ch->ops && ch->ops->failed)
+			ch->ops->failed(ch->publisher);
+	}
+}
+
 /*
  * Every state edge writes the state, then takes each slot's rx_lock, so a
- * waiter that armed its slot before the edge is seen by @err.
+ * waiter that armed its slot before the edge is seen by @err. An edge to a
+ * state that fails requests also ends a hold of obmf_slot_wait_late().
  */
 static void obmf_core_wake(struct obmf_core *core, int err)
 {
+	bool fails = err || obmf_state_errno(READ_ONCE(core->state));
 	struct obmf_channel *ch;
 	int i;
 
@@ -210,6 +251,8 @@ static void obmf_core_wake(struct obmf_core *core, int err)
 			ch->slot.armed = false;
 			ch->slot.err = err;
 			complete(&ch->slot.done);
+		} else if (fails) {
+			obmf_slot_late(&ch->slot);
 		}
 	}
 }
@@ -239,8 +282,100 @@ void obmf_core_fatal(struct obmf_core *core, int err)
 			return;
 	} while (!try_cmpxchg(&core->state, &state, OBMF_FAILED));
 	obmf_count(core, OBMF_IF_FATAL_ERRORS);
-	dev_err(core->dev, "transport failed (%d), device stopped\n", err);
+	obmf_report_bounded(core, core->dev, OBMF_EV_FATAL, -1, err, 0);
 	obmf_core_wake(core, -EIO);
+	/* Any context: the bulk IN completion stops the device too */
+	queue_work(core->wq, &core->fail_work);
+}
+
+/**
+ * obmf_report_log - log one event of obmf_report()
+ * @dev: the device the line names
+ * @ev: the event
+ * @ch: its channel, or -1
+ * @a: its first value
+ * @b: its second value
+ * @rs: the call site's ratelimit state, NULL for an event the state
+ *	machine bounds
+ * @func: the call site, named in the line on suppressed events
+ *
+ * Any context. A KUnit case can redirect it, so it sees the events raised
+ * on its own thread, an interrupt taken on that thread included.
+ */
+void obmf_report_log(struct device *dev, enum obmf_event ev, int ch, long a,
+		     long b, struct ratelimit_state *rs, const char *func)
+{
+	KUNIT_STATIC_STUB_REDIRECT(obmf_report_log, dev, ev, ch, a, b, rs,
+				   func);
+
+	if (rs && !___ratelimit(rs, func))
+		return;
+	switch (ev) {
+	case OBMF_EV_FATAL:
+		dev_err(dev, "transport failed: %pe, device stopped\n",
+			ERR_PTR(a));
+		break;
+	case OBMF_EV_IN_STALL:
+		dev_warn(dev, "bulk in stalled\n");
+		break;
+	case OBMF_EV_OUT_STALL:
+		dev_warn(dev, "bulk out stalled\n");
+		break;
+	case OBMF_EV_IN_CLEAR_HALT:
+		dev_warn(dev, "bulk in clear halt failed: %pe\n", ERR_PTR(a));
+		break;
+	case OBMF_EV_OUT_CLEAR_HALT:
+		dev_warn(dev, "bulk out clear halt failed: %pe\n", ERR_PTR(a));
+		break;
+	case OBMF_EV_NO_RESPONSE:
+		dev_warn(dev, "channel %d: no response in %ld ms\n", ch, a);
+		break;
+	case OBMF_EV_DEVICE_ERROR:
+		dev_warn(dev, "channel %d: device error %#lx\n", ch, a);
+		break;
+	case OBMF_EV_BAD_RESPONSE:
+		if (a < 0)
+			dev_warn(dev, "channel %d: bad response\n", ch);
+		else
+			dev_warn(dev, "channel %d: bad response, %ld bytes\n",
+				 ch, a);
+		break;
+	case OBMF_EV_RX_SHORT:
+		dev_warn(dev, "malformed message: short, %ld bytes\n", a);
+		break;
+	case OBMF_EV_RX_OVERSIZE:
+		dev_warn(dev, "malformed message: size over the transfer, %ld of %ld bytes\n",
+			 a, b);
+		break;
+	case OBMF_EV_RX_TRAILING:
+		dev_warn(dev, "malformed message: trailing bytes, %ld\n", a);
+		break;
+	case OBMF_EV_RX_NO_CHANNEL:
+		dev_warn(dev, "message for unknown channel %d\n", ch);
+		break;
+	case OBMF_EV_BAD_DREQ:
+		dev_warn(dev, "channel %d: bad device request, %ld bytes\n", ch,
+			 a);
+		break;
+	case OBMF_EV_ANSWER_NOT_SENT:
+		dev_warn(dev, "channel %d: answer not sent: %pe\n", ch,
+			 ERR_PTR(a));
+		break;
+	case OBMF_EV_CH_HEALTH:
+		dev_warn(dev, "channel %d: health %ld, error indicator %ld\n",
+			 ch, a, b);
+		break;
+	case OBMF_EV_QUEUE_FULL:
+		dev_warn(dev,
+			 "channel %d: device request queue full, request %s\n",
+			 ch, a ? "refused" : "dropped");
+		break;
+	case OBMF_EV_TX_DROPPED:
+		dev_warn(dev, "dropped %ld bytes: %pe\n", a, ERR_PTR(b));
+		break;
+	case OBMF_EV_NR:
+		break;
+	}
 }
 
 /* Returns @core, or NULL once the core has stopped */
@@ -335,6 +470,7 @@ static void obmf_rec_free(struct obmf_channel *ch, struct obmf_dreq_rec *rec)
 {
 	int i;
 
+	ch->used--;
 	if (!rec->prealloc) {
 		kfree(rec);
 		return;
@@ -376,24 +512,34 @@ void obmf_ch_free(struct obmf_channel *ch)
 	kfree(ch);
 }
 
+static int obmf_reply_status(struct obmf_channel *ch, int err)
+{
+	struct obmf_core *core = ch->core;
+
+	obmf_ch_count(ch, OBMF_CH_STATUS_ERRORS);
+	/* The device's own failure; every other status is an answer */
+	if ((err == -EIO || err == -ECHRNG) && !obmf_core_discovering(core))
+		obmf_report(core, core->dev, OBMF_EV_DEVICE_ERROR,
+			    ch->info.number, ch->slot.status, 0);
+	return err;
+}
+
 static int obmf_reply(struct obmf_channel *ch, u8 cmd, void *resp,
 		      size_t resp_cap, size_t *resp_len)
 {
 	struct obmf_slot *slot = &ch->slot;
+	struct obmf_core *core = ch->core;
 	u8 mask = obmf_echo_mask(ch->info.type);
 	const u8 *body = slot->buf;
 	size_t len = slot->len;
 	int err;
 
 	err = obmf_dialect_status_errno(ch);
-	if (err) {
-		obmf_ch_count(ch, OBMF_CH_STATUS_ERRORS);
-		return err;
-	}
-	if (slot->status) {
-		obmf_ch_count(ch, OBMF_CH_STATUS_ERRORS);
-		return obmf_status_errno(ch->info.type, slot->status);
-	}
+	if (err)
+		return obmf_reply_status(ch, err);
+	if (slot->status)
+		return obmf_reply_status(ch, obmf_status_errno(ch->info.type,
+							       slot->status));
 	if (obmf_is_mmio(ch->info.type)) {
 		if (!obmf_mmio_strip(ch, cmd, &body, &len, resp_cap))
 			goto proto;
@@ -413,13 +559,13 @@ static int obmf_reply(struct obmf_channel *ch, u8 cmd, void *resp,
 
 proto:
 	obmf_ch_count(ch, OBMF_CH_PROTOCOL_ERRORS);
-	if (ch->info.number)
-		dev_dbg(ch->core->dev, "channel %u: bad response, %zu bytes\n",
-			ch->info.number, slot->len);
-	else
-		dev_warn(ch->core->dev,
-			 "channel 0: %zu bytes, %zu or %zu expected\n",
-			 slot->len, resp_cap, resp_cap + OBMF_MMIO_HEAD_LEN);
+	if (!obmf_core_discovering(core))
+		obmf_report(core, core->dev, OBMF_EV_BAD_RESPONSE,
+			    ch->info.number, slot->len, 0);
+	else if (!ch->info.number)
+		dev_dbg(core->dev,
+			"channel 0: %zu bytes, %zu or %zu expected\n",
+			slot->len, resp_cap, resp_cap + OBMF_MMIO_HEAD_LEN);
 	return -EPROTO;
 }
 
@@ -445,6 +591,25 @@ static unsigned int obmf_wait_ms(struct obmf_core *core,
 }
 
 /*
+ * No request carries a tag: after a reply timeout the next request waits
+ * for the late reply, which is dropped, or one default timeout, so that
+ * reply does not answer it.
+ */
+static void obmf_slot_wait_late(struct obmf_core *core, struct obmf_slot *slot)
+{
+	long left = 0;
+
+	scoped_guard(spinlock_irqsave, &slot->rx_lock) {
+		if (slot->held)
+			left = (long)(slot->held_until - jiffies);
+	}
+	if (left > 0 && !obmf_state_errno(READ_ONCE(core->state)))
+		wait_for_completion_timeout(&slot->done, left);
+	scoped_guard(spinlock_irqsave, &slot->rx_lock)
+		slot->held = false;
+}
+
+/*
  * Arms the slot, sends the @len bytes in tx_buf and waits for the reply,
  * under the slot lock. Returns 0 with the reply in the slot.
  */
@@ -455,9 +620,11 @@ int obmf_slot_xfer(struct obmf_channel *ch, u8 cmd, size_t len,
 	struct obmf_slot *slot = &ch->slot;
 	unsigned int wait = obmf_wait_ms(core, timeout_ms);
 	unsigned long deadline;
+	int ret, state;
 	long left;
-	int ret;
 
+	if (READ_ONCE(slot->held))
+		obmf_slot_wait_late(core, slot);
 	scoped_guard(spinlock_irqsave, &slot->rx_lock) {
 		ret = obmf_state_errno(READ_ONCE(core->state));
 		if (!ret) {
@@ -485,18 +652,30 @@ int obmf_slot_xfer(struct obmf_channel *ch, u8 cmd, size_t len,
 
 	left = max_t(long, (long)(deadline - jiffies), 1);
 	if (!wait_for_completion_timeout(&slot->done, left)) {
+		deadline = jiffies + msecs_to_jiffies(OBMF_DEFAULT_TIMEOUT_MS);
 		scoped_guard(spinlock_irqsave, &slot->rx_lock) {
 			if (slot->armed) {
 				slot->armed = false;
+				slot->held = true;
+				slot->held_until = deadline;
 				ret = -ETIMEDOUT;
 			}
 		}
 		if (ret) {
 			obmf_ch_count(ch, OBMF_CH_TIMEOUTS);
+			state = READ_ONCE(core->state);
+			if (state == OBMF_LIVE || state == OBMF_QUIESCED)
+				obmf_report(core, core->dev,
+					    OBMF_EV_NO_RESPONSE,
+					    ch->info.number, wait, 0);
 			obmf_core_timed_out(core);
 			return ret;
 		}
 	}
+	/* Set under rx_lock; reported here, where the caller may sleep */
+	if (slot->err == -EPROTO && !obmf_core_discovering(core))
+		obmf_report(core, core->dev, OBMF_EV_BAD_RESPONSE,
+			    ch->info.number, slot->len, 0);
 	return slot->err;
 }
 
@@ -547,9 +726,14 @@ int obmf_ch_request(struct obmf_channel *ch, u8 cmd, const void *req,
  * @resp_len: length of the response, or NULL if it must be @resp_cap
  * @timeout_ms: response wait, 0 for the default
  *
+ * After a response timeout on the channel, the next request is sent once
+ * the late response comes or %OBMF_DEFAULT_TIMEOUT_MS after the timeout,
+ * so it can take longer than @timeout_ms.
+ *
  * Sleeps. Returns 0, the errno of a nonzero response status, -ETIMEDOUT,
  * -EMSGSIZE for a request above the channel's limit, -EPROTO for a
- * malformed response, or -ENODEV once the device is gone.
+ * malformed response, -EAGAIN while the device is suspended, -EIO after a
+ * transport error stopped it, or -ENODEV once it is gone.
  */
 int obmf_request(struct obmf_fdev *fdev, u8 cmd, const void *req,
 		 size_t req_len, void *resp, size_t resp_cap, size_t *resp_len,
@@ -568,16 +752,20 @@ static void obmf_rx_response(struct obmf_channel *ch, u8 status, const u8 *data,
 	guard(spinlock_irqsave)(&slot->rx_lock);
 	if (!slot->armed) {
 		obmf_ch_count(ch, OBMF_CH_RX_LATE);
+		dev_dbg_ratelimited(ch->core->dev,
+				    "channel %u: late response dropped\n",
+				    ch->info.number);
+		obmf_slot_late(slot);
 		return;
 	}
 	slot->armed = false;
 	slot->status = status;
+	slot->len = len;
 	if (len > slot->cap) {
 		slot->err = -EPROTO;
 		obmf_ch_count(ch, OBMF_CH_PROTOCOL_ERRORS);
 	} else {
 		memcpy(slot->buf, data, len);
-		slot->len = len;
 	}
 	obmf_ch_count(ch, OBMF_CH_RX_RESPONSES);
 	complete(&slot->done);
@@ -610,7 +798,7 @@ bool obmf_dreq_len_ok(const struct obmf_channel *ch, const u8 *data, size_t len)
 	return true;
 }
 
-static int obmf_send_answer(struct obmf_channel *ch, u8 cmd, u8 status,
+static int obmf_answer_xmit(struct obmf_channel *ch, u8 cmd, u8 status,
 			    const void *data, size_t len)
 {
 	struct obmf_core *core = ch->core;
@@ -643,12 +831,23 @@ static int obmf_send_answer(struct obmf_channel *ch, u8 cmd, u8 status,
 		return ret;
 
 	ret = tp->ops->send(tp, msg, mlen, OBMF_DEFAULT_TIMEOUT_MS);
-	if (ret) {
-		obmf_ch_count(ch, OBMF_CH_TX_ERRORS);
-		if (ret == -ETIMEDOUT)
-			obmf_core_timed_out(core);
-	} else {
+	if (ret == -ETIMEDOUT)
+		obmf_core_timed_out(core);
+	else if (!ret)
 		obmf_ch_count(ch, OBMF_CH_TX_ANSWERS);
+	return ret;
+}
+
+/* No caller can act on a failure: report every one but the device's end */
+static int obmf_send_answer(struct obmf_channel *ch, u8 cmd, u8 status,
+			    const void *data, size_t len)
+{
+	int ret = obmf_answer_xmit(ch, cmd, status, data, len);
+
+	if (ret && ret != -ENODEV) {
+		obmf_ch_count(ch, OBMF_CH_TX_ERRORS);
+		obmf_report(ch->core, ch->core->dev, OBMF_EV_ANSWER_NOT_SENT,
+			    ch->info.number, ret, 0);
 	}
 	return ret;
 }
@@ -731,29 +930,45 @@ static struct obmf_dreq_rec *obmf_rec_get(struct obmf_channel *ch, bool due,
 	return NULL;
 }
 
-/* Queues a device request, or owes its answer; under dreq_lock */
-bool obmf_dreq_add(struct obmf_channel *ch, const u8 *data, size_t len)
+/*
+ * Queues a device request, or owes its answer and returns false when the
+ * queue is full; @due tells whether it waits for one; under dreq_lock
+ */
+bool obmf_dreq_add(struct obmf_channel *ch, const u8 *data, size_t len,
+		   bool *due)
 {
-	bool due = obmf_answer_due(ch, data[0]);
 	struct obmf_dreq_rec *rec;
 
-	rec = obmf_rec_get(ch, due, len - 1);
+	*due = obmf_answer_due(ch, data[0]);
+	rec = obmf_rec_get(ch, *due, len - 1);
 	if (rec) {
 		rec->kept = false;
 		rec->done = false;
 		rec->dreq.cmd = data[0];
-		rec->dreq.answer_due = due;
+		rec->dreq.answer_due = *due;
 		rec->dreq.data = rec->buf;
 		rec->dreq.len = len - 1;
 		memcpy(rec->buf, data + 1, len - 1);
 		list_add_tail(&rec->node, &ch->queue);
+		if (++ch->used >
+		    atomic_long_read(&ch->cnt[OBMF_CH_DREQ_MAX_DEPTH]))
+			atomic_long_set(&ch->cnt[OBMF_CH_DREQ_MAX_DEPTH],
+					ch->used);
 		return true;
 	}
-	if (due) {
+	if (*due) {
 		ch->owed++;
 		ch->owed_cmd = data[0];
 	}
 	return false;
+}
+
+/* Counts and reports a dropped device request; not under dreq_lock */
+void obmf_dreq_full(struct obmf_channel *ch, bool due)
+{
+	obmf_ch_count(ch, OBMF_CH_RX_DROPPED);
+	obmf_report(ch->core, ch->core->dev, OBMF_EV_QUEUE_FULL,
+		    ch->info.number, due, 0);
 }
 
 /*
@@ -778,8 +993,7 @@ void obmf_dreq_owe_invalid(struct obmf_channel *ch)
 
 static void obmf_rx_dreq(struct obmf_channel *ch, const u8 *data, size_t len)
 {
-	bool queued = false;
-	bool bad;
+	bool bad, queued = true, due = false;
 
 	obmf_ch_count(ch, OBMF_CH_RX_DEVICE_REQUESTS);
 	scoped_guard(spinlock_irqsave, &ch->dreq_lock) {
@@ -787,13 +1001,17 @@ static void obmf_rx_dreq(struct obmf_channel *ch, const u8 *data, size_t len)
 		if (bad)
 			obmf_dreq_owe_invalid(ch);
 		else
-			queued = obmf_dreq_add(ch, data, len);
+			queued = obmf_dreq_add(ch, data, len, &due);
 	}
 
-	if (bad)
+	if (bad) {
 		obmf_count(ch->core, OBMF_IF_RX_MALFORMED);
-	else if (!queued)
-		obmf_ch_count(ch, OBMF_CH_RX_DROPPED);
+		if (!obmf_core_discovering(ch->core))
+			obmf_report(ch->core, ch->core->dev, OBMF_EV_BAD_DREQ,
+				    ch->info.number, len, 0);
+	} else if (!queued) {
+		obmf_dreq_full(ch, due);
+	}
 	queue_work(ch->core->wq, &ch->work);
 }
 
@@ -823,6 +1041,9 @@ static void obmf_dreq_deliver(struct obmf_channel *ch,
 				      "channel %u: request not answered\n",
 				      ch->info.number);
 		obmf_default_answer(ch, rec->dreq.cmd);
+	} else if (!done && ret) {
+		/* A datagram no driver took */
+		obmf_ch_count(ch, OBMF_CH_RX_DROPPED);
 	}
 	obmf_rec_put(ch, rec);
 }
@@ -977,24 +1198,39 @@ void obmf_core_rx(struct obmf_core *core, const u8 *buf, size_t len)
 	const struct obmf_hdr *hdr = (const struct obmf_hdr *)buf;
 	struct obmf_channel *ch;
 	size_t size;
+	bool quiet;
 
+	quiet = obmf_core_discovering(core);
 	if (len < OBMF_HDR_LEN) {
 		obmf_count(core, OBMF_IF_RX_MALFORMED);
+		if (!quiet)
+			obmf_report(core, core->dev, OBMF_EV_RX_SHORT, -1, len,
+				    0);
 		return;
 	}
 	size = le16_to_cpu(hdr->size);
 	if (size > len - OBMF_HDR_LEN) {
 		obmf_count(core, OBMF_IF_RX_MALFORMED);
+		if (!quiet)
+			obmf_report(core, core->dev, OBMF_EV_RX_OVERSIZE, -1,
+				    size, len - OBMF_HDR_LEN);
 		return;
 	}
 	/* Bytes after the payload the header gives are not part of it */
-	if (size < len - OBMF_HDR_LEN)
+	if (size < len - OBMF_HDR_LEN) {
 		obmf_count(core, OBMF_IF_RX_MALFORMED);
+		if (!quiet)
+			obmf_report(core, core->dev, OBMF_EV_RX_TRAILING, -1,
+				    len - OBMF_HDR_LEN - size, 0);
+	}
 	obmf_count(core, OBMF_IF_RX_MESSAGES);
 
 	ch = obmf_core_lookup(core, hdr->channel);
 	if (!ch) {
 		obmf_count(core, OBMF_IF_RX_NO_CHANNEL);
+		if (!quiet)
+			obmf_report(core, core->dev, OBMF_EV_RX_NO_CHANNEL,
+				    hdr->channel, 0, 0);
 		return;
 	}
 	if (dialect && dialect->decode) {
@@ -1051,6 +1287,7 @@ struct obmf_core *obmf_core_create(struct obmf_transport *tp)
 		alloc_workqueue("obmf-%s", WQ_UNBOUND, 0, dev_name(core->dev));
 	if (!core->wq)
 		return NULL;
+	INIT_WORK(&core->fail_work, obmf_core_fail_work);
 	resp = core->ch0_chunk;
 	cap = core->ch0_chunk + OBMF_HDR_LEN;
 	dialect = obmf_dialect(core);
@@ -1206,6 +1443,7 @@ void obmf_core_unbind(struct obmf_core *core, bool attached)
 		obmf_bus_del(core);
 	}
 
+	disable_work_sync(&core->fail_work);
 	obmf_debugfs_del(core);
 	obmf_core_free(core);
 }

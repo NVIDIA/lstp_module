@@ -854,6 +854,7 @@ const struct obmf_usb_proto obmf_lstp_usb_proto = {
 
 #if IS_ENABLED(CONFIG_OBMF_LSTP_KUNIT_TEST)
 #include <kunit/device.h>
+#include <kunit/static_stub.h>
 #include <kunit/test.h>
 #include <linux/atomic.h>
 #include <linux/delay.h>
@@ -2201,6 +2202,7 @@ static void lt_i2c_round_trip(struct kunit *test)
 	struct obmf_channel *ch;
 	u8 resp[16], m[4];
 	size_t len;
+	long errs;
 	int i;
 
 	KUNIT_ASSERT_EQ(test, lt_bind(f), 0);
@@ -2231,6 +2233,9 @@ static void lt_i2c_round_trip(struct kunit *test)
 	}
 	KUNIT_EXPECT_EQ(test, atomic_long_read(&ch->cnt[OBMF_CH_STATUS_ERRORS]),
 			ARRAY_SIZE(st));
+	/* ERROR and an unknown status report; NACK does not */
+	errs = atomic_long_read(&f->core->events[OBMF_EV_DEVICE_ERROR]);
+	KUNIT_EXPECT_EQ(test, errs, 2);
 
 	/* A write's reply with data */
 	lt_set_reply(f, reply, sizeof(reply));
@@ -2260,6 +2265,7 @@ static void lt_uart_round_trip(struct kunit *test)
 	struct obmf_channel *ch;
 	u8 resp[8], m[4];
 	size_t len;
+	long errs;
 
 	KUNIT_ASSERT_EQ(test, lt_bind(f), 0);
 	ch = f->core->chans[2];
@@ -2288,6 +2294,9 @@ static void lt_uart_round_trip(struct kunit *test)
 			obmf_ch_request(ch, 0x01, req, sizeof(req), resp,
 					sizeof(resp), &len, 0),
 			-EIO);
+	/* A NACK is the device's answer, ARB_LOST its failure */
+	errs = atomic_long_read(&f->core->events[OBMF_EV_DEVICE_ERROR]);
+	KUNIT_EXPECT_EQ(test, errs, 1);
 }
 
 /*
@@ -2359,6 +2368,34 @@ static void lt_default_answer(struct kunit *test)
 			1);
 }
 
+/*
+ * Channel 0 takes device requests before publish; an empty one
+ * is counted, not reported, while discovering
+ */
+static void lt_rx_before_publish(struct kunit *test)
+{
+	static const u8 empty[] = { 0, 0x00, 0, 0 };
+	struct lt_fake *f = lt_create(test, 64, 1);
+	struct obmf_core *core;
+	int ret;
+
+	KUNIT_ASSERT_EQ(test, obmf_dialect_attach(&f->tp, &obmf_lstp_usb_proto),
+			0);
+	f->core = obmf_core_create(&f->tp);
+	KUNIT_ASSERT_NOT_NULL(test, f->core);
+	ret = kunit_add_action_or_reset(test, lt_unbind_action, f);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	core = f->core;
+	obmf_core_rx(core, empty, sizeof(empty));
+	flush_workqueue(core->wq);
+	ret = atomic_long_read(&core->ch0->cnt[OBMF_CH_RX_DEVICE_REQUESTS]);
+	KUNIT_EXPECT_EQ(test, ret, 1);
+	KUNIT_EXPECT_EQ(test,
+			atomic_long_read(&core->cnt[OBMF_IF_RX_MALFORMED]), 1);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&core->events[OBMF_EV_BAD_DREQ]),
+			0);
+}
+
 /* The serial driver on an LSTP device; only when built in */
 #if IS_BUILTIN(CONFIG_OBMF_TTY)
 
@@ -2420,6 +2457,73 @@ static struct tty_struct *lt_tty_open(struct kunit *test,
 			kunit_add_action_or_reset(test, lt_tty_close, tty), 0);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	return tty;
+}
+
+/* Keeps, in test->priv, the last queue-full report of the case's thread */
+static void lt_qf_stub(struct device *dev, enum obmf_event ev, int ch, long a,
+		       long b, struct ratelimit_state *rs, const char *func)
+{
+	long *refused = kunit_get_current_test()->priv;
+
+	if (ev == OBMF_EV_QUEUE_FULL)
+		*refused = a;
+}
+
+/*
+ * UART writes sent while the first waits for the serial driver
+ * take the reserve and the queue, and the open port takes them; the next
+ * is refused with the NACK, counted in rx_dropped and reported as
+ * refused, and every write is answered once
+ */
+static void lt_uart_queue_full(struct kunit *test)
+{
+	static const u8 write[] = { 2, 0x00, 2, 0, 'h', 'i' };
+	static const u8 nack[] = { 2, 0x84, 0, 0 };
+	int n = OBMF_DREQ_RESERVE + OBMF_DREQ_QUEUE_MAX + 1, i;
+	struct lt_fake *f = lt_create(test, 64, 2);
+	struct obmf_channel *ch;
+	struct tty_struct *tty;
+	long refused = -1;
+	struct ktermios t;
+	int sends;
+
+	KUNIT_ASSERT_EQ(test, lt_bind(f), 0);
+	ch = f->core->chans[2];
+	KUNIT_ASSERT_NOT_NULL(test, ch);
+	tty = lt_tty_open(test, ch);
+	/* No echo, so the line discipline sends nothing */
+	down_read(&tty->termios_rwsem);
+	t = tty->termios;
+	up_read(&tty->termios_rwsem);
+	t.c_lflag &= ~ECHO;
+	tty_set_termios(tty, &t);
+	sends = f->sends;
+	test->priv = &refused;
+	kunit_activate_static_stub(test, obmf_report_log, lt_qf_stub);
+
+	/* Expectations only while the lock is held */
+	mutex_lock(&ch->dispatch_lock);
+	for (i = 0; i < n; i++)
+		obmf_core_rx(f->core, write, sizeof(write));
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&ch->cnt[OBMF_CH_RX_DROPPED]),
+			1);
+	mutex_unlock(&ch->dispatch_lock);
+	kunit_deactivate_static_stub(test, obmf_report_log);
+	test->priv = NULL;
+	flush_workqueue(f->core->wq);
+
+	KUNIT_EXPECT_EQ(test, refused, 1);
+	KUNIT_EXPECT_EQ(test, f->sends - sends, n);
+	/* The queued writes are taken; the default answer goes last */
+	KUNIT_EXPECT_EQ(test, f->sent_len, sizeof(nack));
+	KUNIT_EXPECT_MEMEQ(test, f->sent, nack, sizeof(nack));
+	KUNIT_EXPECT_EQ(test,
+			atomic_long_read(&ch->cnt[OBMF_CH_DEFAULT_ANSWERS]), 1);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&ch->cnt[OBMF_CH_RX_DROPPED]),
+			1);
+	KUNIT_EXPECT_EQ(test,
+			atomic_long_read(&f->core->events[OBMF_EV_QUEUE_FULL]),
+			1);
 }
 
 /* Waits up to @ms for @tx characters sent in all and none left */
@@ -2752,8 +2856,8 @@ KUNIT_DEFINE_ACTION_WRAPPER(lt_cancel_late, cancel_delayed_work_sync,
 
 /*
  * No response, and the reply comes late, while the next transfer waits:
- * nothing is sent between the two requests, and the late reply answers
- * the next transfer, as LSTP cannot tell them apart
+ * the next transfer is sent only after the late reply, which is dropped,
+ * so it times out in turn
  */
 static void lt_i2c_late_reply(struct kunit *test)
 {
@@ -2763,6 +2867,8 @@ static void lt_i2c_late_reply(struct kunit *test)
 	struct i2c_adapter *adap;
 	struct obmf_channel *ch;
 	struct lt_late *l;
+	ktime_t t;
+	s64 ms;
 	int ret;
 
 	KUNIT_ASSERT_EQ(test, lt_bind(f), 0);
@@ -2779,13 +2885,19 @@ static void lt_i2c_late_reply(struct kunit *test)
 
 	queue_delayed_work(system_dfl_wq, &l->work,
 			   msecs_to_jiffies(OBMF_DEFAULT_TIMEOUT_MS + 500));
+	t = ktime_get();
 	KUNIT_EXPECT_EQ(test, lt_read_byte(adap, &data), -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, f->sends, 1);
-	KUNIT_EXPECT_EQ(test, lt_read_byte(adap, &data), 0);
-	KUNIT_EXPECT_EQ(test, data.byte, 0x5a);
+	KUNIT_EXPECT_EQ(test, lt_read_byte(adap, &data), -ETIMEDOUT);
+	ms = ktime_ms_delta(ktime_get(), t);
+	KUNIT_EXPECT_GE(test, ms,
+			2 * OBMF_DEFAULT_TIMEOUT_MS + 500 -
+				jiffies_to_msecs(2));
+	/* the late reply, not the end of the hold, sent the second */
+	KUNIT_EXPECT_LT(test, ms, 2 * OBMF_DEFAULT_TIMEOUT_MS + 900);
 	KUNIT_EXPECT_EQ(test, f->sends, 2);
-	KUNIT_EXPECT_EQ(test, atomic_long_read(&ch->cnt[OBMF_CH_TIMEOUTS]), 1);
-	KUNIT_EXPECT_EQ(test, atomic_long_read(&ch->cnt[OBMF_CH_RX_LATE]), 0);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&ch->cnt[OBMF_CH_TIMEOUTS]), 2);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&ch->cnt[OBMF_CH_RX_LATE]), 1);
 }
 
 #endif /* IS_BUILTIN(CONFIG_I2C_OBMF) */
@@ -2849,9 +2961,11 @@ static struct kunit_case obmf_lstp_cases[] = {
 	KUNIT_CASE(lt_i2c_round_trip),
 	KUNIT_CASE(lt_uart_round_trip),
 	KUNIT_CASE(lt_default_answer),
+	KUNIT_CASE(lt_rx_before_publish),
 #if IS_BUILTIN(CONFIG_OBMF_TTY)
 	KUNIT_CASE(lt_uart_closed),
 	KUNIT_CASE(lt_uart_refused),
+	KUNIT_CASE(lt_uart_queue_full),
 #endif
 	KUNIT_CASE(lt_wire_then_request),
 	KUNIT_CASE(lt_late_reply),

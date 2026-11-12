@@ -1,4 +1,4 @@
-# OBMF-ICP over USB: Linux drivers (evaluation drop 2)
+# OBMF-ICP over USB: Linux drivers (evaluation drop 3)
 
 This is a Linux driver for USB devices that implement the OCP Open
 Boot and Management Framework Interface Consolidation Protocol
@@ -13,7 +13,7 @@ the driver, so the function drivers and user space see OBMF-ICP only.
 
 ## Status
 
-This is the second evaluation drop of work in progress toward
+This is the third evaluation drop of work in progress toward
 upstream Linux. It is not a release. Module names, device names,
 sysfs and debugfs files, and the in-kernel interface for function
 drivers can still change, before or during upstream review. We share
@@ -80,93 +80,81 @@ yet, so they are built out of tree only; `TESTING.md` shows the two
 entries the KUnit run adds. `REQUIREMENTS.md` covers the kernel
 versions and the Kconfig options.
 
-## What changed since drop 1
+## What changed since drop 2
+
+Reports:
+
+- What the device does wrong is now counted and logged through one
+  helper: each event counts in a new debugfs directory of the
+  interface, `usb/obmf/<interface>/events/`, one file per event, and
+  logs one line, at most 10 lines per 5 s from each place in the code.
+  The counters also count what the rate limit kept out of the log.
+  Errors are printed by name (`-EPROTO`), or as numbers on a kernel
+  without `CONFIG_SYMBOLIC_ERRNAME`; the transport failure line is now
+  "transport failed: <errno>, device stopped".
+- A response timeout ("channel <n>: no response in <ms> ms"), a
+  failure status that says the device could not do the request
+  ("channel <n>: device error <status>"), a response that does not fit
+  its request ("bad response"), a message the core cannot take
+  ("malformed message: ...", "message for unknown channel <n>", "bad
+  device request") and an answer that cannot be sent ("answer not
+  sent") are now logged. The statuses a function driver acts on (busy,
+  timeout, I2C NACK) stay quiet, and so does all of this during
+  discovery, where a reply left from an earlier binding is expected.
+- A stall of either bulk endpoint logs "bulk in stalled" or "bulk out
+  stalled", and a halt clear that fails logs "bulk in clear halt
+  failed: <errno>" or "bulk out clear halt failed: <errno>". A failed
+  bulk OUT halt clear now counts as a failed transfer.
+- A channel that reports HEALTH_STATUS 3 (not ready) or 15 (channel
+  error), or sets CHANNEL_ERROR_INDICATOR, still binds, now with one
+  warning per bind: "channel <n>: health <h>, error indicator <i>".
+- A device request that finds the channel's queue full is reported:
+  "channel <n>: device request queue full, request refused" (or
+  "request dropped" for one that waits for no answer). Each channel
+  has a new counter, `dreq_max_depth`, the most device requests it
+  held at once.
+
+Function drivers and the core:
+
+- After a transport failure stops the device, the core tells each
+  function driver, through a new optional `failed` operation, and
+  `obmf_fdev_errno()` gives the errno a request would fail with. The
+  serial driver hangs its tty up then, and an open fails with `EIO`
+  until the interface is bound again.
+- After a response timeout, the channel's next request waits until
+  the late response arrives, which is dropped, or for one default
+  timeout (1 s), so that the late response does not answer it. A
+  response later than that is still taken by the next request.
+- Function drivers can report events of their own through
+  `obmf_fdev_report()`, counted with the core's.
 
 Serial channels:
 
-- Characters the device refuses (a NACK that accepts none), answers
-  busy (status 0x03) or does not answer (no answer, status 0x02, or
-  the line timeout 0x40) now stay queued and are sent again 10 ms
-  after each refusal, busy answer or timeout, with no limit; a device
-  that does not answer is therefore tried about once a second. Drop 1
-  dropped them after 20 refusals in a row or at the first busy answer
-  or timeout. While the device refuses, `write_room()` shrinks,
-  writers block and `tcdrain()` waits. When the same characters have
-  waited 5 s, the port logs one "transmit stalled: <reason>, <n>
-  characters waiting" warning, and nothing more until the device
-  takes them. The driver cannot tell a device held off by flow
-  control (CTS) from one that refuses for its own reasons, so a port
-  held off for 5 s gets the line too.
-- The characters are discarded only on a flush, a hangup, an unbind,
-  or a close after `closing_wait` (30 s by default); a close that
-  discards some logs "<n> characters not sent at close, discarded",
-  for characters in a write still in flight once the device answers
-  it or it times out. Other error statuses still drop them with a
-  rate-limited "dropped <n> bytes" warning.
-- Requests carry no tag: after an answer that comes after the
-  timeout, characters can reach the line twice, and the next request
-  takes that answer, so characters the device then refuses can count
-  as sent and be lost (`ASSUMPTIONS.md`).
-- A serial channel now takes a firmware node, as an I2C channel
-  does: a child node named `serial` on device tree, or a channel
-  object on ACPI (`REQUIREMENTS.md`). A disabled node leaves the
-  channel without a tty.
-- While the port is closed, a device write that carries characters
-  is refused with a NACK and a count of 0, so the device keeps them;
-  drop 1 dropped them. A write with events only is taken.
-- A refused device write is not acted on: its events are counted and
-  passed on once, when the device sends it again and it is taken. A
-  refusal for a full receive buffer is counted in `buf_overrun` of
-  `TIOCGICOUNT`.
-- Carrier Down hangs the tty up, unless `CLOCAL` is set, and is
-  counted in `dcd`.
-- A break the device refuses is sent again, up to 20 times, 10 ms
-  apart; then `tcsendbreak()` fails with `EIO`. Unlike characters, a
-  break keeps this limit.
-- termios reports `CRTSCTS` when the device uses RTS/CTS.
-- Data bits, stop bits or parity out of range give a port at 8N1,
-  with a warning; drop 1 gave no port. A line speed of 0 still does.
-- At low line speeds a write request carries fewer characters, so
-  that its wait fits the 10 s limit of the core.
-- No "dropped" warning after an unplug; an open that races an unbind
-  fails with `ENODEV`.
+- Characters dropped after an error are reported as an event, counted
+  in `events/tx_dropped`, with the line "dropped <n> bytes: <errno>".
+- Each port has a debugfs directory, `obmf_tty/<tty>/`, with
+  `tx_dropped` (characters dropped after an error or at close) and
+  `tx_stalls` (the "transmit stalled" lines).
+- Each timeout doubles the wait for the answers after it, up to 10 s,
+  until the port is opened again: a device that answers later than the
+  default timeout gets one repeat, not one per write. A device answer
+  with a timeout status (0x02, or the line timeout 0x40) doubles the
+  wait as well (see `KNOWN-ISSUES.md`).
 
-I2C channels:
+## What changed in drop 2
 
-- No bus recovery is registered with the I2C core, also on a channel
-  that offers one, so `i2c_recover_bus()` returns `-EBUSY`; a failed
-  transfer returns its error, and the client decides. Drop 1 started
-  one after a busy answer or a timeout on a channel that offered it.
-- SMBus clients with PEC enabled work.
-
-The core:
-
-- A device request that a function driver leaves unanswered gets the
-  default answer, with a one-time warning.
-- A serial or IPMI device request that cannot be decoded is answered
-  with the invalid status (OBMF-ICP 1.0.0, 5.2, Table 4) instead of
-  being dropped unanswered.
-- A software unbind also stops at the first send timeout, not only at
-  the first response timeout.
-- A channel whose header and configuration run past the 32-bit
-  configuration space is left out as a bad layout.
-- Unloading `obmf.ko` waits for the device-link work the function
-  devices left queued.
-- The channel list in the kernel log at discovery names an I2C target
-  channel "I2C-target"; drop 1 cut it to "I2C-targe".
-
-LSTP:
-
-- An I2C configuration of at least 1 byte and a UART configuration of
-  at least 7 bytes are accepted; the missing fields read as 0.
-- A GPIO channel's configuration is read to an empty slice, and an
-  error status after the first slice ends a configuration and keeps
-  the channel.
-- The host's answer to a device's UART write that carries an error
-  status is sent as `LSTP_NOT_SUPP`.
-
-The KUnit suites now also run the I2C and serial drivers on the fake
-transport.
+Since drop 1: serial channels take firmware nodes; the serial driver
+keeps characters the device refuses, answers busy or does not answer
+and sends them again until the device takes them, with one "transmit
+stalled" line after 5 s, refuses device writes while the port is
+closed and hangs up on Carrier Down; a refused break is sent again up
+to 20 times; out-of-range line settings give a port at 8N1. The I2C
+driver registers no bus recovery, and SMBus clients with PEC work. The
+core answers device requests that a driver leaves unanswered with the
+default answer, and those that cannot be decoded with the invalid
+status. LSTP accepts shorter I2C and UART configurations and reads a
+GPIO channel's configuration to an empty slice. The KUnit suites also
+run the I2C and serial drivers on the fake transport.
 
 ## What was tested
 
@@ -190,15 +178,18 @@ These modules, built from this tree:
   no interface object or one that is not present. All passed.
 - KUnit on x86_64 at Linux v7.3-rc6: the native suites, with the I2C
   and serial drivers built in, and with LSTP, including channel nodes
-  from a device tree overlay and from software nodes, and the serial
+  from a device tree overlay and from software nodes, the serial
   transmit retries, the stall and close lines, a suspend and an unbind
-  during a retry: 100 of 100 tests passed without LSTP, 149 of 149
-  with it.
+  during a retry, and the event reports, the hold after a timeout, the
+  growing serial wait, the hang-up after a transport failure and the
+  new counters: 127 of 127 tests passed without LSTP, 178 of 178 with
+  it.
 
-Not tested yet: system sleep and resume on a device (KUnit runs the
-serial driver's suspend and resume on the fake transport), a
-`clock-frequency` that differs from the channel's speed, and the
-out-of-tree KUnit build.
+Not tested yet: the new report lines on a device (KUnit makes each
+one on the fake transport), system sleep and resume on a device
+(KUnit runs the serial driver's suspend and resume on the fake
+transport), a `clock-frequency` that differs from the channel's
+speed, and the out-of-tree KUnit build.
 
 `TESTING.md` describes how to repeat these checks on your hardware.
 

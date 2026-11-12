@@ -49,14 +49,18 @@ Two bulk IN transfers are kept queued, and one bulk OUT transfer is in
 flight at a time. A message is never sent twice: a failed or timed-out
 send is an error for the caller.
 
-On a stalled bulk IN endpoint the transport clears the halt and queues
-the transfers again (OBMF-ICP over USB 1.0, 8.2). Other bulk IN errors
-are retried after 250 ms. Ten bulk IN errors or stalls in a row stop
-the device:
-the core logs "transport failed (<errno>), device stopped", and every
-later request fails with `-EIO` until the interface is bound again.
-On a stalled bulk OUT endpoint the halt is cleared and that send fails
-with `-EPIPE`. The driver does not reset the port or the device; that
+On a stalled bulk IN endpoint the transport logs "bulk in stalled",
+clears the halt and queues the transfers again (OBMF-ICP over USB 1.0,
+8.2); a halt clear that fails logs "bulk in clear halt failed:
+<errno>". Other bulk IN errors are retried after 250 ms, with a debug
+message. Ten bulk IN errors or stalls in a row stop the device: the
+core logs "transport failed: <errno>, device stopped", tells the
+function drivers (see "Lifetime"), and every later request fails with
+`-EIO` until the interface is bound again. On a stalled bulk OUT
+endpoint the transport logs "bulk out stalled", the halt is cleared
+(a failure logs "bulk out clear halt failed: <errno>" and counts as a
+failed bulk OUT transfer) and that send fails with `-EPIPE`. None of
+these lines is logged while the device goes away (`-ENODEV`). The driver does not reset the port or the device; that
 is left to the USB core.
 
 ## The message layer
@@ -87,12 +91,42 @@ The response is checked before the caller sees it:
 
 The wait is the caller's timeout, or 1000 ms by default, at most
 10000 ms, and at least the profile's floor. A request that gets no
-response in time fails with `-ETIMEDOUT`; a response that arrives
-later is counted as late and dropped. During a software unbind, the
+response in time fails with `-ETIMEDOUT` and logs "channel <n>: no
+response in <ms> ms". The channel's next request then waits until
+the late response arrives, which is counted as late and dropped, or
+for one default timeout (1000 ms), so that response does not answer
+it. A stop or suspend of the device ends such a wait. A response that
+comes after it ended is still taken by the next request (see
+`KNOWN-ISSUES.md` and `ASSUMPTIONS.md`). A send that times out sets
+no such wait. During a software unbind, the
 first timeout, of a send or of a response, stops the device ("no
 response during unbind, device stopped"). From then on requests fail
 at once and no answer is sent, so that the removal of the function
 drivers does not wait a timeout for every request.
+
+### Events
+
+What the device does wrong is reported through one helper: it counts
+the event in the interface's `events/` directory in debugfs, then
+logs one line, at most 10 lines per 5 s from each place in the code,
+for all devices together (the kernel's default rate limit). The
+events are the transport failure, a stall or a failed halt clear on
+either endpoint, a response timeout, a failure status, a response
+that does not fit its request, a message the core cannot take (too
+short, larger than its transfer, trailing bytes, for an unknown
+channel), a device request that cannot be decoded, an answer that
+cannot be sent, an unhealthy channel at bind, and a full device
+request queue. The statuses a function driver acts on (busy, timeout,
+I2C NACK) are not logged, nor is a timeout during unbind, where the
+core stops and says so. During discovery, timeouts, bad responses and
+messages for unknown channels are taken as leftovers of an earlier
+binding and stay quiet. Errors are printed by name (`-EPROTO`), or as
+numbers on a kernel without `CONFIG_SYMBOLIC_ERRNAME`.
+
+Function drivers report their own events through the same helper, on
+their function device: the serial driver's dropped characters
+(`tx_dropped`). A malformed response a function driver finds is
+reported as the core's bad response.
 
 ### Requests from the device
 
@@ -102,7 +136,11 @@ an unbound workqueue of the instance, one at a time per channel. Each
 channel keeps three records in reserve for requests that wait for an
 answer, and allocates at most 16 more. A request that waits for an
 answer and finds no record is not lost: the core owes its answer and
-sends the default answer later.
+sends the default answer later. Each request that finds no record is
+reported, "channel <n>: device request queue full, request refused",
+or "... request dropped" for one that waits for no answer, and the
+channel's `dreq_max_depth` keeps the most records it had in use at
+once.
 
 A function driver takes device requests by passing its operations to
 `devm_obmf_publish()`. Its `device_request()` returns 0 when it has
@@ -165,7 +203,11 @@ The device decides which channels are in use. Discovery keeps a
 channel only if its CHANNEL_CONTROL has CHANNEL_ENABLE and its
 CHANNEL_STATUS has CONFIG_VALID (Table 65); any other channel is left
 out with a warning and gets no function device. HEALTH_STATUS and
-CHANNEL_ERROR_INDICATOR are not checked (see `ASSUMPTIONS.md`). The
+CHANNEL_ERROR_INDICATOR do not decide: a kept channel whose
+HEALTH_STATUS is 3 (not ready) or 15 (channel error), or that sets
+CHANNEL_ERROR_INDICATOR, binds with one warning per bind, "channel
+<n>: health <h>, error indicator <i>", after the discovery pass that
+is kept (see `ASSUMPTIONS.md`). The
 core never writes CHANNEL_ENABLE: it does not switch channels on at
 bind or off at unbind. A channel is therefore on before its function
 driver binds;
@@ -216,7 +258,18 @@ data and per-channel quirks) and calls the functions of
 - `obmf_fdev_label()`, a name of the form `<device name>_<channel
   name>` for what the driver registers;
 - `obmf_fdev_protocol_error()`, to count a malformed response the
-  driver found.
+  driver found;
+- `obmf_fdev_report()`, to count and log one of the function
+  driver's own events, rate limited per place in the code;
+- `obmf_fdev_errno()`, the errno a request would fail with now (0
+  while the device works, `-EIO` after a transport failure).
+
+The operations a driver publishes may include `failed`: the core
+calls it once, in process context, after a transport failure stopped
+the device. It runs under the lock that delivers device requests, so
+it must not unbind its device, publish, or wait for one of its own
+device requests. A driver that publishes after the failure is
+refused.
 
 ## The function drivers
 
@@ -256,7 +309,12 @@ Host writes are queued in a 4 KiB buffer and sent as Write requests
 answer is the default response timeout plus twice the characters'
 time on the wire, at ten bits a character; at low line speeds a
 request carries fewer characters, so that the wait fits the core's
-10 s limit. Characters leave the buffer only when the device accepts
+10 s limit. Each timeout (no answer, status 0x02, or the line timeout
+0x40) doubles the default part of the wait for the answers after it,
+up to the core's 10 s limit, which also caps the wire time; it goes
+back to the default when the port is opened again. A device that
+answers later than the default timeout therefore gets one repeat, not
+one per write. Characters leave the buffer only when the device accepts
 them; after a partial accept the next request starts with the first
 character not accepted. Characters the device refuses (a NACK that
 accepts none), answers busy (status 0x03, 5.2, Table 4) or does not
@@ -273,8 +331,8 @@ stall. The driver cannot tell a device held off by flow control (CTS)
 from one that refuses for its own reasons.
 
 Any other error status, or an answer that accepts more than was sent
-(a protocol error), drops the characters of that request with a
-rate-limited "dropped <n> bytes" warning (no warning once the device
+(a protocol error), drops the characters of that request, reported
+as an event, "dropped <n> bytes: <errno>" (no line once the device
 is gone), and the next characters go out. A flush discards what is
 not yet sent; with a request in flight, the characters it carries
 leave once it is answered, and characters written after the flush
@@ -284,11 +342,16 @@ dropped and logs "<n> characters not sent at close, discarded"; for a
 request still in flight the line comes once it is answered or times
 out, and counts the characters the device did not take.
 
-Requests carry no tag (6.6). An answer that comes after the host's
-timeout is taken by the next try, so the device can get the same
-characters twice, and the answer of that try is then taken by the
-request after it, so characters the device refuses there can count
-as sent and be lost (`ASSUMPTIONS.md`).
+Requests carry no tag (6.6). The core holds the next try after a
+timeout until the late answer comes or one default timeout passes.
+An answer that comes later still is taken by the next try, so the
+device can get the same characters twice, and the answer of that try
+is then taken by the request after it, so characters the device
+refuses there can count as sent and be lost (`ASSUMPTIONS.md`).
+
+After a transport failure the port is hung up, as on Carrier Down,
+and a later open fails with `-EIO` until the interface is bound
+again.
 
 System suspend stops the tries; resume starts them again. A break is
 one Generate Break event; a refused break is sent again up to 20
@@ -424,7 +487,9 @@ hung up when its device goes, and an open that races the teardown
 fails with `-ENODEV`.
 
 **Transport failure.** After ten bulk IN errors in a row the device
-is stopped and every request fails with `-EIO`. The function devices
+is stopped and every request fails with `-EIO`. The core then calls
+the `failed` operation of each published function driver, once, from
+a work item; the serial driver hangs its tty up. The function devices
 stay until the interface is unbound, or the device is unplugged.
 
 **System suspend and resume.** Each function device suspends before
@@ -472,6 +537,21 @@ a function device:
 | `default_answers` | default and invalid answers sent by the core |
 | `rx_dropped` | device requests not delivered for want of a record (a due answer still goes out as the default answer), ended by the driver without an answer, left queued when the channel is freed, or answers with no wire form |
 | `rx_replaced` | reserved, stays 0 |
+| `dreq_max_depth` | the most device requests the channel held at once (at most 19: 3 reserved records and a queue of 16) |
+
+The interface directory also has `events/`, one file per event of
+"Events" above, named `transport_failed`, `in_stalled`, `out_stalled`,
+`in_clear_halt_failed`, `out_clear_halt_failed`, `no_response`,
+`device_error`, `bad_response`, `rx_short`, `rx_size_over_transfer`,
+`rx_trailing_bytes`, `rx_unknown_channel`, `bad_device_request`,
+`answer_not_sent`, `channel_health`, `device_request_queue_full` and
+`tx_dropped`. Each counts the events of the interface, also those the
+rate limit kept out of the log.
+
+Each serial port has a directory `obmf_tty/<tty>/` (for example
+`obmf_tty/ttyOBMF0/`) with `tx_dropped`, the characters dropped after
+an error or at close, and `tx_stalls`, the "transmit stalled" lines.
+It goes at unbind.
 
 With `CONFIG_FAULT_INJECTION_DEBUG_FS`, the interface directory also
 holds `fail_bulk_in/` and `fail_bulk_out/`. They follow the kernel's

@@ -3,9 +3,11 @@
  * OBMF-ICP over USB: channel 0, discovery and channel control
  */
 
+#include <linux/bitfield.h>
 #include <linux/build_bug.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/jiffies.h>
@@ -337,6 +339,34 @@ static void obmf_discover_settle(struct obmf_core *core, unsigned long deadline)
 }
 
 /*
+ * OBMF-ICP 1.0.0, 5.15, Table 65: a channel whose HEALTH_STATUS is 3
+ * (not ready) or 15 (channel error), or that sets CHANNEL_ERROR_INDICATOR,
+ * still binds; once per bind, after the pass that is kept.
+ */
+#define OBMF_CH_HEALTH_NOT_READY 3
+#define OBMF_CH_HEALTH_ERROR 15
+
+static void obmf_discover_health(struct obmf_core *core)
+{
+	struct obmf_channel *ch;
+	u8 health;
+	bool ind;
+	int i;
+
+	for (i = 1; i < OBMF_NR_CHANNELS; i++) {
+		ch = core->chans[i];
+		if (!ch)
+			continue;
+		health = FIELD_GET(OBMF_CH_STATUS_HEALTH, ch->status);
+		ind = ch->status & OBMF_CH_STATUS_ERROR;
+		if (health == OBMF_CH_HEALTH_NOT_READY ||
+		    health == OBMF_CH_HEALTH_ERROR || ind)
+			obmf_report_bounded(core, core->dev, OBMF_EV_CH_HEALTH,
+					    i, health, ind);
+	}
+}
+
+/*
  * A reply left from an earlier binding fails a read's checks or makes
  * the next read time out; a device header that changed means the
  * device was still settling. Such a pass is discarded and run again.
@@ -391,6 +421,8 @@ int obmf_ctrl_discover(struct obmf_core *core)
 		}
 		if (!obmf_discover_again(ret))
 			break;
+		dev_dbg(core->dev, "discovery pass %d failed: %pe, again\n",
+			pass + 1, ERR_PTR(ret));
 		if (time_after(jiffies, deadline)) {
 			ret = -ETIMEDOUT;
 			break;
@@ -401,7 +433,9 @@ int obmf_ctrl_discover(struct obmf_core *core)
 		dev_err(core->dev, "channel 0 changed during discovery\n");
 		ret = -EIO;
 	} else if (ret) {
-		dev_err(core->dev, "discovery failed: %d\n", ret);
+		dev_err(core->dev, "discovery failed: %pe\n", ERR_PTR(ret));
+	} else {
+		obmf_discover_health(core);
 	}
 	return ret;
 }

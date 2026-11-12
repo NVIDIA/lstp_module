@@ -191,7 +191,8 @@ static int obmf_i2c_cfg(struct obmf_i2c *i2c, struct device *dev)
 	/*
 	 * The channel's bus recovery (options bit 0) is not offered to the
 	 * I2C core: no status says the bus is held, and a recovery sent
-	 * after a timeout can take the late reply as its own
+	 * after a timeout can take a reply later than the core's hold as
+	 * its own
 	 */
 	return 0;
 }

@@ -6,8 +6,10 @@
 #include <linux/auxiliary_bus.h>
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/kfifo.h>
 #include <linux/math64.h>
 #include <linux/module.h>
@@ -78,9 +80,13 @@ struct obmf_tty_cfg {
  * @tx_stalled: the head of @fifo has not moved since @tx_since
  * @tx_warned: the stall was reported
  * @tx_since: jiffies of the first try that kept the head
+ * @tx_wait: how long a request waits for its answer beyond twice its
+ *	time on the wire: OBMF_DEFAULT_TIMEOUT_MS at each open, doubled
+ *	after each timeout up to OBMF_MAX_TIMEOUT_MS
  * @icount: line counters for TIOCGICOUNT
  * @tx_dropped: bytes dropped after an error or at close
  * @tx_stalls: stalls reported
+ * @dbg: debugfs directory with @tx_dropped and @tx_stalls
  * @speed: UART_SPEED_HZ
  * @cflag: CSIZE, CSTOPB, PARENB, PARODD, CMSPAR and CRTSCTS from Table 78
  * @minor: tty index, U32_MAX until allocated
@@ -101,9 +107,11 @@ struct obmf_tty {
 	bool tx_stalled;
 	bool tx_warned;
 	unsigned long tx_since;
+	unsigned int tx_wait;
 	struct async_icount icount;
 	unsigned long tx_dropped;
 	unsigned long tx_stalls;
+	struct dentry *dbg;
 	u32 speed;
 	tcflag_t cflag;
 	u32 minor;
@@ -111,6 +119,7 @@ struct obmf_tty {
 };
 
 static struct tty_driver *obmf_tty_driver;
+static struct dentry *obmf_tty_dbg;
 /* Covers the minor table and @gone for install and activate */
 static DEFINE_MUTEX(obmf_tty_lock);
 static DEFINE_XARRAY_ALLOC(obmf_tty_minors);
@@ -136,12 +145,18 @@ static int obmf_tty_send(struct obmf_tty *p, u8 ev, size_t n, size_t *done,
 	u16 acc;
 	int ret;
 
+	scoped_guard(spinlock_irqsave, &p->lock)
+		ms = p->tx_wait;
 	/* Twice the time on the wire, ten bits a character */
-	ms = OBMF_DEFAULT_TIMEOUT_MS +
-	     2 * DIV_ROUND_UP(n * 10 * MSEC_PER_SEC, p->speed);
+	ms += 2 * DIV_ROUND_UP(n * 10 * MSEC_PER_SEC, p->speed);
 	put_unaligned_le16(n, p->req);
 	ret = obmf_request(p->fdev, ev, p->req, 2 + n, resp, sizeof(resp), &len,
 			   ms);
+	if (ret == -ETIMEDOUT) {
+		guard(spinlock_irqsave)
+			(&p->lock);
+		p->tx_wait = min(2 * p->tx_wait, OBMF_MAX_TIMEOUT_MS);
+	}
 	if (ret)
 		return ret;
 	if (len != sizeof(resp) || get_unaligned_le16(resp + 1) > n) {
@@ -209,11 +224,15 @@ static void obmf_tty_warn_close(struct obmf_tty *p, size_t n)
  * accepts them. A NACK of none, busy (OBMF-ICP 1.0.0, 5.2, Table 4: 0x03)
  * or a timeout keeps them for another try: no answer, Table 4 0x02, or
  * the line timeout (5.5, Table 21: 0x40). Any other error drops them.
- * No request carries a tag, so an answer that comes after the timeout
- * answers the next try, and the device may get the bytes twice; the
- * next request can then take that try's own answer, so bytes can also
- * be lost. A head kept for OBMF_TTY_STALL_MS gets one warning, then none
- * until the device accepts it.
+ * No request carries a tag: the core holds the next try until an answer
+ * that comes after the timeout arrives, or for one default timeout, so
+ * the device may get the bytes twice. Each timeout doubles the wait of
+ * the requests after it, up to OBMF_MAX_TIMEOUT_MS, until the next open,
+ * so a device that is slower than the wait gets one repeat, not one per
+ * request. An answer later than the hold answers the next try, whose own
+ * answer the request after it can take, so bytes can also be lost. A
+ * head kept for OBMF_TTY_STALL_MS gets one warning, then none until the
+ * device accepts it.
  */
 static int obmf_tty_tx_one(struct obmf_tty *p)
 {
@@ -261,8 +280,7 @@ static int obmf_tty_tx_one(struct obmf_tty *p)
 	}
 	/* -ENODEV: the device is gone and every write fails */
 	if (drop && ret != -ENODEV)
-		dev_warn_ratelimited(&p->fdev->adev.dev,
-				     "dropped %zu bytes: %d\n", done, ret);
+		obmf_fdev_report(p->fdev, OBMF_EV_TX_DROPPED, done, ret);
 	if (stall)
 		obmf_tty_warn_stall(p, ret, waiting);
 	if (closed)
@@ -504,16 +522,24 @@ static void obmf_tty_destruct(struct tty_port *port)
 
 /*
  * port->tty is set by now, so a teardown that has not set @gone yet will
- * hang this tty up; one that has may have found no tty to hang up.
+ * hang this tty up; one that has may have found no tty to hang up. So
+ * will a transport error that stops the device later; after one, every
+ * request fails, and the open is refused.
  */
 static int obmf_tty_activate(struct tty_port *port, struct tty_struct *tty)
 {
 	struct obmf_tty *p = container_of(port, struct obmf_tty, port);
-	bool gone;
 
-	scoped_guard(mutex, &obmf_tty_lock)
-		gone = p->gone;
-	return gone ? -ENODEV : 0;
+	guard(mutex)
+		(&obmf_tty_lock);
+	if (p->gone)
+		return -ENODEV;
+	/* @fdev is set until @gone */
+	if (obmf_fdev_errno(p->fdev) == -EIO)
+		return -EIO;
+	scoped_guard(spinlock_irqsave, &p->lock)
+		p->tx_wait = OBMF_DEFAULT_TIMEOUT_MS;
+	return 0;
 }
 
 /*
@@ -598,8 +624,17 @@ answer:
 	return 0;
 }
 
+/* A transport error stopped the device: hang up, as on carrier down */
+static void obmf_tty_failed(struct obmf_fdev *fdev)
+{
+	struct obmf_tty *p = auxiliary_get_drvdata(&fdev->adev);
+
+	tty_port_tty_hangup(&p->port, false);
+}
+
 static const struct obmf_fdev_ops obmf_tty_fdev_ops = {
 	.device_request = obmf_tty_device_request,
+	.failed = obmf_tty_failed,
 };
 
 static void obmf_tty_teardown(void *data)
@@ -613,6 +648,7 @@ static void obmf_tty_teardown(void *data)
 	/* Waits for a break request; none starts after this */
 	scoped_guard(mutex, &p->req_lock)
 		p->fdev = NULL;
+	debugfs_remove(p->dbg);
 	tty_unregister_device(obmf_tty_driver, p->minor);
 	tty_port_put(&p->port);
 }
@@ -685,7 +721,7 @@ static int obmf_tty_probe(struct auxiliary_device *adev,
 				     "request limit %zu too small\n",
 				     info->max_req);
 	max_chars = min_t(size_t, info->max_req - OBMF_TTY_HEAD, U16_MAX);
-	/* So that obmf_tty_send()'s wait fits the core's limit */
+	/* So that obmf_tty_send()'s first wait fits the core's limit */
 	wire = div_u64((u64)speed *
 			       (OBMF_MAX_TIMEOUT_MS - OBMF_DEFAULT_TIMEOUT_MS),
 		       2 * 10 * MSEC_PER_SEC);
@@ -722,6 +758,9 @@ static int obmf_tty_probe(struct auxiliary_device *adev,
 		return PTR_ERR(tty_dev);
 
 	auxiliary_set_drvdata(adev, p);
+	p->dbg = debugfs_create_dir(dev_name(tty_dev), obmf_tty_dbg);
+	debugfs_create_ulong("tx_dropped", 0444, p->dbg, &p->tx_dropped);
+	debugfs_create_ulong("tx_stalls", 0444, p->dbg, &p->tx_stalls);
 	ret = devm_add_action_or_reset(dev, obmf_tty_teardown, no_free_ptr(p));
 	if (ret)
 		return ret;
@@ -783,9 +822,11 @@ static int __init obmf_tty_init(void)
 		return ret;
 	}
 	obmf_tty_driver = driver;
+	obmf_tty_dbg = debugfs_create_dir("obmf_tty", NULL);
 
 	ret = auxiliary_driver_register(&obmf_tty_aux_driver);
 	if (ret) {
+		debugfs_remove(obmf_tty_dbg);
 		tty_unregister_driver(driver);
 		tty_driver_kref_put(driver);
 	}
@@ -796,6 +837,7 @@ module_init(obmf_tty_init);
 static void __exit obmf_tty_exit(void)
 {
 	auxiliary_driver_unregister(&obmf_tty_aux_driver);
+	debugfs_remove(obmf_tty_dbg);
 	tty_unregister_driver(obmf_tty_driver);
 	tty_driver_kref_put(obmf_tty_driver);
 }
