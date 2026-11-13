@@ -8,6 +8,8 @@ CONFIG_OBMF_TTY=y
 CONFIG_DEBUG_FS=y
 CONFIG_OF=y
 CONFIG_OF_OVERLAY=y
+CONFIG_GPIOLIB=y
+CONFIG_GPIO_OBMF=y
 
 # The console tracepoint, for the serial cases' log checks
 CONFIG_FTRACE=y

@@ -82,7 +82,8 @@ struct obmf_tty_cfg {
  * @tx_since: jiffies of the first try that kept the head
  * @tx_wait: how long a request waits for its answer beyond twice its
  *	time on the wire: OBMF_DEFAULT_TIMEOUT_MS at each open, doubled
- *	after each timeout up to OBMF_MAX_TIMEOUT_MS
+ *	after each request that waited that long with no answer, up to
+ *	OBMF_MAX_TIMEOUT_MS
  * @icount: line counters for TIOCGICOUNT
  * @tx_dropped: bytes dropped after an error or at close
  * @tx_stalls: stalls reported
@@ -140,6 +141,7 @@ static int obmf_tty_send(struct obmf_tty *p, u8 ev, size_t n, size_t *done,
 			 bool *nack)
 {
 	u8 resp[OBMF_TTY_RESP_LEN];
+	unsigned long start;
 	unsigned int ms;
 	size_t len;
 	u16 acc;
@@ -149,10 +151,14 @@ static int obmf_tty_send(struct obmf_tty *p, u8 ev, size_t n, size_t *done,
 		ms = p->tx_wait;
 	/* Twice the time on the wire, ten bits a character */
 	ms += 2 * DIV_ROUND_UP(n * 10 * MSEC_PER_SEC, p->speed);
+	ms = min(ms, OBMF_MAX_TIMEOUT_MS);
 	put_unaligned_le16(n, p->req);
+	start = jiffies;
 	ret = obmf_request(p->fdev, ev, p->req, 2 + n, resp, sizeof(resp), &len,
 			   ms);
-	if (ret == -ETIMEDOUT) {
+	/* Only a wait that ran out: a timeout status is an answer in time */
+	if (ret == -ETIMEDOUT &&
+	    time_after_eq(jiffies, start + msecs_to_jiffies(ms))) {
 		guard(spinlock_irqsave)
 			(&p->lock);
 		p->tx_wait = min(2 * p->tx_wait, OBMF_MAX_TIMEOUT_MS);
@@ -226,13 +232,14 @@ static void obmf_tty_warn_close(struct obmf_tty *p, size_t n)
  * the line timeout (5.5, Table 21: 0x40). Any other error drops them.
  * No request carries a tag: the core holds the next try until an answer
  * that comes after the timeout arrives, or for one default timeout, so
- * the device may get the bytes twice. Each timeout doubles the wait of
- * the requests after it, up to OBMF_MAX_TIMEOUT_MS, until the next open,
- * so a device that is slower than the wait gets one repeat, not one per
- * request. An answer later than the hold answers the next try, whose own
- * answer the request after it can take, so bytes can also be lost. A
- * head kept for OBMF_TTY_STALL_MS gets one warning, then none until the
- * device accepts it.
+ * the device may get the bytes twice. Each request that gets no answer
+ * doubles the wait of the requests after it, up to OBMF_MAX_TIMEOUT_MS,
+ * until the next open, so a device that is slower than the wait gets one
+ * repeat, not one per request; 0x02 or 0x40 keeps the wait, as the
+ * device answered in time. An answer later than the hold answers the
+ * next try, whose own answer the request after it can take, so bytes
+ * can also be lost. A head kept for OBMF_TTY_STALL_MS gets one warning,
+ * then none until the device accepts it.
  */
 static int obmf_tty_tx_one(struct obmf_tty *p)
 {

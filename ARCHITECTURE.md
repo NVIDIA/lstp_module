@@ -5,12 +5,12 @@ instance of the lower three; the function drivers bind the devices the
 instance creates.
 
 ```text
-  user space      /dev/i2c-N        /dev/ttyOBMFn
-                      |                  |
-  function        i2c-obmf.ko        obmf_tty.ko
-  drivers             |                  |
-                 obmf.i2c.<id>     obmf.serial.<id>   auxiliary bus
-                      +--------+---------+
+  user space      /dev/i2c-N        /dev/ttyOBMFn      /dev/gpiochipN
+                      |                  |                  |
+  function        i2c-obmf.ko        obmf_tty.ko        gpio-obmf.ko
+  drivers             |                  |                  |
+                 obmf.i2c.<id>     obmf.serial.<id>   obmf.gpio.<id>   auxiliary bus
+                      +--------+---------+------------------+
   obmf.ko                      |  include/linux/usb/obmf.h
                  function device registry (obmf-bus.c)
                  channel 0 and discovery  (obmf-ctrl.c)
@@ -125,8 +125,13 @@ numbers on a kernel without `CONFIG_SYMBOLIC_ERRNAME`.
 
 Function drivers report their own events through the same helper, on
 their function device: the serial driver's dropped characters
-(`tx_dropped`). A malformed response a function driver finds is
-reported as the core's bad response.
+(`tx_dropped`), the GPIO driver's failed Sets (`gpio_set_failed`) and
+the interrupt configurations the device refused
+(`gpio_irq_config_failed`). An event can also be counted with no line:
+a GPIO interrupt event for a line with no interrupt set up
+(`gpio_irq_unused`). A malformed response a function driver finds is
+reported as the core's bad response, and a device request it cannot
+take as the core's bad device request.
 
 ### Requests from the device
 
@@ -157,6 +162,9 @@ The default answer is the one the core sends when no driver answers:
   Table 23);
 - GPIO Interrupt Notify: success (5.4.1, Table 18); an Interrupt
   Notify Datagram waits for no answer;
+- a GPIO command the device may not send: invalid (a reserved command,
+  6 to 0xff, Table 18; on a channel where the device is the GPIO
+  Producer, any command but the two interrupt notifications, Table 16);
 - every other request: BUSY.
 
 A device request that cannot be decoded reaches no driver: a serial
@@ -223,11 +231,13 @@ driver:
 
 | CHANNEL_TYPE | DEVICE_ROLE | device name |
 |---|---|---|
+| GPIO (0x02) | producer | `obmf.gpio.<id>` |
 | I2C controller (0x04) | producer | `obmf.i2c.<id>` |
 | serial (0x03) | producer or symmetric | `obmf.serial.<id>` |
 
-Both kinds look for a firmware node: I2C channels a node named `i2c`,
-serial channels one named `serial`. Every other channel is discovered
+Each kind looks for a firmware node: GPIO channels a node named
+`gpio`, I2C channels one named `i2c`, serial channels one named
+`serial`. Every other channel is discovered
 and logged at debug level, but gets no device yet. `<id>` is unique
 across all OBMF-ICP interfaces in the system; it is not the channel
 number.
@@ -260,9 +270,14 @@ data and per-channel quirks) and calls the functions of
 - `obmf_fdev_protocol_error()`, to count a malformed response the
   driver found;
 - `obmf_fdev_report()`, to count and log one of the function
-  driver's own events, rate limited per place in the code;
+  driver's own events, rate limited per place in the code, and
+  `obmf_fdev_count()`, to count one with no line, from any context;
+- `obmf_fdev_bad_request()`, to count and log a device request the
+  driver found malformed, with the same counter and line as one the
+  core cannot decode;
 - `obmf_fdev_errno()`, the errno a request would fail with now (0
-  while the device works, `-EIO` after a transport failure).
+  while the device works, `-EAGAIN` while it is suspended, `-EIO`
+  after a transport failure, `-ENODEV` once it is gone).
 
 The operations a driver publishes may include `failed`: the core
 calls it once, in process context, after a transport failure stopped
@@ -309,12 +324,13 @@ Host writes are queued in a 4 KiB buffer and sent as Write requests
 answer is the default response timeout plus twice the characters'
 time on the wire, at ten bits a character; at low line speeds a
 request carries fewer characters, so that the wait fits the core's
-10 s limit. Each timeout (no answer, status 0x02, or the line timeout
-0x40) doubles the default part of the wait for the answers after it,
-up to the core's 10 s limit, which also caps the wire time; it goes
-back to the default when the port is opened again. A device that
-answers later than the default timeout therefore gets one repeat, not
-one per write. Characters leave the buffer only when the device accepts
+10 s limit, which also caps the wire time. A request that waited its
+whole time with no answer doubles the default part of the wait for
+the answers after it, up to that limit; it goes back to the default
+when the port is opened again. A timeout status from the device (0x02,
+or the line timeout 0x40) is an answer in time and keeps the wait. A
+device that answers later than the default timeout therefore gets one
+repeat, not one per write. Characters leave the buffer only when the device accepts
 them; after a partial accept the next request starts with the first
 character not accepted. Characters the device refuses (a NACK that
 accepts none), answers busy (status 0x03, 5.2, Table 4) or does not
@@ -374,6 +390,71 @@ the warning "unsupported line ..., using 8N1"; a speed of 0 gives no
 tty. RTS/CTS flow control is reported as `CRTSCTS`. The driver reports
 the settings in termios and cannot change them yet
 (`KNOWN-ISSUES.md`).
+
+### GPIO (`gpio-obmf.ko`)
+
+Each GPIO channel gets one GPIO chip, labelled `<device name>_<channel
+name>`, below the GPIO function device. The configuration data
+(OBMF-ICP 1.0.0, 5.15.2, Tables 76 and 77) gives GPIO_COUNT and an
+entry for each line; the lines are numbered by GPIO_INDEX, and an
+index the configuration does not list is a hole, which cannot be
+requested. A count above 4096, an index with reserved bits set or an
+index listed twice refuses the channel. A line whose direction,
+default output, drive or bias is out of range is left out as a hole,
+with one warning that gives the count. GPIO_NAME names the lines; an
+empty name, or one with a control character, is left out. The
+channel's payload limits give how many lines one Get Values or Set
+Values carries (a per-channel quirk); a request for more lines is
+split into several messages, and limits too small for one line leave
+the channel without a chip.
+
+Each line's direction is the device's (GPIO_DIRECTION); asking for the
+other one fails with `-EINVAL` and sends nothing. The driver sets no
+drive or bias (`KNOWN-ISSUES.md`).
+
+Get Values (5.4.1, Table 19) reads inputs: the response is matched to
+the request by line index, each line once and in any order; a stray,
+repeated or out-of-range index is a protocol error (`-EPROTO`). An
+output reads the value last set, from its default output on, and
+sends nothing. Set Values sends the outputs' new values; the driver
+keeps a message's values only when the device took them, so a Set
+that fails keeps the values set before for its lines. A split Set
+stops at the first message that fails, so the lines of the messages
+before it keep their new values. A failed Set is reported
+("cannot set line <n>: <errno>", or "cannot set lines: <errno>" for
+several), except for a Set of an input, which is refused before
+anything is sent, and a device that is gone. While the device is
+stopped or suspended, reads of any line fail with the request's
+errno.
+
+The chip has an immutable interrupt chip with a bus lock; its
+interrupts are nested and threaded, because configuring the device
+sleeps. Only edge triggers are offered (rising, falling or both): a
+level type is refused with `-EINVAL`, since Table 18 does not say
+when a level that stays is reported again. An output cannot be requested as
+an interrupt. The device is configured only when the bus lock is
+released: Set Interrupt Config (Table 17) with the line's trigger while
+the line is unmasked, else disable, sent only when it differs from
+what the device last took. A failure keeps what the device had, so
+the next change tries again; it is reported ("cannot configure the
+interrupt of line <n>: <errno>"), and the line is not armed. The
+consumer's request itself succeeds, because the kernel's hook returns
+no error.
+
+The driver takes the channel's device requests (an Interrupt Notify or
+an Interrupt Notify Datagram, Table 18), each an entry for every line
+that saw its edge, data 0. One bad entry (an index past the chip, a
+hole, data not 0, an odd length, or no entry) makes the request
+malformed: it is reported as a bad device request, a Notify is
+answered invalid, and no line is handled. A Notify is answered success
+before the handlers run, because a handler may read lines from the
+device that waits for that answer; a Datagram gets no answer. Each
+listed line that is armed runs its handler once; an event for a line
+that is not counts in `gpio_irq_unused`. The events carry no level, so
+a consumer of both edges reads the line. This path takes none of the
+driver's locks. At unbind the device requests stop before the chip is
+removed. The interrupt configuration is not sent again after a device
+reset (`ASSUMPTIONS.md`).
 
 ## Dialects: devices with another wire protocol
 
@@ -439,14 +520,28 @@ every response wait is at least 1000 ms. What it translates:
   settings (Table 78); a shorter configuration leaves the channel out.
   A refusal goes to the device as `LSTP_NACK`, and an answer with an
   error status as `LSTP_NOT_SUPP`;
+- GPIO channels: the GPIO table (LSTP 1.0, 4.3.1) as the OBMF-ICP
+  configuration (Tables 76 and 77), a line's index its position across
+  the table's blocks; an output with LED support is an LED, not a GPIO
+  line, and is left out as a hole, and a channel of LEDs only gets no
+  chip (`KNOWN-ISSUES.md`); Z, which OBMF-ICP lacks, becomes the
+  released level of an open-drain or open-source line. Get Values
+  becomes GET_VALUE and Set Values SET_VALUE (4.3.2); as the GET_VALUE
+  response carries the states only, the indices of the request are
+  kept to rebuild the OBMF-ICP response. Set Interrupt Config becomes
+  SET_IRQ_CONFIG, one line a request, and a device's IRQ_EVENT becomes
+  an Interrupt Notify Datagram of its lines, without the state the
+  event carries (`ASSUMPTIONS.md`). Get Interrupt Config is refused as
+  not supported, and the reserved commands as invalid, with nothing
+  sent;
 - the channel header bytes, which LSTP lacks: every channel reads as
   healthy, enabled and with a valid configuration. An I2C bus
   recovery request would be sent as the LSTP bus recovery command;
   nothing sends one, as the I2C driver offers no bus recovery.
 
 The channel limits are the packet size less the header, plus what the
-OBMF-ICP form of the type adds. SPI, GPIO and IPMI channels get a
-record but no translation and no device yet. Channels of other LSTP
+OBMF-ICP form of the type adds. SPI and IPMI channels get a record
+but no translation and no device yet. Channels of other LSTP
 types (vendor, OEM or reserved) are left out with a warning. LSTP
 devices give no PCI-SIG vendor ID, so the core records 0 for it.
 
@@ -477,8 +572,10 @@ answers once the device is stopped.
 requests fail at once with `-ENODEV`, and then the function devices
 are removed.
 
-**Module unload.** `i2c-obmf.ko` and `obmf_tty.ko` use symbols of
-`obmf.ko`, so they are unloaded first; each unbinds its devices.
+**Module unload.** `i2c-obmf.ko`, `obmf_tty.ko` and `gpio-obmf.ko` use
+symbols of `obmf.ko`, so they are unloaded first; each unbinds its
+devices. A GPIO line that a consumer holds keeps `gpio-obmf.ko` in
+use until it is released.
 Unloading `obmf.ko` then unbinds every interface the software way,
 and waits for the device-link releases that the removed function
 devices queued, so that none runs after the module is gone. An open
@@ -544,9 +641,10 @@ The interface directory also has `events/`, one file per event of
 `in_clear_halt_failed`, `out_clear_halt_failed`, `no_response`,
 `device_error`, `bad_response`, `rx_short`, `rx_size_over_transfer`,
 `rx_trailing_bytes`, `rx_unknown_channel`, `bad_device_request`,
-`answer_not_sent`, `channel_health`, `device_request_queue_full` and
-`tx_dropped`. Each counts the events of the interface, also those the
-rate limit kept out of the log.
+`answer_not_sent`, `channel_health`, `device_request_queue_full`,
+`tx_dropped`, `gpio_set_failed`, `gpio_irq_config_failed` and
+`gpio_irq_unused`. Each counts the events of the interface, also those
+the rate limit kept out of the log.
 
 Each serial port has a directory `obmf_tty/<tty>/` (for example
 `obmf_tty/ttyOBMF0/`) with `tx_dropped`, the characters dropped after

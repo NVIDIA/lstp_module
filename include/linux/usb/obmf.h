@@ -92,6 +92,48 @@
 #define OBMF_CH_CONTROL_LOCK_REQ BIT(3)
 #define OBMF_CH_CONTROL_CLEAR_ERROR BIT(4)
 
+/* OBMF-ICP 1.0.0, 5.4.1, Table 18: GPIO commands and entries */
+#define OBMF_GPIO_GET_VALUES 0
+#define OBMF_GPIO_SET_VALUES 1
+#define OBMF_GPIO_SET_INTERRUPT_CONFIG 3
+#define OBMF_GPIO_INTERRUPT_NOTIFY 4
+#define OBMF_GPIO_INTERRUPT_NOTIFY_DATAGRAM 5
+#define OBMF_GPIO_INDEX GENMASK(11, 0)
+#define OBMF_GPIO_DATA GENMASK(15, 12)
+
+/* OBMF-ICP 1.0.0, 5.4.1, Table 18: the data of Set Interrupt Config */
+#define OBMF_GPIO_IRQ_DISABLE 0
+#define OBMF_GPIO_IRQ_LEVEL_LOW 1
+#define OBMF_GPIO_IRQ_LEVEL_HIGH 2
+#define OBMF_GPIO_IRQ_RISING 3
+#define OBMF_GPIO_IRQ_FALLING 4
+#define OBMF_GPIO_IRQ_BOTH 5
+
+/* OBMF-ICP 1.0.0, 5.15.2, Table 76: GPIO_COUNT, then the entries */
+#define OBMF_GPIO_COUNT_LEN 2
+#define OBMF_GPIO_LINES 4096
+
+/* OBMF-ICP 1.0.0, 5.15.2, Table 77 after the index */
+struct obmf_gpio_line_cfg {
+	u8 name[32];
+	u8 direction;
+	u8 default_output;
+	u8 drive;
+	u8 persist;
+	u8 bias;
+	__le16 bias_strength;
+	__le16 drive_strength;
+	__le16 slew_rate;
+	__le16 debounce;
+} __packed;
+
+/* OBMF-ICP 1.0.0, 5.15.2, Table 77 */
+struct obmf_gpio_cfg_entry {
+	__le16 index;
+	struct obmf_gpio_line_cfg line;
+	u8 reserved[3];
+} __packed;
+
 #define OBMF_DEFAULT_TIMEOUT_MS 1000
 #define OBMF_MAX_TIMEOUT_MS 10000
 
@@ -100,9 +142,13 @@ struct obmf_channel;
 /**
  * struct obmf_channel_quirks - what the device does on a channel beyond
  *	its configuration, for the function driver to adapt to
+ * @gpio_per_get: GPIO lines one Get Values can carry, 0 if none fits
+ * @gpio_per_set: GPIO lines one Set Values can carry, 0 if none fits
  * @i2c_dev_retries: the device retries a lost I2C arbitration itself
  */
 struct obmf_channel_quirks {
+	u16 gpio_per_get;
+	u16 gpio_per_set;
 	bool i2c_dev_retries;
 };
 
@@ -191,6 +237,7 @@ int devm_obmf_publish(struct obmf_fdev *fdev, const struct obmf_fdev_ops *ops);
 
 void obmf_fdev_label(struct obmf_fdev *fdev, char *buf, size_t size);
 void obmf_fdev_protocol_error(struct obmf_fdev *fdev);
+void obmf_fdev_bad_request(struct obmf_fdev *fdev, size_t len);
 int obmf_fdev_errno(struct obmf_fdev *fdev);
 
 /*
@@ -216,11 +263,15 @@ enum obmf_event {
 	OBMF_EV_QUEUE_FULL,
 	OBMF_EV_FDEV_FIRST,
 	OBMF_EV_TX_DROPPED = OBMF_EV_FDEV_FIRST,
+	OBMF_EV_GPIO_SET,
+	OBMF_EV_GPIO_IRQ,
+	OBMF_EV_GPIO_IRQ_UNUSED,
 	OBMF_EV_NR,
 };
 
 void __obmf_fdev_report(struct obmf_fdev *fdev, enum obmf_event ev, long a,
 			long b, struct ratelimit_state *rs, const char *func);
+void obmf_fdev_count(struct obmf_fdev *fdev, enum obmf_event ev);
 
 /*
  * Counts @ev, then logs it on @fdev: at most DEFAULT_RATELIMIT_BURST

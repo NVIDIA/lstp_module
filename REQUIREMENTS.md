@@ -14,15 +14,20 @@ it was built for. Older kernels are not supported yet.
 older than v7.3. The out-of-tree `Kbuild` includes it in every file.
 It defines the newer helpers the code uses (allocation helpers, the
 scoped firmware node walk, the symbol namespace macros of 6.12, the
-default workqueue name, a tty driver flag) when the kernel lacks
-them, and is empty on a kernel that has them all. `Kbuild` also
-checks the kernel headers for two of them. In a kernel tree the
+default workqueue name, a tty driver flag, and for the GPIO driver
+the older form of the set callbacks and, below 6.15, the check of the
+line mask on request) when the kernel lacks them, and is empty on a
+kernel that has them all. `Kbuild` checks the kernel headers, or for
+the GPIO line mask the kernel version, for four of them. In a kernel tree the
 header is not used.
 
 ## Kernel configuration
 
 The kernel needs `CONFIG_USB` and `CONFIG_AUXILIARY_BUS=y`. The I2C
-driver needs `CONFIG_I2C`, and the serial driver the tty layer.
+driver needs `CONFIG_I2C`, the serial driver the tty layer, and the
+GPIO driver `CONFIG_GPIOLIB` with `CONFIG_GPIOLIB_IRQCHIP`; out of
+tree, `gpio-obmf.ko` is built only against a kernel that has
+`CONFIG_GPIOLIB_IRQCHIP`.
 `CONFIG_DEBUG_FS` gives the counters, `CONFIG_DYNAMIC_DEBUG` the debug
 messages at run time, and `CONFIG_FAULT_INJECTION_DEBUG_FS` the
 transfer fault injection.
@@ -43,10 +48,11 @@ support), `OBMF_KUNIT_TEST=y` (which needs a kernel with
 `CONFIG_KUNIT` and `CONFIG_DTC`, and with `OBMF_LSTP=y` adds the LSTP
 suite), and `OBMF_DEBUG=y`, which builds every file with `DEBUG`.
 
-The I2C and serial drivers have no Kconfig entries yet. Their KUnit
-cases are built only when the driver is built into the kernel
-(`CONFIG_I2C_OBMF=y`, `CONFIG_OBMF_TTY=y`, the names the entries will
-have), so an out-of-tree KUnit build has none of them. The serial
+The I2C, serial and GPIO drivers have no Kconfig entries yet. Their
+KUnit cases are built only when the driver is built into the kernel
+(`CONFIG_I2C_OBMF=y`, `CONFIG_OBMF_TTY=y`, `CONFIG_GPIO_OBMF=y`, the
+names the entries will have), so an out-of-tree KUnit build has none
+of them. The serial
 cases that check the kernel log read it from the console tracepoint:
 they need `CONFIG_PRINTK` and tracepoints (`.kunitconfig` sets
 `CONFIG_FTRACE=y`) and are skipped without them.
@@ -124,7 +130,8 @@ Channel 0 (OBMF-ICP 1.0.0, 5.15):
 Per channel:
 
 - payload limits large enough for the type's head: at least 3 bytes
-  for serial, 4 for I2C;
+  for serial and for GPIO (one line in a request and in a response),
+  4 for I2C;
 - I2C controller: the configuration data of Table 79, with the bus
   speed index; the bus recovery option is not used: the driver
   registers no bus recovery and writes no CHANNEL-SPECIFIC CONTROL
@@ -135,7 +142,12 @@ Per channel:
   Data bits outside 5 to 8, stop bits other than 1 or 2, or a parity
   code above 4 give a tty at 8N1, with the warning "unsupported line
   <data bits><parity><stop bits>, using 8N1"; the device keeps running
-  its line as it is.
+  its line as it is;
+- GPIO: the configuration data of Tables 76 and 77: GPIO_COUNT of at
+  most 4096, and one entry per line with an index listed once and no
+  reserved bits set; a line whose direction, default output, drive or
+  bias is out of range is left out. The GPIO driver serves channels
+  whose DEVICE_ROLE is producer (the device owns the lines).
 
 ### Serial channels
 
@@ -153,12 +165,13 @@ The serial driver expects this of a device:
   twice the characters' time on the wire at ten bits a character.
   Without an answer in time the host sends the same characters again
   10 ms later, after waiting up to 1000 ms for the late answer; each
-  timeout, or timeout status, doubles the default part of the wait
-  for the next answers, up to 10 s in all, until the port is opened
-  again. A device that answers later than that, or that took
-  characters it answers with a timeout status, gets them twice, and
-  the late answer is taken as the answer to the next try
-  (`ASSUMPTIONS.md`).
+  timeout with no answer doubles the default part of the wait for the
+  next answers, up to 10 s in all, until the port is opened again. A
+  timeout status is an answer in time: the characters are sent again,
+  and the wait stays as it is. A device that answers later than the
+  wait and the 1000 ms after it, or that took characters it answers
+  with a timeout status, gets them twice, and the late answer is
+  taken as the answer to the next try (`ASSUMPTIONS.md`).
 - Generate a complete break for each Generate Break request; there is
   no "break off" request.
 - Keep a device write that the host refuses, and send it again later.
@@ -172,6 +185,35 @@ The serial driver expects this of a device:
   none of them until the write is taken.
 - Set the overrun event only for characters lost on their way to the
   host; Carrier Down hangs the tty up unless `CLOCAL` is set.
+
+### GPIO channels
+
+The GPIO driver expects this of a device:
+
+- Keep each line's direction as its configuration gives it; the host
+  never asks to change it, and drives only outputs.
+- Answer Get Values (5.4.1, Table 19) with the echo and one entry for
+  each line asked, in any order, each with data 0 or 1. The host asks
+  only for inputs: an output reads the value last set, from its
+  default output on.
+- Answer Set Values with the echo when it set every line, and with an
+  error status otherwise; the host then keeps the values set before
+  (`ASSUMPTIONS.md`). A Set with more lines than one message carries
+  is split, and stops at the first message that fails.
+- Answer Set Interrupt Config (Table 17) with success only for a line
+  whose edges it will report, and with an error status otherwise. The host asks for rising,
+  falling or both edges, or disable; it never asks for a level.
+- Report the edges with an Interrupt Notify or an Interrupt Notify
+  Datagram (Table 18) that lists each line that saw its edge, with
+  data 0; send nothing for a line after a disable was answered. The
+  host answers a Notify before it runs the handlers, and a handler may
+  read lines then, so the device must answer GPIO requests while it
+  waits for the next answer. One bad entry makes the host refuse the
+  whole request, and a Notify is then answered invalid.
+- Send no other GPIO request: the host answers the other commands
+  invalid.
+
+GPIO interrupts were tested with unit-test fakes only.
 
 ## Device requirements: LSTP
 
@@ -190,28 +232,34 @@ out. A channel may end at most 683 slices short, and a discovery pass
 at most 5461; past either, the channel is left out with "over
 budget".
 
-I2C and UART channels get function devices. An I2C configuration
+I2C, UART and GPIO channels get function devices. An I2C configuration
 needs at least its first byte, the speed; the fields it lacks read as
 0. The UART configuration starts with the bytes of OBMF-ICP Table 78,
 needs at least those 7, and follows the serial rules above: the host
 sends a write again that the device answers `LSTP_NACK` (0x04),
 `LSTP_BUSY` (0x03) or `LSTP_TIMEOUT` (0x02), and drops one answered
 with another error status. The host refuses a device write with
-`LSTP_NACK`.
+`LSTP_NACK`. A GPIO table (LSTP 1.0, 4.3.1) gives the lines, a line's
+index its position across the table's blocks; an output with LED
+support is left out of the GPIO chip. GET_VALUE is answered with the
+states in the order of the request. SET_IRQ_CONFIG carries one line;
+an IRQ_EVENT lists lines whose offsets fit 12 bits, each with a state
+of 0 or 1, which the host checks and does not use.
 
 ## Describing function devices: device tree, ACPI, software nodes
 
 A firmware node is optional. Without one, an I2C channel still gets
 its adapter, and clients can be added from user space; a serial
-channel still gets its tty. A node gives the I2C clients on the
-channel's bus, a `clock-frequency` to check, properties a udev rule
-can read for a serial port, or a way to leave a channel unused. I2C
-controller and serial channels are looked up.
+channel still gets its tty, and a GPIO channel its GPIO chip. A node
+gives the I2C clients on the channel's bus, a `clock-frequency` to
+check, properties a udev rule can read for a serial port, the GPIO
+chip's node for consumers of its lines, or a way to leave a channel
+unused. I2C controller, serial and GPIO channels are looked up.
 
 The node of a channel is a child of the USB interface's node. On
 device tree and with software nodes, it is the child named `i2c` for
-an I2C channel or `serial` for a serial channel (the name before any
-`@`) whose `reg` is the channel number. A child with that `reg` and
+an I2C channel, `serial` for a serial channel or `gpio` for a GPIO
+channel (the name before any `@`) whose `reg` is the channel number. A child with that `reg` and
 another name is ignored with the warning
 "channel <n>: node <name> ignored", where `<name>` is the node's name
 with its unit address, for example `spi@1`. On ACPI, it is the child
@@ -227,6 +275,15 @@ A serial channel's node belongs to its function device,
 no node of its own. The port is not registered through serdev, so a
 device described below a serial node (a Bluetooth or GNSS chip, for
 example) is not bound; user space can still open the tty.
+
+A GPIO channel's node belongs to its function device, `obmf.gpio.<id>`,
+which is the GPIO chip's parent, so the chip takes that node as any
+GPIO chip takes its own: consumers refer to its lines through it, and
+`gpio-line-names` in it replaces the names the device gives. A
+consumer that takes a line as an interrupt from device tree needs the
+node to be an interrupt controller with two cells (the line and the
+edge). Only the match of the node to the function device is tested
+(KUnit); consumers through a node are not tested yet.
 
 If an I2C channel's node has `clock-frequency`, it must equal the bus
 speed in the channel's configuration; otherwise the I2C probe fails with
@@ -363,9 +420,9 @@ object, with `_ADR` 1, 2, and so on. An interface object with `_ADR`
 ### Software nodes
 
 A platform driver or a board file can attach software nodes to the
-interface. The rules are those of device tree: a child named `i2c`
-or `serial` with a `reg` property equal to the channel number, and
-the I2C clients below an `i2c` child.
+interface. The rules are those of device tree: a child named `i2c`,
+`serial` or `gpio` with a `reg` property equal to the channel number,
+and the I2C clients below an `i2c` child.
 
 ## Interfaces to the kernel and user space
 
@@ -377,7 +434,7 @@ On the USB interface:
   (`ARCHITECTURE.md`, "Counters").
 
 On the auxiliary bus, one device per function channel, named
-`obmf.i2c.<id>` or `obmf.serial.<id>` in
+`obmf.i2c.<id>`, `obmf.serial.<id>` or `obmf.gpio.<id>` in
 `/sys/bus/auxiliary/devices/`, each with:
 
 - `name`: the channel name (CHANNEL_NAME, Table 65);
@@ -403,3 +460,15 @@ transport failure the tty is hung up and an open fails with `EIO`
 until the interface is bound again. In debugfs,
 `obmf_tty/<tty>/tx_dropped` and `tx_stalls` count the characters the
 port dropped and its stall lines.
+
+GPIO: a GPIO chip, a child of the auxiliary device, labelled
+`<device name>_<channel name>`, with one line per GPIO_INDEX up to the
+highest the configuration lists; the indices it does not list are
+holes. Line names are GPIO_NAME. Each line keeps the direction the
+device gives; a request for the other one fails with `EINVAL`. Reading
+an output gives the value last set. Inputs give edge interrupts
+(rising, falling, both); level types fail with `EINVAL`. No drive or
+bias can be set (`KNOWN-ISSUES.md`). The interface's `events/` counts
+failed Sets (`gpio_set_failed`), refused interrupt configurations
+(`gpio_irq_config_failed`) and interrupt events for lines with no
+interrupt set up (`gpio_irq_unused`).

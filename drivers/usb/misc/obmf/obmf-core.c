@@ -373,6 +373,19 @@ void obmf_report_log(struct device *dev, enum obmf_event ev, int ch, long a,
 	case OBMF_EV_TX_DROPPED:
 		dev_warn(dev, "dropped %ld bytes: %pe\n", a, ERR_PTR(b));
 		break;
+	case OBMF_EV_GPIO_SET:
+		if (a < 0)
+			dev_err(dev, "cannot set lines: %pe\n", ERR_PTR(b));
+		else
+			dev_err(dev, "cannot set line %ld: %pe\n", a,
+				ERR_PTR(b));
+		break;
+	case OBMF_EV_GPIO_IRQ:
+		dev_err(dev,
+			"cannot configure the interrupt of line %ld: %pe\n", a,
+			ERR_PTR(b));
+		break;
+	case OBMF_EV_GPIO_IRQ_UNUSED:
 	case OBMF_EV_NR:
 		break;
 	}
@@ -771,10 +784,6 @@ static void obmf_rx_response(struct obmf_channel *ch, u8 status, const u8 *data,
 	complete(&slot->done);
 }
 
-/* OBMF-ICP 1.0.0, 5.4.1, Table 18 */
-#define OBMF_GPIO_INTERRUPT_NOTIFY 4
-#define OBMF_GPIO_INTERRUPT_NOTIFY_DATAGRAM 5
-
 /* OBMF-ICP 1.0.0, 5.5.2, Table 23 */
 #define OBMF_SERIAL_RESP_NACK BIT(0)
 
@@ -854,8 +863,10 @@ static int obmf_send_answer(struct obmf_channel *ch, u8 cmd, u8 status,
 
 /*
  * The answer for a device request no driver takes: a serial write is
- * refused with nothing accepted, a GPIO interrupt is acknowledged, and
- * everything else is answered busy.
+ * refused with nothing accepted, a GPIO interrupt is acknowledged, a GPIO
+ * command the device may not send is invalid (Table 16: a Producer
+ * requests interrupts only; Table 18: commands 6 to 0xff are reserved),
+ * and everything else is answered busy.
  */
 static void obmf_default_answer(struct obmf_channel *ch, u8 cmd)
 {
@@ -873,6 +884,9 @@ static void obmf_default_answer(struct obmf_channel *ch, u8 cmd)
 	case OBMF_TYPE_GPIO:
 		if (cmd == OBMF_GPIO_INTERRUPT_NOTIFY)
 			status = OBMF_STATUS_SUCCESS;
+		else if (cmd > OBMF_GPIO_INTERRUPT_NOTIFY_DATAGRAM ||
+			 ch->info.role == OBMF_ROLE_PRODUCER)
+			status = OBMF_STATUS_INVALID;
 		break;
 	}
 	obmf_ch_count(ch, OBMF_CH_DEFAULT_ANSWERS);
@@ -1107,7 +1121,8 @@ static struct obmf_dreq_rec *obmf_dreq_finish(struct obmf_channel *ch,
  * @data: response payload after the echo byte on types that echo
  * @len: length of @data
  *
- * Sleeps. Ends @dreq whether or not the answer could be sent.
+ * Sleeps. Ends @dreq whether or not the answer could be sent; called from
+ * the device_request operation, @dreq stays readable until it returns.
  */
 int obmf_respond(struct obmf_fdev *fdev, struct obmf_dreq *dreq, u8 status,
 		 const void *data, size_t len)

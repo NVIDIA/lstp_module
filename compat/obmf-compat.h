@@ -101,4 +101,30 @@
 #define TTY_DRIVER_RESET_SAVED_TERMIOS 0
 #endif
 
+/*
+ * The symbols below select a branch of an #ifdef in a driver, where an
+ * older kernel differs in a way a header cannot hide. The upstream export
+ * resolves each to its v7.3 branch, the symbol undefined.
+ *
+ * OBMF_COMPAT_GPIO_SET_VOID: gpio_chip's set() and set_multiple() return
+ * int (include/linux/gpio/driver.h:429-433 @ v7.3-rc6, from v6.17) and
+ * void before (:439-443 @ v6.12, :448-451 @ v6.16). Kbuild passes
+ * OBMF_KBUILD_GPIO_SET_VOID when the target's driver.h has the void form.
+ */
+#ifdef OBMF_KBUILD_GPIO_SET_VOID
+#define OBMF_COMPAT_GPIO_SET_VOID
+#endif
+
+/*
+ * OBMF_COMPAT_GPIO_VALID_MASK_NEEDS_REQUEST: before v6.15 gpiolib checks a
+ * line against the valid mask at request only for a chip with a request()
+ * callback (drivers/gpio/gpiolib.c:2291-2296 @ v6.12, the same in
+ * rpi-6.12.y); from v6.15 for every chip (:2385 @ v6.15, :2608 @ v7.3-rc6).
+ * No header shows it: Kbuild passes OBMF_KBUILD_GPIO_REQUEST_VALID below
+ * kernel 6.15.
+ */
+#ifdef OBMF_KBUILD_GPIO_REQUEST_VALID
+#define OBMF_COMPAT_GPIO_VALID_MASK_NEEDS_REQUEST
+#endif
+
 #endif /* __OBMF_COMPAT_H */

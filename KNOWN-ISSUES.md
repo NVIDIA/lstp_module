@@ -5,11 +5,13 @@ closes each item. The numbers are stable: please quote them in
 reports. Gaps in the numbering are items already closed, or items
 about code that is not in this drop.
 
-## KI-1: a late I2C response after a timeout can answer the next request
+## KI-1: a late response after a timeout can answer the next I2C or GPIO request
 
 - Effect: after an I2C request times out, its late response can
   complete the next request with the same command: a false ACK, or
-  data read from the earlier address. It can only happen after a
+  data read from the earlier address. On GPIO, a late Set response
+  can complete the next Set and hide its refusal, and a late Get
+  response can give stale levels. It can only happen after a
   timeout. Since drop 3 the next request after a timeout waits for the
   late response, which is dropped, or for one default timeout (1 s);
   only a response later than that can still answer it.
@@ -68,12 +70,12 @@ about code that is not in this drop.
 - Closes when: the specification settles both; then block read, with
   tests.
 
-## KI-9: only the I2C and serial function drivers exist
+## KI-9: only the I2C, serial and GPIO function drivers exist
 
-- Effect: GPIO, SPI, IPMI, memory device and the other channel types
-  are discovered and logged, but get no device. A GPIO driver is being
-  written; it is not in this drop.
-- Why: I2C and serial come first; the other types follow.
+- Effect: SPI, IPMI, memory device and the other channel types are
+  discovered and logged, but get no device. The GPIO driver is new in
+  this drop.
+- Why: I2C, serial and GPIO come first; the other types follow.
 - Closes when: each driver is added.
 
 ## KI-11: after a real stall, some devices stay stopped until replugged
@@ -114,6 +116,28 @@ about code that is not in this drop.
 - Closes when: the USB core gives interfaces their own ACPI
   companions, or such a device appears and needs another rule.
 
+## KI-17: a GPIO consumer that asks for open drain or open source cannot set the line high
+
+- Effect: a consumer that asks for a drive mode (a firmware flag such
+  as `GPIO_OPEN_DRAIN`, or `gpioset --drive`) gets `EINVAL` when it
+  sets the line high (open drain) or low (open source). Push-pull use,
+  the default, works.
+- Why: the driver has no `set_config`, so the GPIO core emulates the
+  mode by switching the line to input, and an OBMF-ICP line's
+  direction is fixed by the device.
+- Closes when: a `set_config` accepts a drive mode that matches the
+  line's own, or the limit is accepted.
+
+## KI-19: LSTP LED pins are not exposed
+
+- Effect: on an LSTP device, an output with LED support is not a GPIO
+  line, and a channel of LED pins only gives no GPIO chip. Earlier
+  LSTP drivers expose these pins as LEDs.
+- Why: LED support is not built yet; the count of pins left out is a
+  debug message only.
+- Closes when: LED support is built for LSTP with tests, or the limit
+  is accepted.
+
 ## KI-20: serial input can be lost with no kernel message
 
 - Effect: input is lost in two ways; only the second is logged, since
@@ -148,18 +172,22 @@ about code that is not in this drop.
 - Closes when: the property is a limit: the adapter runs at the
   device's speed at or below it and warns above it, with tests.
 
-## KI-22: a device timeout status on a serial write also lengthens the wait
+## KI-23: GPIO interrupts take edge triggers only; a level trigger is refused
 
-- Effect: each timeout on a serial write doubles the wait for the
-  answers after it, up to 10 s, until the port is opened again. A
-  device answer with status 0x02 (timeout) or 0x40 (line timeout)
-  does the same, though the device answered in time, so the host then
-  waits longer than needed. No characters are lost.
-- Why: both give the same error as no answer.
-- Closes when: the wait doubles only when no answer comes (planned for
-  a later drop).
-- See AS-56.
+- Effect: a GPIO input can be an interrupt with a rising, falling or
+  both-edge trigger. A level trigger is refused with `EINVAL`, so a
+  client whose firmware node asks for a level-triggered interrupt from
+  a GPIO line fails to request it and does not probe. A client
+  described with an edge trigger works.
+- Why: the specification does not say how a device notifies a level
+  that stays asserted after the host handled it.
+- Closes when: level triggers are served, with that notification rule
+  settled and with tests.
+- The interrupts were tested with unit-test fakes only: no device we
+  have raises GPIO interrupts.
 
 ## Known limits without a number yet
 
 - There are no allocation-failure tests yet.
+- No GPIO drive or bias can be set; each line works as the device
+  configures it (see KI-17).

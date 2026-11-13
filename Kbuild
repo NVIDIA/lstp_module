@@ -15,6 +15,17 @@ endif
 ifeq ($(shell grep -qw TTY_DRIVER_RESET_SAVED_TERMIOS $(srctree)/include/linux/tty_driver.h && echo y),)
 ccflags-y += -DOBMF_COMPAT_NO_RESET_SAVED_TERMIOS
 endif
+# A callback's type: for the compat header, which defines the symbol the
+# GPIO driver tests
+ifneq ($(shell grep -qE 'void\s+.[*]set[^_a-z]' $(srctree)/include/linux/gpio/driver.h && echo y),)
+ccflags-y += -DOBMF_KBUILD_GPIO_SET_VOID
+endif
+# Below 6.15 gpiolib checks the valid mask through a request() callback
+# only; a version, as no header shows it
+obmf_gpio_old := $(shell [ $(VERSION) -lt 6 ] || { [ $(VERSION) -eq 6 ] && [ $(PATCHLEVEL) -lt 15 ]; } && echo y)
+ifeq ($(obmf_gpio_old),y)
+ccflags-y += -DOBMF_KBUILD_GPIO_REQUEST_VALID
+endif
 
 # Where __acquires() is still a sparse context, sparse cannot follow
 # guard(spinlock*); newer kernels leave lock contexts to clang.
@@ -76,3 +87,10 @@ i2c-obmf-y := drivers/i2c/busses/i2c-obmf.o
 
 obj-m += obmf_tty.o
 obmf_tty-y := drivers/tty/obmf_tty.o
+
+# The GPIO driver's interrupts need the gpiolib irqchip, which a kernel
+# tree's Kconfig entry would select
+ifneq ($(CONFIG_GPIOLIB_IRQCHIP),)
+obj-m += gpio-obmf.o
+gpio-obmf-y := drivers/gpio/gpio-obmf.o
+endif

@@ -255,7 +255,8 @@ items about code or tools that are not in this drop.
   Symmetric" and then "2-255 - Reserved".
 - Options: 2 is symmetric and 3-255 reserved; or 2 is reserved.
 - This driver: gives a serial port to serial channels with role 0 or
-  2, and an I2C adapter to I2C controller channels with role 0.
+  2, and an I2C adapter to I2C controller channels and a GPIO chip to
+  GPIO channels with role 0.
 - Prerequisites: report role 0, or 2 for a symmetric serial channel;
   not 3-255.
 - If your device differs: a channel with another role is discovered
@@ -269,9 +270,12 @@ items about code or tools that are not in this drop.
   silent on it.
 - Options: no answer to a Datagram; answer it like an Interrupt
   Notify.
-- This driver: with no GPIO driver yet (KI-9), the core answers an
-  Interrupt Notify (command 4) with status 0x00 on bulk OUT and sends
-  nothing for a Datagram (command 5).
+- This driver: answers an Interrupt Notify (command 4) on bulk OUT,
+  with status 0x00, or with the invalid status for one with a bad
+  entry, and sends nothing for a Datagram (command 5). The GPIO driver
+  answers a Notify before it runs the handlers; with no GPIO driver
+  bound, the core answers it with status 0x00. An LSTP IRQ_EVENT,
+  which has no answer, is taken as a Datagram.
 - Prerequisites: expect no answer to command 5; send GPIO events on
   bulk IN, since this driver reads no interrupt IN endpoint.
 - If your device differs: a device that waits for an answer to a
@@ -509,9 +513,10 @@ items about code or tools that are not in this drop.
   the characters' time on the wire at ten bits a character, and cuts
   each request so that the wait fits 10 s. A write that gets no answer
   in time is kept and sent again 10 ms later, with one "transmit
-  stalled" line after 5 s. Each timeout doubles the default part of
-  the wait for the answers after it, up to 10 s in all, until the port
-  is opened again (AS-56). On LSTP, a device write the host cannot
+  stalled" line after 5 s. Each timeout with no answer doubles the
+  default part of the wait for the answers after it, up to 10 s in
+  all, until the port is opened again (AS-56); a timeout status does
+  not. On LSTP, a device write the host cannot
   decode, too large or with an unknown command, is answered 0x06
   (`LSTP_NOT_SUPP`), not 0x07 (`LSTP_TOO_LARGE`).
 - Prerequisites: answer each serial write at once: accept what you can
@@ -542,6 +547,170 @@ items about code or tools that are not in this drop.
   one request outstanding may match the invalid answer to a later
   request.
 - Closes when: the specification defines the retry rule.
+
+## AS-31: a device need not answer a read of an output line with its level
+
+- Specification: OBMF-ICP 1.0.0, Table 17, lists a read of an output
+  ("Read on OUT") as an invalid operation; whether a device may still
+  return the level is not said. LSTP 1.0 does not say either.
+- Options: outputs not readable: the host keeps the value last set;
+  outputs readable; one read of the outputs at bind to find out.
+- This driver: never reads an output line from the device, on either
+  protocol: a read of an output gives the value last set, from the
+  line's default output at bind.
+- Prerequisites: drive each output only as the host sets it, from its
+  default output on.
+- If your device differs: a persisted output (GPIO_OUTPUT_PERSIST_STATE
+  1) reads its default, not its level, until the first Set after the
+  bind; an output the device changes on its own reads the value last
+  set.
+- Closes when: the specification says whether outputs are readable.
+
+## AS-32: a device answers a GPIO read with one entry per requested index
+
+- Specification: OBMF-ICP 1.0.0, Table 19, gives no order for the
+  entries of a Get Values response.
+- Options: match each entry by its index, each index once; take the
+  entries in the order of the request.
+- This driver: matches each entry of an OBMF-ICP response by its
+  index; on LSTP, GET_VALUE answers in the order of the request.
+- Prerequisites: return exactly one entry for each line asked, with
+  data 0 or 1.
+- If your device differs: a response with a missing, repeated or
+  unknown index, or data above 1, fails the read with `EPROTO` and is
+  counted as a protocol error.
+- Closes when: the specification gives the order.
+
+## AS-33: a device sends no GPIO interrupt events while no interrupt is configured
+
+- Specification: neither OBMF-ICP 1.0.0 nor LSTP 1.0 says which
+  interrupt configuration a line has before the host sets one.
+- Options: none, so no events until the host configures a line; some.
+- This driver: sets a line's interrupt only while a consumer holds it
+  enabled, and runs the line's handler only then. An event for any
+  other line is counted in `events/gpio_irq_unused`, with no log line,
+  and dropped; an Interrupt Notify is still answered.
+- Prerequisites: send no interrupt event for a line whose interrupt
+  was never configured.
+- If your device differs: the counter grows; no line is affected.
+- Closes when: the specification says what a line's interrupt
+  configuration is before the host sets one.
+
+## AS-34: a failed multi-line GPIO Set may have applied some entries
+
+- Specification: neither OBMF-ICP 1.0.0 nor LSTP 1.0 says what a
+  failed Set Values applied.
+- Options: none of its entries; any prefix of them.
+- This driver: cannot tell, so it keeps the values set before for
+  every line of a Set message the device refuses, reads nothing back,
+  and reports the failure ("cannot set line <n>: <errno>" or "cannot
+  set lines: <errno>", counted in `events/gpio_set_failed`). A Set
+  split over several messages stops at the first refused one; the
+  messages before it stay set.
+- Prerequisites: apply all entries of a Set Values message or none.
+- If your device differs: after a refused Set an output can be at a
+  level the driver does not know: reads give the value set before,
+  until the line is set again.
+- Closes when: the specification says what a failed Set applies.
+
+## AS-36: an LSTP line with a Z default starts at its released level
+
+- Specification: LSTP 1.0, 4.3.1.2, allows a Z default output, which
+  OBMF-ICP does not have; its level depends on the board.
+- Options: the released level; leave the line out; refuse the channel.
+- This driver: an open-drain output with a Z default starts high, an
+  open-source one low; a push-pull output with Z stays an output and
+  starts low.
+- Prerequisites: use Z only on lines whose released level is the
+  board's pull.
+- If your device differs: the line reads a wrong level until it is
+  set; nothing is driven because of it.
+- Closes when: the LSTP specification gives the level of Z.
+
+## AS-37: a cut LSTP GPIO table keeps its whole entries
+
+- Specification: discovery can end an LSTP GPIO table early, at the
+  READ_CONFIG range or on an error status after the first slice
+  (`REQUIREMENTS.md`, "Device requirements: LSTP").
+- Options: keep the whole entries; refuse the channel.
+- This driver: keeps the whole lines and leaves a partial one out,
+  with "channel <n>: GPIO table cut in line <m>".
+- Prerequisites: keep the GPIO table within the READ_CONFIG range and
+  answer every slice of it.
+- If your device differs: the lines past the cut are missing; the log
+  has one warning.
+- Closes when: every device's GPIO table is shown to fit and to be read
+  whole.
+
+## AS-38: an LSTP GPIO table ends after 255 blocks or with its data
+
+- Specification: LSTP 1.0, 4.3.1.4, gives the limit of 255 blocks but
+  no end marker, and nothing on what may follow.
+- Options: read up to 255 blocks or to the end of the data; a block
+  with count 0 ends the table.
+- This driver: reads up to 255 blocks; a block with count 0 adds no
+  line; bytes after the 255th block are ignored with "channel <n>: <k>
+  bytes after 255 GPIO blocks ignored".
+- Prerequisites: send no data after the GPIO table.
+- If your device differs: a warning; no line is added.
+- Closes when: the LSTP specification says how a table ends.
+
+## AS-39: an LSTP GPIO channel always sends its first block count
+
+- Specification: LSTP 1.0 does not say whether a GPIO channel may have
+  an empty configuration.
+- Options: leave the channel out; keep a channel with no lines.
+- This driver: leaves a GPIO channel with an empty configuration out.
+- Prerequisites: send at least the first block count for every GPIO
+  channel.
+- If your device differs: a GPIO channel with no lines gets no device;
+  nothing else changes.
+- Closes when: the LSTP specification says how a channel with no lines
+  is described.
+
+## AS-40: an LSTP GPIO error response carries no data the host needs
+
+- Specification: LSTP 1.0 does not say whether an error response may
+  carry data.
+- Options: ignore the data; take the response as malformed.
+- This driver: ignores data after an error status and reports the
+  status.
+- Prerequisites: put nothing the host needs after an error status.
+- If your device differs: what a device puts after an error status is
+  lost; the error itself is reported.
+- Closes when: the LSTP specification says what an error response
+  holds.
+
+## AS-41: LSTP GPIO names are UTF-8 and persist states are 0 or 1
+
+- Specification: LSTP 1.0 gives no encoding for GPIO names and no range
+  for the persist state.
+- Options: copy both as sent; check them and leave the line out.
+- This driver: copies both as sent; the GPIO driver gives no name to a
+  line whose name holds a control character.
+- Prerequisites: send UTF-8 names, NUL-padded, and a persist state of
+  0 or 1.
+- If your device differs: a line's name shows odd characters, is cut
+  at 32 bytes or is missing; a persist state above 1 is not used by
+  the host.
+- Closes when: the LSTP specification gives the name encoding and the
+  persist range.
+
+## AS-42: the host sends no GPIO request with an interrupt or reserved command other than Set Interrupt Config
+
+- Specification: neither OBMF-ICP 1.0.0 nor LSTP 1.0 says which error
+  a host request with a GPIO interrupt or reserved command gets when
+  the dialect cannot carry it.
+- Options: not supported for commands 2 to 5 and invalid for 6 and up;
+  invalid for 4 and up.
+- This driver: the GPIO driver sends Get Values, Set Values and Set
+  Interrupt Config only. On LSTP, Set Interrupt Config becomes
+  SET_IRQ_CONFIG; Get Interrupt Config and commands 4 and 5 fail with
+  `EOPNOTSUPP`, and commands 6 and up with `EINVAL`, before anything is
+  sent.
+- Prerequisites: none (host side only).
+- If your device differs: no request reaches the device either way.
+- Closes when: the specification sets the errors.
 
 ## AS-44: a board description puts no devices below a serial channel's node
 
@@ -628,10 +797,11 @@ items about code or tools that are not in this drop.
   (Table 4) or the line timeout 0x40 (Table 21), and sends them again
   10 ms later. Since drop 3 the next try waits up to one default
   timeout (1000 ms) for the late answer, which is dropped, and each
-  timeout doubles the wait of the tries after it, up to 10 s, until
-  the port is opened again: a device slower than the default timeout
-  gets one repeat per open, not one per write. An answer later than
-  that is taken by the next try as its own.
+  timeout with no answer doubles the wait of the tries after it, up to
+  10 s, until the port is opened again: a device slower than the
+  default timeout gets one repeat per open, not one per write. Since
+  drop 4 a timeout status does not double the wait. An answer later
+  than that is taken by the next try as its own.
 - Prerequisites: a device that answers late did not take the
   characters, or a repeat is harmless on its line; its late answer
   accepts what the try it answers carried.
@@ -755,8 +925,9 @@ items about code or tools that are not in this drop.
   answer.
 - Options: cap the growing serial wait at the core's 10 s limit; a
   longer cap for serial channels.
-- This driver: each timeout doubles the serial wait, up to 10 s for
-  the wait and the wire time together, until the port is opened again.
+- This driver: each timeout with no answer doubles the serial wait,
+  up to 10 s for the wait and the wire time together, until the port
+  is opened again; a timeout status leaves it as it is.
 - Prerequisites: answer every serial write within 10 s.
 - If your device differs: every write times out at the cap and is
   sent again, and the port logs a "transmit stalled" line for each
@@ -788,7 +959,8 @@ items about code or tools that are not in this drop.
 - Options: double the serial wait after each timeout until the port
   is opened again; keep a fixed wait.
 - This driver: doubles the wait for the next answers after each
-  timeout, up to 10 s.
+  timeout with no answer, up to 10 s; an answer with a timeout status
+  came in time and leaves the wait as it is.
 - Prerequisites: a device that missed one answer is slow on the next
   as well, or the longer wait costs little on its line.
 - If your device differs: after lost answers the host tries less and
@@ -837,3 +1009,101 @@ items about code or tools that are not in this drop.
 - If your board differs: a lookup by name finds one of the two
   adapters, so a tool can talk to the wrong device.
 - Closes when: a board needs unique names.
+
+## AS-62: a Set Interrupt Config the device refuses leaves the interrupt off until the next change
+
+- Specification: OBMF-ICP 1.0.0, Table 17, lets a device refuse a Set
+  Interrupt Config; the kernel sends the configuration after the
+  consumer's call has returned, so the refusal cannot reach the
+  consumer.
+- Options: report it, count it, leave the interrupt off and try again
+  at the next change; refuse at request time, from a per-line
+  capability the device does not describe.
+- This driver: logs "cannot configure the interrupt of line <n>:
+  <errno>", counts `events/gpio_irq_config_failed`, and leaves the
+  interrupt off: the line's events are counted in
+  `events/gpio_irq_unused`. The next change of the line's interrupt
+  sends the configuration again.
+- Prerequisites: answer success only for a line whose edges you will
+  report.
+- If your device differs: a consumer waits for edges that never come;
+  the log line and the counter show it.
+- Closes when: the specification says how a device tells which lines
+  can interrupt.
+
+## AS-63: a device sends one interrupt entry per edge and none after a disable
+
+- Specification: OBMF-ICP 1.0.0, Table 18, does not say whether two
+  edges between notifications give one entry or two, or whether a
+  notification may follow a disable.
+- Options: one handler run per entry, entries for lines without an
+  interrupt counted and dropped; a read of the line on every entry.
+- This driver: runs the handler of a line with its interrupt enabled
+  once for each entry; counts the other entries in
+  `events/gpio_irq_unused`.
+- Prerequisites: send one entry per edge, or merge close edges into
+  one; send nothing for a line after a disable is answered.
+- If your device differs: a handler runs more or less often than edges
+  came; a consumer that reads the line still sees its level.
+- Closes when: the specification answers both points.
+
+## AS-64: a device keeps a line's interrupt configuration until the host changes it
+
+- Specification: OBMF-ICP 1.0.0 does not say whether a device keeps a
+  GPIO line's interrupt configuration across a reset.
+- Options: send it on change only; send every enabled line's
+  configuration again after the device comes back.
+- This driver: sends Set Interrupt Config only when the trigger differs
+  from the last one the device took.
+- Prerequisites: keep each line's interrupt configuration while the
+  interface stays bound.
+- If your device differs: after the device loses the configuration,
+  the line gives no more interrupts, with no log line, until a
+  consumer changes the line's interrupt.
+- Closes when: the specification says what a reset clears.
+
+## AS-65: the state of an LSTP interrupt event is not used
+
+- Specification: LSTP 1.0, 4.3.2, gives a state with each line of an
+  IRQ_EVENT and does not say what it means.
+- Options: check it and drop it; pass it on as a level, which no
+  OBMF-ICP field holds.
+- This driver: an event with a state above 1 is malformed and dropped;
+  otherwise it becomes an Interrupt Notify Datagram of the lines,
+  without the states.
+- Prerequisites: none on the device; a consumer that needs the level
+  reads the line.
+- If your device differs: a consumer that reads the line after a short
+  pulse sees the level after it; the edge is still delivered.
+- Closes when: the LSTP specification says what the state means.
+
+## AS-66: a device may send the next GPIO notification before the handlers finish
+
+- Specification: OBMF-ICP 1.0.0, Table 18, does not say whether a
+  device waits for the host's handlers before its next notification.
+- Options: answer first and queue the next; answer after the handlers,
+  which would block a handler that reads a line.
+- This driver: answers an Interrupt Notify before the handlers run;
+  the core holds up to 16 device requests per channel and refuses one
+  more, with "channel <n>: device request queue full, request refused"
+  (or "request dropped" for a Datagram).
+- Prerequisites: send no more notifications than the queue holds while
+  the handlers run, or merge edges.
+- If your device differs: later notifications of a burst are lost,
+  with that line and the channel's `dreq_max_depth` in debugfs.
+- Closes when: a device with GPIO interrupts is run under a burst of
+  edges.
+
+## AS-67: two devices' GPIO chips can have the same label
+
+- Specification: none; the GPIO core does not require unique chip
+  labels, and a GPIO lookup table names its chip by label.
+- Options: "<device name>_<channel name>"; add the USB path to the
+  label.
+- This driver: labels each chip "<device name>_<channel name>", from
+  the names the device reports, as it names the I2C adapters (AS-61).
+- Prerequisites: on a board with two identical devices, describe GPIO
+  consumers through firmware nodes, not lookup tables.
+- If your board differs: a lookup by label finds one of the two chips,
+  so a consumer can drive the other device's line.
+- Closes when: a board needs unique labels.

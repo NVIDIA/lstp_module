@@ -29,6 +29,7 @@ struct obmf_fdev_type {
 };
 
 static const struct obmf_fdev_type obmf_fdev_types[] = {
+	{ OBMF_TYPE_GPIO, OBMF_ROLE_PRODUCER, "gpio", "gpio" },
 	{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c", "i2c" },
 	{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "serial", "serial" },
 	{ OBMF_TYPE_SERIAL, OBMF_ROLE_SYMMETRIC, "serial", "serial" },
@@ -439,6 +440,21 @@ void __obmf_fdev_report(struct obmf_fdev *fdev, enum obmf_event ev, long a,
 EXPORT_SYMBOL_NS_GPL(__obmf_fdev_report, "OBMF");
 
 /**
+ * obmf_fdev_count - count an event that has no log line
+ * @fdev: the function device
+ * @ev: the event, from OBMF_EV_FDEV_FIRST on
+ *
+ * Any context.
+ */
+void obmf_fdev_count(struct obmf_fdev *fdev, enum obmf_event ev)
+{
+	if (WARN_ON_ONCE(ev < OBMF_EV_FDEV_FIRST || ev >= OBMF_EV_NR))
+		return;
+	atomic_long_inc(&fdev->ch->core->events[ev]);
+}
+EXPORT_SYMBOL_NS_GPL(obmf_fdev_count, "OBMF");
+
+/**
  * obmf_fdev_protocol_error - count a malformed message a driver found
  * @fdev: the function device
  */
@@ -451,6 +467,23 @@ void obmf_fdev_protocol_error(struct obmf_fdev *fdev)
 		    ch->info.number, -1, 0);
 }
 EXPORT_SYMBOL_NS_GPL(obmf_fdev_protocol_error, "OBMF");
+
+/**
+ * obmf_fdev_bad_request - count a malformed device request a driver found
+ * @fdev: the function device
+ * @len: its payload length, the command byte included
+ *
+ * Counted and logged as the device requests the core cannot decode.
+ */
+void obmf_fdev_bad_request(struct obmf_fdev *fdev, size_t len)
+{
+	struct obmf_channel *ch = fdev->ch;
+
+	obmf_count(ch->core, OBMF_IF_RX_MALFORMED);
+	obmf_report(ch->core, &fdev->adev.dev, OBMF_EV_BAD_DREQ,
+		    ch->info.number, len, 0);
+}
+EXPORT_SYMBOL_NS_GPL(obmf_fdev_bad_request, "OBMF");
 
 static struct dentry *obmf_debugfs_root;
 
@@ -499,6 +532,9 @@ static const char *const obmf_ev_names[OBMF_EV_NR] = {
 	[OBMF_EV_CH_HEALTH] = "channel_health",
 	[OBMF_EV_QUEUE_FULL] = "device_request_queue_full",
 	[OBMF_EV_TX_DROPPED] = "tx_dropped",
+	[OBMF_EV_GPIO_SET] = "gpio_set_failed",
+	[OBMF_EV_GPIO_IRQ] = "gpio_irq_config_failed",
+	[OBMF_EV_GPIO_IRQ_UNUSED] = "gpio_irq_unused",
 };
 
 static int obmf_counter_get(void *data, u64 *val)

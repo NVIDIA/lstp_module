@@ -146,6 +146,18 @@ static size_t obmf_type_head(u8 type)
 	return 1;
 }
 
+/*
+ * OBMF-ICP 1.0.0, 5.4, Tables 18 and 19: a Get of N lines takes 1 + 2N
+ * payload bytes each way, a Set 1 + 2N out. Outputs are not read: Table
+ * 17 names "Read on OUT" an invalid operation.
+ */
+static void obmf_gpio_quirks(struct obmf_channel_info *info)
+{
+	info->quirks.gpio_per_get =
+		(min(info->max_req, info->max_resp) - 1) / 2;
+	info->quirks.gpio_per_set = (info->max_req - 1) / 2;
+}
+
 static bool obmf_overlaps(struct obmf_channel **found, int nr, u32 off,
 			  size_t len)
 {
@@ -253,6 +265,8 @@ static int obmf_discover_channel(struct obmf_core *core,
 	ch->info.config = ch->config;
 	ch->info.config_len = cfg;
 	*total += cfg;
+	if (ch->info.type == OBMF_TYPE_GPIO)
+		obmf_gpio_quirks(&ch->info);
 
 	if (ch->info.max_req < max_req - OBMF_HDR_LEN ||
 	    ch->info.max_resp < max_resp - OBMF_HDR_LEN)

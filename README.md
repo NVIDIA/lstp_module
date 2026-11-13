@@ -1,11 +1,11 @@
-# OBMF-ICP over USB: Linux drivers (evaluation drop 3)
+# OBMF-ICP over USB: Linux drivers (evaluation drop 4)
 
 This is a Linux driver for USB devices that implement the OCP Open
 Boot and Management Framework Interface Consolidation Protocol
 (OBMF-ICP 1.0.0) over USB (OBMF-ICP over USB 1.0). It discovers the
 channels of the device through channel 0 and gives each channel that
 has a function driver its own device on the auxiliary bus. Function
-drivers for I2C controller and serial channels are included.
+drivers for I2C controller, serial and GPIO channels are included.
 
 As an option, the same driver also serves devices that speak LSTP 1.0.
 Their messages are translated to OBMF-ICP where they enter and leave
@@ -13,7 +13,7 @@ the driver, so the function drivers and user space see OBMF-ICP only.
 
 ## Status
 
-This is the third evaluation drop of work in progress toward
+This is the fourth evaluation drop of work in progress toward
 upstream Linux. It is not a release. Module names, device names,
 sysfs and debugfs files, and the in-kernel interface for function
 drivers can still change, before or during upstream review. We share
@@ -27,9 +27,11 @@ and firmware descriptions, and the behaviour on your hardware.
 | `obmf.ko` | `drivers/usb/misc/obmf/` | the USB transport, the message layer, channel 0 and discovery, and the function devices; optionally the dialect support, LSTP, and the KUnit cases | the OBMF-ICP USB interface (class 0xef, subclass 0x09, protocol 0x01); LSTP interfaces when built with LSTP |
 | `i2c-obmf.ko` | `drivers/i2c/busses/i2c-obmf.c` | one I2C adapter per I2C controller channel | auxiliary devices `obmf.i2c` |
 | `obmf_tty.ko` | `drivers/tty/obmf_tty.c` | one `/dev/ttyOBMF<n>` per serial channel | auxiliary devices `obmf.serial` |
+| `gpio-obmf.ko` | `drivers/gpio/gpio-obmf.c` | one GPIO chip per GPIO channel, with edge interrupts on its inputs | auxiliary devices `obmf.gpio` |
 
-`i2c-obmf.ko` and `obmf_tty.ko` use symbols of `obmf.ko`, so load
-`obmf.ko` first.
+The function drivers use symbols of `obmf.ko`, so load `obmf.ko`
+first. `gpio-obmf.ko` is built only against a kernel with
+`CONFIG_GPIOLIB_IRQCHIP`.
 
 ## The tree
 
@@ -38,8 +40,8 @@ The sources sit where they would in a kernel tree:
 - `drivers/usb/misc/obmf/`: the core, with its `Kconfig`, `Makefile`
   and `.kunitconfig`;
 - `include/linux/usb/obmf.h`: the interface for function drivers;
-- `drivers/i2c/busses/i2c-obmf.c` and `drivers/tty/obmf_tty.c`: the
-  function drivers;
+- `drivers/i2c/busses/i2c-obmf.c`, `drivers/tty/obmf_tty.c` and
+  `drivers/gpio/gpio-obmf.c`: the function drivers;
 - `compat/obmf-compat.h`: what an out-of-tree build needs from
   kernels older than the one the code is written for;
 - `Kbuild` and `Makefile`: the out-of-tree build.
@@ -75,121 +77,119 @@ The modules are out of tree and unsigned, so the first `insmod`
 taints the kernel. `TESTING.md` covers loading and checking them.
 
 In a kernel tree, `drivers/usb/misc/obmf/Kconfig` describes `obmf.ko`
-and its options. The I2C and serial drivers have no Kconfig entries
-yet, so they are built out of tree only; `TESTING.md` shows the two
-entries the KUnit run adds. `REQUIREMENTS.md` covers the kernel
+and its options. The I2C, serial and GPIO drivers have no Kconfig
+entries yet, so they are built out of tree only; `TESTING.md` shows
+the three entries the KUnit run adds. `REQUIREMENTS.md` covers the kernel
 versions and the Kconfig options.
 
-## What changed since drop 2
+## What changed since drop 3
 
-Reports:
+GPIO channels, new in this drop:
 
-- What the device does wrong is now counted and logged through one
-  helper: each event counts in a new debugfs directory of the
-  interface, `usb/obmf/<interface>/events/`, one file per event, and
-  logs one line, at most 10 lines per 5 s from each place in the code.
-  The counters also count what the rate limit kept out of the log.
-  Errors are printed by name (`-EPROTO`), or as numbers on a kernel
-  without `CONFIG_SYMBOLIC_ERRNAME`; the transport failure line is now
-  "transport failed: <errno>, device stopped".
-- A response timeout ("channel <n>: no response in <ms> ms"), a
-  failure status that says the device could not do the request
-  ("channel <n>: device error <status>"), a response that does not fit
-  its request ("bad response"), a message the core cannot take
-  ("malformed message: ...", "message for unknown channel <n>", "bad
-  device request") and an answer that cannot be sent ("answer not
-  sent") are now logged. The statuses a function driver acts on (busy,
-  timeout, I2C NACK) stay quiet, and so does all of this during
-  discovery, where a reply left from an earlier binding is expected.
-- A stall of either bulk endpoint logs "bulk in stalled" or "bulk out
-  stalled", and a halt clear that fails logs "bulk in clear halt
-  failed: <errno>" or "bulk out clear halt failed: <errno>". A failed
-  bulk OUT halt clear now counts as a failed transfer.
-- A channel that reports HEALTH_STATUS 3 (not ready) or 15 (channel
-  error), or sets CHANNEL_ERROR_INDICATOR, still binds, now with one
-  warning per bind: "channel <n>: health <h>, error indicator <i>".
-- A device request that finds the channel's queue full is reported:
-  "channel <n>: device request queue full, request refused" (or
-  "request dropped" for one that waits for no answer). Each channel
-  has a new counter, `dreq_max_depth`, the most device requests it
-  held at once.
+- `gpio-obmf.ko` gives each GPIO channel whose device owns the lines
+  a GPIO chip, on OBMF-ICP devices and on LSTP devices. The lines are
+  numbered by their GPIO_INDEX, and an index the configuration does
+  not list is a hole; the names are GPIO_NAME. Each line keeps the
+  direction the device gives it: a request for the other direction
+  fails with `EINVAL`, and setting an input with `EPERM`. Reading an output
+  gives the value last set, from its default output on, without a
+  request to the device. Get and Set of several lines go in one
+  request. A Set the device refuses keeps the values set before and
+  is reported as an event, counted in `events/gpio_set_failed`.
+- On LSTP devices the GPIO table and the Get, Set and interrupt
+  requests are translated; an output with LED support is left out of
+  the GPIO chip, with one debug line per channel.
+- GPIO interrupts: each input can be an interrupt with **edge triggers
+  only** (rising, falling or both); level triggers are refused with
+  `EINVAL`. The driver sends the trigger with Set Interrupt Config,
+  and the device's Interrupt Notify (on LSTP, IRQ_EVENT) runs the
+  handlers. A configuration the device refuses leaves the interrupt
+  off and is reported (`events/gpio_irq_config_failed`); an event for
+  a line with no interrupt set up is counted
+  (`events/gpio_irq_unused`). **The interrupts were tested with
+  unit-test fakes only: no device we have raises GPIO interrupts.**
+  Reports from devices that do are welcome.
 
-Function drivers and the core:
+The core:
 
-- After a transport failure stops the device, the core tells each
-  function driver, through a new optional `failed` operation, and
-  `obmf_fdev_errno()` gives the errno a request would fail with. The
-  serial driver hangs its tty up then, and an open fails with `EIO`
-  until the interface is bound again.
-- After a response timeout, the channel's next request waits until
-  the late response arrives, which is dropped, or for one default
-  timeout (1 s), so that the late response does not answer it. A
-  response later than that is still taken by the next request.
-- Function drivers can report events of their own through
-  `obmf_fdev_report()`, counted with the core's.
+- A function driver can now take the device requests of its channel
+  (a new optional `device_request` operation), count an event of its
+  own without a log line (`obmf_fdev_count()`), and report a device
+  request it cannot decode (`obmf_fdev_bad_request()`).
+- A GPIO Interrupt Notify on a channel without a driver is answered
+  success; GPIO commands a device must not send are answered invalid.
 
 Serial channels:
 
-- Characters dropped after an error are reported as an event, counted
-  in `events/tx_dropped`, with the line "dropped <n> bytes: <errno>".
-- Each port has a debugfs directory, `obmf_tty/<tty>/`, with
-  `tx_dropped` (characters dropped after an error or at close) and
-  `tx_stalls` (the "transmit stalled" lines).
-- Each timeout doubles the wait for the answers after it, up to 10 s,
-  until the port is opened again: a device that answers later than the
-  default timeout gets one repeat, not one per write. A device answer
-  with a timeout status (0x02, or the line timeout 0x40) doubles the
-  wait as well (see `KNOWN-ISSUES.md`).
+- The wait for an answer now doubles only after a timeout on the
+  host, when no answer came in time. A device answer with a timeout
+  status is an answer in time: the characters are sent again and the
+  wait stays as it is.
 
-## What changed in drop 2
+## What changed in drop 3
 
-Since drop 1: serial channels take firmware nodes; the serial driver
-keeps characters the device refuses, answers busy or does not answer
-and sends them again until the device takes them, with one "transmit
-stalled" line after 5 s, refuses device writes while the port is
-closed and hangs up on Carrier Down; a refused break is sent again up
-to 20 times; out-of-range line settings give a port at 8N1. The I2C
-driver registers no bus recovery, and SMBus clients with PEC work. The
-core answers device requests that a driver leaves unanswered with the
-default answer, and those that cannot be decoded with the invalid
-status. LSTP accepts shorter I2C and UART configurations and reads a
-GPIO channel's configuration to an empty slice. The KUnit suites also
-run the I2C and serial drivers on the fake transport.
+Since drop 2: what the device does wrong is counted in
+`usb/obmf/<interface>/events/` and logged through one rate-limited
+helper, with errors printed by name; response timeouts, device
+errors, bad responses, malformed messages, unsent answers, endpoint
+stalls, unhealthy channels and full device request queues are
+logged; after a transport failure the core tells each function
+driver, and the serial driver hangs its tty up; after a response
+timeout, the channel's next request waits for the late response or
+for 1 s; serial ports count dropped characters and stalls in
+`obmf_tty/<tty>/`, and the serial wait grows after timeouts.
 
 ## What was tested
 
 These modules, built from this tree:
 
-- Linux 6.12, arm64: a microcontroller device with OBMF-ICP firmware:
-  I2C through an at24 EEPROM client (a 256-byte pattern read back and
-  compared), a 100,000-byte serial loopback compared byte for byte,
-  and unbind and bind. All passed; the device's GPIO channel was
-  discovered and left without a driver.
-- Linux 6.18, arm64: a USB hub controller with LSTP management:
-  discovery, an I2C scan and EEPROM reads, and unbind, idle and during
-  I2C traffic. All passed.
+- Linux 6.12, arm64: a development microcontroller (MCU) board with
+  OBMF-ICP firmware: I2C through an at24 EEPROM client (a 256-byte
+  pattern read back and compared), a 100,000-byte serial loopback
+  compared byte for byte, the GPIO chip's lines, names and
+  directions, one output looped to one input set to both levels and
+  read back on both, the refused directions, unbind and bind, and two
+  cable pulls, one idle and one during I2C reads. All passed.
+- The same MCU with LSTP firmware: the same I2C, serial and GPIO
+  checks. All passed.
+- Linux 6.18, arm64: a USB4715-based LSTP device (a USB hub controller
+  with LSTP management): discovery, an I2C scan and EEPROM reads, its
+  GPIO lines (outputs looped to inputs, set and read back in pairs,
+  the refused directions), and unbind, idle and during I2C traffic.
+  All passed; its UART behaves as `KNOWN-ISSUES.md` describes.
 - Device tree and ACPI, at Linux v7.3-rc6 in an arm64 KVM guest on a
-  Linux 6.12 host, with the microcontroller device passed through, and
-  the modules built with LSTP: the I2C and the serial channel matched
-  to their nodes or objects, an at24 client created from the I2C node
+  Linux 6.12 host, with the MCU device passed through, and the
+  modules built with LSTP: the I2C and the serial channel matched to
+  their nodes or objects, an at24 client created from the I2C node
   and read back, the tty below the serial function device, and a
   4096-byte serial loopback; a disabled serial node, a disabled I2C
   node, an I2C node with another name, no channel nodes, and on ACPI
   no interface object or one that is not present. All passed.
-- KUnit on x86_64 at Linux v7.3-rc6: the native suites, with the I2C
-  and serial drivers built in, and with LSTP, including channel nodes
-  from a device tree overlay and from software nodes, the serial
-  transmit retries, the stall and close lines, a suspend and an unbind
-  during a retry, and the event reports, the hold after a timeout, the
-  growing serial wait, the hang-up after a transport failure and the
-  new counters: 127 of 127 tests passed without LSTP, 178 of 178 with
-  it.
+- KUnit on x86_64 at Linux v7.3-rc6: the native suites, with the I2C,
+  serial and GPIO drivers built in, and with LSTP, including channel
+  nodes from a device tree overlay and from software nodes, the GPIO
+  lines, holes, names and directions, Get and Set of several lines,
+  refused and failed Sets, the edge interrupts with Interrupt Notify
+  and Interrupt Notify Datagram, a refused interrupt configuration,
+  bad device requests, an unbind with interrupts set up, the LSTP
+  GPIO translation, and the serial wait after a host timeout and after
+  a timeout status: 147 of 147 tests passed without LSTP, 218 of 218
+  with it.
 
-Not tested yet: the new report lines on a device (KUnit makes each
-one on the fake transport), system sleep and resume on a device
-(KUnit runs the serial driver's suspend and resume on the fake
-transport), a `clock-frequency` that differs from the channel's
-speed, and the out-of-tree KUnit build.
+Not tested yet: GPIO interrupts on a device (no device we have
+raises them; KUnit runs them on the fake transport), GPIO consumers
+described through a firmware node, the report lines on a device
+(KUnit makes each one on the fake transport), system sleep and resume
+on a device (KUnit runs the serial driver's suspend and resume on the
+fake transport), the USB transport's error handling (transfer errors,
+a real stall, the failure after repeated errors, the fault injection
+attributes: none of these ran on a device or under fault injection,
+and KUnit covers the layers above the transport only), the hold after
+a real response timeout, a transport failure and the serial hang-up
+on a device, a USB reset, module autoload, two OBMF-ICP devices on one
+host, a kernel with KASAN at run time on a device, a
+`clock-frequency` that differs from the channel's speed, and the
+out-of-tree KUnit build.
 
 `TESTING.md` describes how to repeat these checks on your hardware.
 
@@ -201,7 +201,7 @@ speed, and the out-of-tree KUnit build.
 | `REQUIREMENTS.md` | kernel versions, Kconfig and build switches, the USB match, what the driver needs from a device, how to describe function devices in device tree and ACPI, the interfaces to user space |
 | `KNOWN-ISSUES.md` | what is wrong or missing, why, and what closes each item |
 | `ASSUMPTIONS.md` | where the specifications leave a point open: the reading this driver takes, the options, what a device needs, and what closes each item |
-| `TESTING.md` | KUnit, build and load, what the kernel log shows, I2C and serial checks, unbind and unplug, the counters, what to send with a report |
+| `TESTING.md` | KUnit, build and load, what the kernel log shows, I2C, serial and GPIO checks, unbind and unplug, the counters, what to send with a report |
 
 The specification sections these documents cite are those of
 OBMF-ICP 1.0.0 and OBMF-ICP over USB 1.0, and for LSTP devices of

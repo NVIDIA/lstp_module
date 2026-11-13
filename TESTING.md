@@ -7,10 +7,11 @@ send with a report. The commands need root where they show `sudo`.
 
 The unit tests run in a kernel tree with `kunit.py`. They need Linux
 v7.3-rc6 or later, because the in-tree build has no compat header.
-Copy the core driver, its header and the two function drivers into
+Copy the core driver, its header and the three function drivers into
 the tree and hook them in. The function drivers have no Kconfig
-entries of their own yet, so add the two entries the `.kunitconfig`
-asks for; the serial entry goes outside `if TTY`, so it names `TTY`:
+entries of their own yet, so add the three entries the `.kunitconfig`
+asks for; the serial and GPIO entries go outside `if TTY` and
+`if GPIOLIB`, so they name `TTY` and `GPIOLIB`:
 
 ```sh
 cd linux
@@ -18,6 +19,7 @@ cp -r <drop>/drivers/usb/misc/obmf drivers/usb/misc/
 cp <drop>/include/linux/usb/obmf.h include/linux/usb/
 cp <drop>/drivers/i2c/busses/i2c-obmf.c drivers/i2c/busses/
 cp <drop>/drivers/tty/obmf_tty.c drivers/tty/
+cp <drop>/drivers/gpio/gpio-obmf.c drivers/gpio/
 echo 'source "drivers/usb/misc/obmf/Kconfig"' >> drivers/usb/misc/Kconfig
 echo 'obj-$(CONFIG_USB_OBMF) += obmf/' >> drivers/usb/misc/Makefile
 cat >> drivers/i2c/busses/Kconfig <<'EOF'
@@ -32,6 +34,13 @@ config OBMF_TTY
 	depends on TTY && USB_OBMF
 EOF
 echo 'obj-$(CONFIG_OBMF_TTY) += obmf_tty.o' >> drivers/tty/Makefile
+cat >> drivers/gpio/Kconfig <<'EOF'
+config GPIO_OBMF
+	tristate "OBMF-ICP GPIO channels"
+	depends on GPIOLIB && USB_OBMF
+	select GPIOLIB_IRQCHIP
+EOF
+echo 'obj-$(CONFIG_GPIO_OBMF) += gpio-obmf.o' >> drivers/gpio/Makefile
 ```
 
 The native suites:
@@ -56,8 +65,10 @@ With the dialect support, and with LSTP:
 ```
 
 The suites are `obmf-core`, `obmf-ctrl`, `obmf-bus` and `obmf-usb`;
-`obmf-i2c` and `obmf-tty`, which run the I2C and serial drivers on
-the fake transport; `obmf-dialect` with the dialect support;
+`obmf-i2c`, `obmf-tty` and `obmf-gpio`, which run the I2C, serial and
+GPIO drivers on the fake transport (the GPIO interrupt cases too:
+the fake transport sends the interrupt events a device would);
+`obmf-dialect` with the dialect support;
 `obmf-lstp` with LSTP. Every test must pass. Some cases make a driver
 warn or fail a probe on purpose, so the log has such lines; only the
 results count. The serial cases that check the kernel log read it
@@ -67,9 +78,9 @@ skipped.
 
 Out of tree, `make OBMF_KUNIT_TEST=y` against a kernel with
 `CONFIG_KUNIT` and `CONFIG_DTC` builds the core suites into
-`obmf.ko`, and loading the module runs them; the `obmf-i2c` and
-`obmf-tty` suites and the LSTP cases of those drivers need them
-built in, so they are not part of it. That path has not been run
+`obmf.ko`, and loading the module runs them; the `obmf-i2c`,
+`obmf-tty` and `obmf-gpio` suites and the LSTP cases of those drivers
+need them built in, so they are not part of it. That path has not been run
 yet.
 
 ## Build and load
@@ -78,17 +89,19 @@ yet.
 make                                # the running kernel
 make KDIR=<kernel build directory>  # another kernel
 make OBMF_LSTP=y OBMF_DEBUG=y       # with LSTP, with debug messages
-ls *.ko                             # obmf.ko i2c-obmf.ko obmf_tty.ko
+ls *.ko                             # gpio-obmf.ko i2c-obmf.ko obmf.ko obmf_tty.ko
 ```
 
-The kernel must be configured as `REQUIREMENTS.md` says. Mark the log
-and load the modules, core first:
+`gpio-obmf.ko` is built only against a kernel with
+`CONFIG_GPIOLIB_IRQCHIP`. The kernel must be configured as
+`REQUIREMENTS.md` says. Mark the log and load the modules, core first:
 
 ```sh
 echo "obmf-start $(date -Is)" | sudo tee /dev/kmsg
 sudo insmod obmf.ko
 sudo insmod i2c-obmf.ko
 sudo insmod obmf_tty.ko
+sudo insmod gpio-obmf.ko
 ```
 
 The device can be plugged in before or after. The modules are out of
@@ -100,17 +113,17 @@ tree and unsigned, so the first load taints the kernel; record
 After discovery, `obmf` logs one line per device at info level: the
 protocol and its version, the device name, and each channel with its
 kind, number and name. A channel that no function driver in this drop
-serves (GPIO, for example) is marked `(no driver)`. A line that would
+serves (SPI, for example) is marked `(no driver)`. A line that would
 grow too long ends in `and <n> more`. An OBMF-ICP device:
 
 ```text
-obmf 1-1:1.2: OBMF-ICP 1.0 device 'MyDevice': I2C ch1 'I2C', serial ch2 'UART'
+obmf 1-1:1.2: OBMF-ICP 1.0 device 'MyDevice': I2C ch1 'I2C', serial ch2 'UART', GPIO ch3 'GPIO'
 ```
 
 An LSTP device:
 
 ```text
-obmf 1-1:1.2: LSTP 1 device 'MyDevice': I2C ch2 'I2C', GPIO ch3 'gpio' (no driver), serial ch5 'UART'
+obmf 1-1:1.2: LSTP 1 device 'MyDevice': SPI ch1 'spi' (no driver), I2C ch2 'I2C', GPIO ch3 'gpio', serial ch5 'UART'
 ```
 
 On a good bind nothing else from `obmf` appears at the default log
@@ -146,7 +159,10 @@ obmf 1-1:1.2: channel 2: LSTP type 0x4 name 'UART' limits 511/511 config 15
 obmf 1-1:1.2: LSTP 1 device 'MyDevice', 2 channels
 ```
 
-LSTP type 0x3 is I2C and 0x4 is UART.
+LSTP type 0x3 is I2C, 0x4 is UART and 0x2 is GPIO. A GPIO pin the
+LSTP configuration marks as an LED is a hole in the chip, and a
+channel of LEDs only gets no chip; either way a debug line says
+`channel <n>: <m> LED lines left out`.
 
 Messages that point to a problem:
 
@@ -163,7 +179,7 @@ Messages that point to a problem:
 | `bulk in stalled`, `bulk out stalled` | the device stalled an endpoint; the driver clears the halt and goes on; a request that met an OUT stall fails |
 | `bulk in clear halt failed: <errno>`, `bulk out clear halt failed: <errno>` | clearing the halt failed; on the IN endpoint the driver tries again, and repeated failures end in `transport failed` |
 | `no response during unbind, device stopped` | the device stopped answering during an unbind |
-| `channel <n>: no response in <ms> ms` | a request timed out; its function driver got `ETIMEDOUT`. On a serial port each timeout doubles the wait of the requests after it, up to 10 s, until the port is opened again, so `<ms>` grows. After a timeout the channel's next request waits until the late response comes, which is dropped and counted in `rx_late`, or until one default timeout (1 s) has passed; a stop or a suspend ends the wait. A response later than that can still be taken by the next request |
+| `channel <n>: no response in <ms> ms` | a request timed out; its function driver got `ETIMEDOUT`. On a serial port each such timeout doubles the wait of the requests after it, up to 10 s, until the port is opened again, so `<ms>` grows; a timeout status from the device (0x02, or 0x40 for the line) keeps it. After a timeout the channel's next request waits until the late response comes, which is dropped and counted in `rx_late`, or until one default timeout (1 s) has passed; a stop or a suspend ends the wait. A response later than that can still be taken by the next request |
 | `channel <n>: device error <status>` | the device failed a request with a status that says it could not do it (invalid, permanent error, unknown channel, or a code this driver does not know); the statuses a function driver acts on (busy, timeout, NACK) print nothing |
 | `channel <n>: bad response, <len> bytes`, `channel <n>: bad response` | a reply that does not fit its request |
 | `malformed message: short, ...`, `malformed message: size over the transfer, ...`, `malformed message: trailing bytes, ...`, `message for unknown channel <n>`, `channel <n>: bad device request, ...` | a message from the device the driver could not take |
@@ -175,7 +191,11 @@ Messages that point to a problem:
 | `<n> characters not sent at close, discarded` | the last close found characters the device had not taken; with a write in flight, the line comes once it is answered or times out |
 | `line speed 0`, `configuration data too short`, `request limit <n> too small` | a serial channel's configuration or limits were refused; it has no tty |
 | `unsupported line <d><p><s>, using 8N1` | a serial channel's data bits, parity or stop bits are out of range; the tty runs at 8N1 |
-| `channel <n>: node <name> ignored` | a child node with the channel's `reg` has another name than `i2c` or `serial` |
+| `configuration data too short`, `GPIO_COUNT <n> above 4096`, `configuration data too short for <n> lines`, `GPIO_INDEX <i> out of range`, `GPIO_INDEX <i> listed twice`, `channel limits <req>/<resp> too small` | a GPIO channel's configuration or limits were refused; it has no GPIO chip |
+| `<n> lines out of range, left out` | that many GPIO lines had a direction, default output, drive or bias out of range; they are holes in the chip, the others work |
+| `cannot set line <n>: <errno>`, `cannot set lines: <errno>` | a GPIO Set failed; the lines keep the values set before (see "GPIO") |
+| `cannot configure the interrupt of line <n>: <errno>` | the device refused a GPIO line's interrupt configuration; the line gives no interrupts until the next change of its configuration is taken (see "GPIO") |
+| `channel <n>: node <name> ignored` | a child node with the channel's `reg` has another name than `i2c`, `serial` or `gpio` |
 | `unsupported LSTP version <n>` | the LSTP device is not version 1; nothing binds |
 | `channel <n>: short config (<n>), ignored`, `channel <n>: over budget, ignored` | an LSTP channel's configuration was too short, or its slices too many; the others bind |
 
@@ -281,9 +301,10 @@ cmp tx.bin rx.bin && echo SAME
 Host writes the device refuses (NACK), answers busy, or does not
 answer stay in the driver's 4096-byte buffer and are sent again 10 ms
 after each refusal, busy answer or timeout, with no limit. Each
-timeout doubles the wait for the answers after it, up to 10 s, until
-the port is opened again, so a device that does not answer is tried
-less and less often, at last about every 10 s. A write blocks once
+timeout with no answer doubles the wait for the answers after it, up
+to 10 s, until the port is opened again, so a device that does not
+answer is tried less and less often, at last about every 10 s; a
+device that answers with a timeout status keeps the wait as it is. A write blocks once
 the buffer is full. A device that refuses for 5 s gets one
 `transmit stalled` line, also when flow control holds it off. A
 device that answers more than 1 s after the driver's timeout can get
@@ -344,6 +365,75 @@ Carrier Down hangs the tty up only when `CLOCAL` is clear. With
 `stty -F $T -clocal` and a program reading `$T`, a Carrier Down event
 from the device ends the read, and `dcd` goes up by one.
 
+## GPIO
+
+Only on a device with a GPIO channel: the bind line then lists
+`GPIO ch<n> '<name>'` and there is an `obmf.gpio.<id>` function
+device. The host may have GPIO chips of its own; take the device's by
+its interface and stop unless there is exactly one:
+
+```sh
+C=$(for d in /sys/bus/gpio/devices/gpiochip*; do
+	readlink -f $d | grep -qF "/$IF/obmf.gpio." && echo ${d##*/}
+done)
+echo "C=$C"
+[ $(echo $C | wc -w) -eq 1 ] || echo "STOP: not exactly one GPIO chip of the device"
+gpioinfo $C                      # libgpiod 1.x; 2.x: gpioinfo -c $C
+```
+
+The chip has one line per GPIO_INDEX up to the highest the
+configuration lists, named by GPIO_NAME. An index it does not list,
+or one whose direction, default output, drive or bias is out of range,
+is a hole: requesting it fails with "Invalid argument". The device
+fixes each line's direction; asking a line for the other direction
+fails with "Invalid argument" and sends nothing.
+
+Read an input line, then set an output line. **Set only an output
+whose pin is wired to nothing, or to what you put there for this
+test.**
+
+```sh
+gpioget $C <input>               # 2.x: gpioget -c $C <input>
+gpioset $C <output>=1            # 2.x: gpioset -c $C -t0 <output>=1
+```
+
+`gpioget` asks for an input, so on an output line it fails with
+"Invalid argument"; libgpiod 2.x reads an output with `gpioget -a`.
+An output reads back the value last set, from its default output on;
+the device is not asked, so the reading is not the level of the pin.
+A Set that fails keeps the value set before. While the device is
+suspended or after `transport failed`, reading an output fails as
+reading an input does. With an output wired to an input, set the
+output and read the input to see the level on the pin. Afterwards
+the channel's `timeouts` and `protocol_errors` should be 0; a request
+the device refuses counts in `status_errors`.
+
+`cannot set line <n>: <errno>`, or `cannot set lines: <errno>` for
+several, is a Set that failed; the lines keep the values set before,
+and `events/gpio_set_failed` counts it. A Set of an input, one the
+device refuses for the line, and a device that is gone log nothing.
+Report the line with the channel's counters.
+
+An input gives edge interrupts; the level types are refused. `gpiomon`
+on an input sends the interrupt configuration (Set Interrupt Config)
+when it starts and when it stops, and prints an event for each edge
+the device reports:
+
+```sh
+gpiomon -r $C <input>            # 2.x: gpiomon -c $C -e rising <input>
+```
+
+A level trigger, or `gpiomon` on an output, fails with "Invalid
+argument". The device reports no line state, so `gpiomon` prints the
+edge the line was set up for; on both edges, the kernel reads the
+line to tell which. An edge the device reports for a line nobody
+watches counts in `events/gpio_irq_unused`. A configuration the device
+refuses logs `cannot configure the interrupt of line <n>: <errno>` and
+counts in `events/gpio_irq_config_failed`; that line gives no events
+until its configuration changes again and the device takes it.
+GPIO interrupts in this drop were tested with unit-test fakes only;
+please report what your device does.
+
 ## Unbind, unplug and unload
 
 A software unbind and bind:
@@ -361,16 +451,18 @@ tty is hung up too, and opening it fails with `EIO` until the
 interface is bound again. An oops, a warning, or a task that
 hangs is a finding.
 
-Unload in reverse order:
+Unload in reverse order, after closing every program that uses `$T`,
+`/dev/i2c-$N` or `/dev/$C` (`gpioset`, `gpiomon`):
 
 ```sh
+sudo rmmod gpio-obmf
 sudo rmmod obmf_tty
 sudo rmmod i2c-obmf
 sudo rmmod obmf
 ```
 
-If something hangs: close the programs that use `$T` and
-`/dev/i2c-$N`, then unbind; if the unbind hangs, unplug the device,
+If something hangs: close the programs that use `$T`,
+`/dev/i2c-$N` and `/dev/$C`, then unbind; if the unbind hangs, unplug the device,
 which needs no answer from it. Then record the blocked tasks with
 `echo w | sudo tee /proc/sysrq-trigger` and collect the logs.
 
@@ -406,6 +498,9 @@ keeps quiet. After a bind every file should read 0.
 | `channel_health` | `channel <n>: health <h>, error indicator <e>` |
 | `device_request_queue_full` | `channel <n>: device request queue full, request refused` or `request dropped` |
 | `tx_dropped` | `dropped <n> bytes: <errno>` |
+| `gpio_set_failed` | `cannot set line <n>: <errno>`, `cannot set lines: <errno>` |
+| `gpio_irq_config_failed` | `cannot configure the interrupt of line <n>: <errno>` |
+| `gpio_irq_unused` | no line: a GPIO interrupt event for a line with no interrupt set up |
 
 ```sh
 sudo sh -c "grep . /sys/kernel/debug/usb/obmf/$IF/events/*"
