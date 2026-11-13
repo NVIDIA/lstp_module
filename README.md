@@ -84,6 +84,10 @@ versions and the Kconfig options.
 
 ## What changed since drop 3
 
+`CHANGELOG.md` lists the changes, the fixed and new known issues and
+what was tested for every drop; this section describes drop 4's
+changes in full.
+
 GPIO channels, new in this drop:
 
 - `gpio-obmf.ko` gives each GPIO channel whose device owns the lines
@@ -138,6 +142,8 @@ driver, and the serial driver hangs its tty up; after a response
 timeout, the channel's next request waits for the late response or
 for 1 s; serial ports count dropped characters and stalls in
 `obmf_tty/<tty>/`, and the serial wait grows after timeouts.
+
+Drops 1 and 2: `CHANGELOG.md`.
 
 ## What was tested
 
@@ -202,6 +208,7 @@ out-of-tree KUnit build.
 | `KNOWN-ISSUES.md` | what is wrong or missing, why, and what closes each item |
 | `ASSUMPTIONS.md` | where the specifications leave a point open: the reading this driver takes, the options, what a device needs, and what closes each item |
 | `TESTING.md` | KUnit, build and load, what the kernel log shows, I2C, serial and GPIO checks, unbind and unplug, the counters, what to send with a report |
+| `CHANGELOG.md` | per drop: what was added, changed and fixed, the known issues closed, opened and changed, and what it was tested on |
 
 The specification sections these documents cite are those of
 OBMF-ICP 1.0.0 and OBMF-ICP over USB 1.0, and for LSTP devices of
