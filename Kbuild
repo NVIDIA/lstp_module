@@ -15,6 +15,9 @@ endif
 ifeq ($(shell grep -qw TTY_DRIVER_RESET_SAVED_TERMIOS $(srctree)/include/linux/tty_driver.h && echo y),)
 ccflags-y += -DOBMF_COMPAT_NO_RESET_SAVED_TERMIOS
 endif
+ifeq ($(shell grep -qw tty_port_tty_vhangup $(srctree)/include/linux/tty_port.h && echo y),)
+ccflags-y += -DOBMF_COMPAT_NO_TTY_VHANGUP
+endif
 # A callback's type: for the compat header, which defines the symbol the
 # GPIO driver tests
 ifneq ($(shell grep -qE 'void\s+.[*]set[^_a-z]' $(srctree)/include/linux/gpio/driver.h && echo y),)
@@ -84,6 +87,27 @@ endif
 
 obj-m += i2c-obmf.o
 i2c-obmf-y := drivers/i2c/busses/i2c-obmf.o
+
+# The SPI controller driver needs a kernel with SPI controllers, as a
+# kernel tree's Kconfig entry would
+ifneq ($(CONFIG_SPI_MASTER),)
+obj-m += spi-obmf.o
+spi-obmf-y := drivers/spi/spi-obmf.o
+endif
+
+# The spi-obmf parameter auto_bind_spidev (off by default) is for
+# development and debugging only, not for production: it binds spidev to
+# each chip select of a channel whose firmware description has no SPI
+# clients. A board describes its SPI clients in its device tree or ACPI
+# tables, the supported way. Built only here, out of tree;
+# OBMF_SPI_SPIDEV=n leaves it out.
+ifneq ($(OBMF_SPI_SPIDEV),n)
+ccflags-y += -DCONFIG_SPI_OBMF_SPIDEV=1
+endif
+# Before the driver core kept the override, struct spi_device had its own
+ifeq ($(shell grep -qw device_set_driver_override $(srctree)/include/linux/device.h && echo y),)
+ccflags-y += -DOBMF_KBUILD_SPI_DRIVER_OVERRIDE
+endif
 
 obj-m += obmf_tty.o
 obmf_tty-y := drivers/tty/obmf_tty.o

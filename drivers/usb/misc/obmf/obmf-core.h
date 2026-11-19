@@ -81,7 +81,12 @@ struct obmf_usb_proto {
  * @stop: stop for good: cancel and refuse all transfers
  * @quiesce: cancel reception until @resume
  * @resume: arm reception again after @quiesce
- * @send: send one message, sleeping, at most @timeout_ms
+ * @send: send one message, sleeping, at most @timeout_ms whatever other
+ *	sends do; a send that starts after @stop has begun sends nothing and
+ *	returns -ENODEV
+ * @release: give the device up after a failed discovery: return at once
+ *	and unbind the core later, from a context the unbind does not wait
+ *	for; called once, from the bind work or a failed resume
  */
 struct obmf_transport_ops {
 	int (*start)(struct obmf_transport *tp);
@@ -90,6 +95,7 @@ struct obmf_transport_ops {
 	int (*resume)(struct obmf_transport *tp);
 	int (*send)(struct obmf_transport *tp, const void *buf, size_t len,
 		    unsigned int timeout_ms);
+	void (*release)(struct obmf_transport *tp);
 };
 
 /**
@@ -119,8 +125,25 @@ struct obmf_transport {
 	 */
 	const struct obmf_dialect *dialect;
 #endif
+#if IS_ENABLED(CONFIG_KUNIT)
+	/**
+	 * @test_names: the unit tests' fake transports only: the function
+	 *	devices are named "test-<name>", which no function driver
+	 *	matches
+	 */
+	bool test_names;
+#endif
 	struct obmf_core *core;
 };
+
+static inline bool obmf_test_names(const struct obmf_transport *tp)
+{
+#if IS_ENABLED(CONFIG_KUNIT)
+	return tp->test_names;
+#else
+	return false;
+#endif
+}
 
 enum obmf_state {
 	OBMF_INIT,
@@ -320,10 +343,18 @@ struct obmf_channel {
  * @inflight_lock: guards @inflight
  * @inflight: calls from function drivers in progress
  * @inflight_wq: woken when @inflight drops to zero
- * @ch0_lock: serializes channel 0 read-modify-write sequences
+ * @state_wq: woken at every state edge
+ * @ch0_lock: serializes channel 0 read-modify-write sequences; a status
+ *	read that is one channel 0 read takes none
  * @wq: device request delivery
  * @fail_work: calls each published driver's failed operation after a
  *	transport error stopped the device
+ * @bind_work: discovery and the function devices, after probe
+ * @bind_err: the result of @bind_work's last run
+ * @bind_warns: configuration warnings of @bind_work's last run, logged
+ *	or not
+ * @added: @bind_work made the core live and added the function devices
+ * @released: the transport was asked to give the device up
  * @ch0: channel 0
  * @chans: discovered channels by number, published by @table
  * @table: set once @chans is complete
@@ -333,7 +364,8 @@ struct obmf_channel {
  * @vendor_id: VENDOR_ID, a PCI-SIG vendor ID; 0 where the wire protocol
  *	gives none, as a USB vendor ID is not one
  * @device_id: DEVICE_ID
- * @device_name: DEVICE_NAME as a string, empty if none
+ * @device_name: DEVICE_NAME as a string, empty if none; written by
+ *	discovery before @table is set
  * @ch0_chunk: largest channel 0 read
  * @mmio_form: enum obmf_mmio_form, the last read response's
  * @cnt: interface counters
@@ -347,9 +379,15 @@ struct obmf_core {
 	spinlock_t inflight_lock; /* inflight */
 	unsigned int inflight;
 	wait_queue_head_t inflight_wq;
+	wait_queue_head_t state_wq;
 	struct mutex ch0_lock; /* channel 0 read-modify-write */
 	struct workqueue_struct *wq;
 	struct work_struct fail_work;
+	struct work_struct bind_work;
+	int bind_err;
+	unsigned int bind_warns;
+	bool added;
+	bool released;
 	struct obmf_channel *ch0;
 	struct obmf_channel *chans[OBMF_NR_CHANNELS];
 	bool table;
@@ -406,9 +444,14 @@ static inline void obmf_ch_count(struct obmf_channel *ch,
 /* The line a bound device logs, NUL included */
 #define OBMF_INFO_LEN 256
 
+/* Configuration warnings a bind logs; the rest are only counted */
+#define OBMF_BIND_WARN_MAX 10
+
 /* obmf-core.c */
 struct obmf_core *obmf_core_create(struct obmf_transport *tp);
 int obmf_core_bind(struct obmf_core *core);
+__printf(2, 3) void obmf_bind_warn(struct obmf_core *core, const char *fmt,
+				   ...);
 void obmf_core_info(struct obmf_core *core, char *buf);
 void obmf_core_unbind(struct obmf_core *core, bool attached);
 void obmf_core_rx(struct obmf_core *core, const u8 *buf, size_t len);
@@ -420,7 +463,8 @@ int obmf_core_state(struct obmf_core *core);
 /*
  * Discovery runs before the core is live and takes timeouts, malformed
  * replies and strays as leftovers of an earlier binding; its own failure
- * is logged. Response and message events stay quiet until then.
+ * is logged. Response and message events stay quiet until then. Unbind,
+ * suspend and a transport error end it by moving the core out of INIT.
  */
 static inline bool obmf_core_discovering(struct obmf_core *core)
 {

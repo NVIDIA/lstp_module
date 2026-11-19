@@ -42,7 +42,10 @@
  * The allocator family is in v7.3 (include/linux/slab.h:1124-1160 @
  * v7.3-rc6) and in later 6.12 stable releases (:938-974 @ rpi-6.12.y),
  * not in v6.12. Neither 6.12 form nor these fallbacks set a
- * __counted_by() counter; the code assigns it.
+ * __counted_by() counter; the code assigns it. Some 6.18 stable releases
+ * define kzalloc_obj() and kzalloc_objs() with the flags required
+ * (include/linux/slab.h:1009-1012 @ v6.18.34), so every call of the two
+ * passes them.
  */
 #ifndef kzalloc_obj
 #define kzalloc_obj(P, ...) kzalloc(sizeof(P), default_gfp(__VA_ARGS__))
@@ -102,6 +105,31 @@
 #endif
 
 /*
+ * tty_port_tty_vhangup() is in v7.3 (drivers/tty/tty_port.c:433-446 @
+ * v7.3-rc6) and an inline in later 6.12 stable releases
+ * (include/linux/tty_port.h:267-274 @ rpi-6.12.y), not in v6.12. Kbuild
+ * passes OBMF_COMPAT_NO_TTY_VHANGUP when the target's tty_port.h lacks it.
+ */
+#ifdef OBMF_COMPAT_NO_TTY_VHANGUP
+#include <linux/tty.h>
+#include <linux/tty_port.h>
+
+static inline void tty_port_tty_vhangup(struct tty_port *port)
+{
+	struct tty_struct *tty;
+
+	mutex_lock(&port->mutex);
+	tty = tty_port_tty_get(port);
+	mutex_unlock(&port->mutex);
+
+	if (tty) {
+		tty_vhangup(tty);
+		tty_kref_put(tty);
+	}
+}
+#endif
+
+/*
  * The symbols below select a branch of an #ifdef in a driver, where an
  * older kernel differs in a way a header cannot hide. The upstream export
  * resolves each to its v7.3 branch, the symbol undefined.
@@ -125,6 +153,18 @@
  */
 #ifdef OBMF_KBUILD_GPIO_REQUEST_VALID
 #define OBMF_COMPAT_GPIO_VALID_MASK_NEEDS_REQUEST
+#endif
+
+/*
+ * OBMF_COMPAT_SPI_DRIVER_OVERRIDE: struct spi_device has its own
+ * driver_override, set with driver_set_override()
+ * (include/linux/spi/spi.h:218 @ v6.12); the driver core keeps it and
+ * device_set_driver_override() sets it in later kernels
+ * (include/linux/device.h:878 @ v7.3-rc6). Kbuild passes
+ * OBMF_KBUILD_SPI_DRIVER_OVERRIDE when the target's device.h lacks it.
+ */
+#ifdef OBMF_KBUILD_SPI_DRIVER_OVERRIDE
+#define OBMF_COMPAT_SPI_DRIVER_OVERRIDE
 #endif
 
 #endif /* __OBMF_COMPAT_H */

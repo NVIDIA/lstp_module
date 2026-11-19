@@ -5,8 +5,8 @@
  * A device that speaks LSTP 1.0 is served by the OBMF-ICP core: each
  * message is translated at the edge, channel 0 is read with READ_CONFIG,
  * and the channel header bytes are answered here. Channel 0, the I2C
- * controller, GPIO and UART channels are translated, GPIO without Get
- * Interrupt Config; channels of the other types get a record and no
+ * controller, GPIO, UART and SPI channels are translated, GPIO without
+ * Get Interrupt Config; channels of the other types get a record and no
  * function device.
  */
 
@@ -78,6 +78,19 @@
 #define OBMF_I2C_WRITE_READ 3
 #define OBMF_I2C_HEAD 4
 
+/*
+ * OBMF-ICP 1.0.0, 5.10.1, Table 50: payload byte 0, then the write and
+ * read sizes; 5.10.2, Table 51: the echo, then the read size. LSTP 1.0,
+ * 4.2.2 has the same command and chip select bits for CS0 and CS1.
+ */
+#define OBMF_SPI_CMD GENMASK(3, 0)
+#define OBMF_SPI_CS GENMASK(7, 6)
+#define OBMF_SPI_READ 1
+#define OBMF_SPI_WRITE 2
+#define OBMF_SPI_WRITE_READ 3
+#define OBMF_SPI_HEAD 5
+#define OBMF_SPI_RESP_HEAD 3
+
 /* OBMF-ICP 1.0.0, 5.5.1, Table 22 and 5.5.2, Table 23 */
 #define OBMF_SERIAL_EVENTS GENMASK(3, 0)
 #define OBMF_SERIAL_NACK BIT(0)
@@ -121,6 +134,15 @@ struct obmf_lstp_i2c_cfg {
 	u8 bus_low_timeout;
 	u8 arbitration_retries;
 } __packed;
+
+/* LSTP 1.0, 4.2.1: the electrical fields after the speed are not used */
+struct obmf_lstp_spi_cfg {
+	u8 num_devices;
+	__le32 speed;
+} __packed;
+
+/* LSTP 1.0, 4.2.2: the command's chip select bit names CS0 or CS1 */
+#define OBMF_LSTP_SPI_CS_MAX 2
 
 /* LSTP 1.0, 4.5.1; the bytes before drive_strength are OBMF-ICP Table 78 */
 struct obmf_lstp_uart_cfg {
@@ -186,8 +208,7 @@ static const u8 obmf_lstp_irq_types[] = {
  * @gpio_count: GPIO: lines of the Get in flight, set by encode before the
  *	slot is armed
  * @gpio_index: GPIO: their indices, in request order
- * @cfg_len: length of @cfg
- * @cfg: the channel configuration as read
+ * @cfg_len: length of the channel configuration as read
  */
 struct obmf_lstp_ch {
 	u8 type;
@@ -197,7 +218,6 @@ struct obmf_lstp_ch {
 	u16 gpio_count;
 	u16 gpio_index[OBMF_LSTP_GPIO_GET_MAX];
 	size_t cfg_len;
-	u8 cfg[] __counted_by(cfg_len);
 };
 
 static void obmf_lstp_hdr(u8 *buf, u8 channel, u8 status, size_t size)
@@ -210,10 +230,12 @@ static void obmf_lstp_hdr(u8 *buf, u8 channel, u8 status, size_t size)
 }
 
 /*
- * The OBMF-ICP status for an LSTP status (OBMF-ICP Tables 4 and 25); the
- * ones with no OBMF-ICP code are left to obmf_lstp_status_to_errno()
+ * The OBMF-ICP status for an LSTP status (OBMF-ICP Tables 4 and 25): an
+ * unsupported command is an invalid one, a lost arbitration off I2C a
+ * permanent error. The errno of the ones with no exact OBMF-ICP code
+ * comes from obmf_lstp_status_to_errno().
  */
-static u8 obmf_lstp_status(const struct obmf_channel *ch, u8 st)
+static u8 obmf_lstp_icp_status(const struct obmf_channel *ch, u8 st)
 {
 	if (ch->info.type == OBMF_TYPE_I2C_CONTROLLER) {
 		if (st == OBMF_LSTP_NACK)
@@ -221,9 +243,27 @@ static u8 obmf_lstp_status(const struct obmf_channel *ch, u8 st)
 		if (st == OBMF_LSTP_ARB_LOST)
 			return OBMF_STATUS_I2C_ARB_LOST;
 	}
-	if (st == OBMF_LSTP_TOO_LARGE)
+	switch (st) {
+	case OBMF_LSTP_ARB_LOST:
+		return OBMF_STATUS_PERMANENT_ERROR;
+	case OBMF_LSTP_NOT_SUPP:
+		return OBMF_STATUS_INVALID;
+	case OBMF_LSTP_TOO_LARGE:
 		return OBMF_STATUS_SIZE_UNSUPPORTED;
+	}
 	return st;
+}
+
+/* Two LSTP statuses can give one OBMF-ICP status: the log has both */
+static u8 obmf_lstp_status(const struct obmf_channel *ch, u8 st)
+{
+	u8 icp = obmf_lstp_icp_status(ch, st);
+
+	if (st)
+		dev_dbg(ch->core->dev,
+			"channel %u: LSTP status %#x, OBMF-ICP %#x\n",
+			ch->info.number, st, icp);
+	return icp;
 }
 
 /* The LSTP command for each OBMF-ICP I2C command */
@@ -299,6 +339,95 @@ static ssize_t obmf_lstp_i2c_decode(struct obmf_channel *ch, const u8 *in,
 		put_unaligned_le16(dlen, p + 1);
 		p[3] = 0;
 		memcpy(p + OBMF_I2C_HEAD, in + OBMF_HDR_LEN, dlen);
+	}
+	obmf_lstp_hdr(out, in[0], OBMF_HDR_RQRESP | obmf_lstp_status(ch, st),
+		      plen);
+	return OBMF_HDR_LEN + plen;
+}
+
+/*
+ * OBMF-ICP {command, write size, read size, data} (Table 50) becomes the
+ * LSTP command in the header and the data, or the 4-byte read length for
+ * a READ (LSTP 1.0, 4.2.2). LSTP has no posted write, no CS2 or CS3 (the
+ * chip select field would reach the request/response bit) and a
+ * WRITE_READ that reads as many bytes as it writes; a size that does not
+ * match the data is refused too.
+ */
+static ssize_t obmf_lstp_spi_encode(u8 *buf, size_t len)
+{
+	size_t plen = len - OBMF_HDR_LEN;
+	u8 *p = buf + OBMF_HDR_LEN;
+	u16 wlen, rlen;
+	u8 cmd;
+
+	if (plen < OBMF_SPI_HEAD)
+		return -EINVAL;
+	cmd = p[0];
+	wlen = get_unaligned_le16(p + 1);
+	rlen = get_unaligned_le16(p + 3);
+	if (FIELD_GET(OBMF_SPI_CS, cmd) >= OBMF_LSTP_SPI_CS_MAX ||
+	    plen - OBMF_SPI_HEAD != wlen)
+		return -EINVAL;
+
+	switch (FIELD_GET(OBMF_SPI_CMD, cmd)) {
+	case OBMF_SPI_READ:
+		/* No read length 0: LSTP gives it no meaning */
+		if (wlen || !rlen)
+			return -EINVAL;
+		put_unaligned_le32(rlen, p);
+		plen = sizeof(__le32);
+		break;
+	case OBMF_SPI_WRITE:
+		if (rlen)
+			return -EINVAL;
+		memmove(p, p + OBMF_SPI_HEAD, wlen);
+		plen = wlen;
+		break;
+	case OBMF_SPI_WRITE_READ:
+		if (rlen != wlen)
+			return -EINVAL;
+		memmove(p, p + OBMF_SPI_HEAD, wlen);
+		plen = wlen;
+		break;
+	default:
+		return -EINVAL;
+	}
+	obmf_lstp_hdr(buf, buf[0], cmd, plen);
+	return OBMF_HDR_LEN + plen;
+}
+
+/*
+ * An LSTP SPI response carries the read data only; OBMF-ICP Table 51
+ * wants {echo, read size, data}, or the echo alone on an error. A WRITE
+ * reads nothing: LSTP 1.0, 4.2.2 gives its response as the header alone,
+ * but LSTP firmware has been seen to add a byte. The status decides and
+ * the data is dropped: a response longer than the host asked for is
+ * accepted, for forward compatibility within a protocol version.
+ */
+static ssize_t obmf_lstp_spi_decode(struct obmf_channel *ch, const u8 *in,
+				    size_t len, u8 *out, size_t cap,
+				    u8 pending_cmd)
+{
+	u8 op = FIELD_GET(OBMF_SPI_CMD, pending_cmd);
+	size_t dlen = len - OBMF_HDR_LEN;
+	u8 st = in[1] & OBMF_HDR_STATUS;
+	u8 *p = out + OBMF_HDR_LEN;
+	size_t plen = 1;
+
+	if (!st && op == OBMF_SPI_WRITE && dlen) {
+		dev_dbg_ratelimited(ch->core->dev,
+				    "channel %u: write, %zu bytes ignored\n",
+				    ch->info.number, dlen);
+		dlen = 0;
+	}
+	if (!st)
+		plen = OBMF_SPI_RESP_HEAD + dlen;
+	if (OBMF_HDR_LEN + plen > cap)
+		return -EPROTO;
+	p[0] = op;
+	if (!st) {
+		put_unaligned_le16(dlen, p + 1);
+		memcpy(p + OBMF_SPI_RESP_HEAD, in + OBMF_HDR_LEN, dlen);
 	}
 	obmf_lstp_hdr(out, in[0], OBMF_HDR_RQRESP | obmf_lstp_status(ch, st),
 		      plen);
@@ -553,8 +682,9 @@ static ssize_t obmf_lstp_gpio_dreq(const u8 *in, size_t len, u8 *out,
 }
 
 /*
- * Host requests on the I2C, GPIO and UART channels, and answers to the
- * UART device's writes; LSTP has no answer for the other device requests
+ * Host requests on the I2C, GPIO, UART and SPI channels, and answers to
+ * the UART device's writes; LSTP has no answer for the other device
+ * requests
  */
 static ssize_t obmf_lstp_encode(struct obmf_channel *ch, u8 *buf, size_t len,
 				size_t cap)
@@ -562,6 +692,10 @@ static ssize_t obmf_lstp_encode(struct obmf_channel *ch, u8 *buf, size_t len,
 	bool answer = buf[1] & OBMF_HDR_RQRESP;
 	ssize_t n;
 
+	/*
+	 * The I2C, serial and SPI rewrites only shorten the message in place, so
+	 * @cap is checked after them; the GPIO one checks @cap itself.
+	 */
 	switch (ch->info.type) {
 	case OBMF_TYPE_I2C_CONTROLLER:
 		if (answer)
@@ -578,6 +712,11 @@ static ssize_t obmf_lstp_encode(struct obmf_channel *ch, u8 *buf, size_t len,
 		if (answer)
 			return 0;
 		n = obmf_lstp_gpio_encode(ch, buf, len, cap);
+		break;
+	case OBMF_TYPE_SPI:
+		if (answer)
+			return 0;
+		n = obmf_lstp_spi_encode(buf, len);
 		break;
 	default:
 		return answer ? 0 : -EOPNOTSUPP;
@@ -598,6 +737,10 @@ static ssize_t obmf_lstp_decode(struct obmf_channel *ch, const u8 *in,
 		if (!resp)
 			break;
 		return obmf_lstp_i2c_decode(ch, in, len, out, cap, pending_cmd);
+	case OBMF_TYPE_SPI:
+		if (!resp)
+			break;
+		return obmf_lstp_spi_decode(ch, in, len, out, cap, pending_cmd);
 	case OBMF_TYPE_GPIO:
 		if (!resp)
 			return obmf_lstp_gpio_dreq(in, len, out, cap);
@@ -721,6 +864,37 @@ static int obmf_lstp_i2c_config(struct obmf_channel *ch, const u8 *raw,
 }
 
 /*
+ * LSTP 1.0, 4.2.1 to OBMF-ICP Table 84: no mode or word size can be set
+ * (mode 0, 8 bits), one clock for both directions, and at most the two
+ * chip selects a command can name. The device count and the speed are
+ * passed on as they are otherwise; the SPI driver checks them.
+ */
+static int obmf_lstp_spi_config(struct obmf_channel *ch, const u8 *raw,
+				size_t len)
+{
+	const struct obmf_lstp_spi_cfg *c = (const void *)raw;
+	struct obmf_spi_cfg *cfg;
+
+	if (len < sizeof(*c))
+		return -EINVAL;
+	cfg = kzalloc_obj(*cfg, GFP_KERNEL);
+	if (!cfg)
+		return -ENOMEM;
+	cfg->num_devices = min_t(u8, c->num_devices, OBMF_LSTP_SPI_CS_MAX);
+	cfg->rd_max_speed_hz = c->speed;
+	cfg->wr_max_speed_hz = c->speed;
+	if (c->num_devices > OBMF_LSTP_SPI_CS_MAX)
+		obmf_bind_warn(ch->core,
+			       "channel %u: %u SPI devices, %u used\n",
+			       ch->info.number, c->num_devices,
+			       OBMF_LSTP_SPI_CS_MAX);
+	ch->config = (u8 *)cfg;
+	ch->info.config = ch->config;
+	ch->info.config_len = sizeof(*cfg);
+	return 0;
+}
+
+/*
  * LSTP 1.0, 4.5.1: its first bytes are OBMF-ICP Table 78, the only ones
  * used; the electrical fields after them may be left out
  */
@@ -798,7 +972,8 @@ static int obmf_lstp_gpio_config(struct obmf_channel *ch, const u8 *raw,
 {
 	const size_t esz = sizeof(struct obmf_lstp_gpio_cfg);
 	struct obmf_lstp_gpio_tally t = {};
-	struct device *dev = ch->core->dev;
+	struct obmf_core *core = ch->core;
+	struct device *dev = core->dev;
 	unsigned int nr = ch->info.number;
 	struct obmf_gpio_cfg_entry *e;
 	unsigned int blocks = 0;
@@ -833,23 +1008,24 @@ static int obmf_lstp_gpio_config(struct obmf_channel *ch, const u8 *raw,
 		}
 	}
 	if (cut)
-		dev_warn(dev, "channel %u: GPIO table cut in line %u\n", nr,
-			 pos);
+		obmf_bind_warn(core, "channel %u: GPIO table cut in line %u\n",
+			       nr, pos);
 	else if (off < len)
-		dev_warn(dev,
-			 "channel %u: %zu bytes after %u GPIO blocks ignored\n",
-			 nr, len - off, blocks);
+		obmf_bind_warn(core,
+			       "channel %u: %zu bytes after %u GPIO blocks ignored\n",
+			       nr, len - off, blocks);
 	if (t.bad)
-		dev_warn(dev,
-			 "channel %u: %u GPIO lines out of range, left out\n",
-			 nr, t.bad);
+		obmf_bind_warn(core,
+			       "channel %u: %u GPIO lines out of range, left out\n",
+			       nr, t.bad);
 	if (t.above)
-		dev_warn(dev, "channel %u: %u GPIO lines above %u, left out\n",
-			 nr, t.above, OBMF_GPIO_LINES - 1);
+		obmf_bind_warn(core,
+			       "channel %u: %u GPIO lines above %u, left out\n",
+			       nr, t.above, OBMF_GPIO_LINES - 1);
 	if (t.odd_leds)
-		dev_warn(dev,
-			 "channel %u: LED support on %u GPIO lines ignored\n",
-			 nr, t.odd_leds);
+		obmf_bind_warn(core,
+			       "channel %u: LED support on %u GPIO lines ignored\n",
+			       nr, t.odd_leds);
 	if (t.leds)
 		dev_dbg(dev, "channel %u: %u LED lines left out\n", nr, t.leds);
 
@@ -868,8 +1044,10 @@ static int obmf_lstp_gpio_config(struct obmf_channel *ch, const u8 *raw,
 
 /*
  * The LSTP types with an OBMF-ICP type (LSTP 1.0, 3.2), and what each
- * adds to the wire payload in OBMF-ICP form. @table: the configuration is
- * a table of blocks that may span slices (LSTP 1.0, 4.3.1.4)
+ * adds to the wire payload in OBMF-ICP form. One limit covers every
+ * request with data: an I2C write adds 3 but a write-read 1, so I2C
+ * counts 1. @table: the configuration is a table of blocks that may span
+ * slices (LSTP 1.0, 4.3.1.4)
  */
 static const struct obmf_lstp_type {
 	u8 lstp;
@@ -880,10 +1058,11 @@ static const struct obmf_lstp_type {
 	int (*config)(struct obmf_channel *ch, const u8 *raw, size_t len);
 	bool table;
 } obmf_lstp_types[] = {
-	{ OBMF_LSTP_TYPE_SPI, OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, 5, 3 },
+	{ OBMF_LSTP_TYPE_SPI, OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, 5, 3,
+	  obmf_lstp_spi_config },
 	{ OBMF_LSTP_TYPE_GPIO, OBMF_TYPE_GPIO, OBMF_ROLE_PRODUCER, 1, 1,
 	  obmf_lstp_gpio_config, true },
-	{ OBMF_LSTP_TYPE_I2C, OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, 3,
+	{ OBMF_LSTP_TYPE_I2C, OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, 1,
 	  4, obmf_lstp_i2c_config },
 	{ OBMF_LSTP_TYPE_UART, OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, 3, 3,
 	  obmf_lstp_uart_config },
@@ -976,11 +1155,10 @@ static int obmf_lstp_add_channel(struct obmf_core *core,
 		obmf_ch_alloc(core, nr, max_req, max_resp, rx_cap);
 	if (!ch)
 		return -ENOMEM;
-	lc = kzalloc_flex(*lc, cfg, len);
+	lc = kzalloc_obj(*lc, GFP_KERNEL);
 	if (!lc)
 		return -ENOMEM;
 	lc->cfg_len = len;
-	memcpy(lc->cfg, raw, len);
 	lc->type = base->type;
 	lc->flags = base->flags;
 	ch->dialect_data = lc;
@@ -994,9 +1172,9 @@ static int obmf_lstp_add_channel(struct obmf_core *core,
 	if (t->config) {
 		ret = t->config(ch, raw, len);
 		if (ret == -EINVAL) {
-			dev_warn(core->dev,
-				 "channel %d: short config (%zu), ignored\n",
-				 nr, len);
+			obmf_bind_warn(core,
+				       "channel %d: short config (%zu), ignored\n",
+				       nr, len);
 			return 0;
 		}
 		if (ret)
@@ -1037,7 +1215,8 @@ static int obmf_lstp_discover_channel(struct obmf_core *core,
 			    OBMF_LSTP_CFG_TOTAL - *total);
 		if (!want || shorts > OBMF_LSTP_CFG_SHORT_MAX ||
 		    *pass_shorts > OBMF_LSTP_PASS_SHORT_MAX) {
-			dev_warn(dev, "channel %d: over budget, ignored\n", nr);
+			obmf_bind_warn(core,
+				       "channel %d: over budget, ignored\n", nr);
 			return 0;
 		}
 		ret = obmf_lstp_read_config(core, nr, len, want, reply, &got);
@@ -1049,8 +1228,9 @@ static int obmf_lstp_discover_channel(struct obmf_core *core,
 			break;
 		}
 		if (ret == -EREMOTEIO) {
-			dev_warn(dev, "channel %d: status %#lx, ignored\n", nr,
-				 reply[1] & OBMF_HDR_STATUS);
+			obmf_bind_warn(core,
+				       "channel %d: status %#lx, ignored\n", nr,
+				       reply[1] & OBMF_HDR_STATUS);
 			return 0;
 		}
 		if (ret)
@@ -1075,14 +1255,14 @@ static int obmf_lstp_discover_channel(struct obmf_core *core,
 		}
 	} while ((got == want || (t->table && got)) && len < OBMF_LSTP_CFG_END);
 	if (!t) {
-		dev_warn(dev,
-			 "channel %d: LSTP type %#x not supported, ignored\n",
-			 nr, base.type);
+		obmf_bind_warn(core,
+			       "channel %d: LSTP type %#x not supported, ignored\n",
+			       nr, base.type);
 		return 0;
 	}
 	if (len == OBMF_LSTP_CFG_END)
-		dev_warn(dev, "channel %d: configuration cut at %#x\n", nr,
-			 OBMF_LSTP_CFG_END);
+		obmf_bind_warn(core, "channel %d: configuration cut at %#x\n",
+			       nr, OBMF_LSTP_CFG_END);
 
 	return obmf_lstp_add_channel(core, found, nr, t, &base, raw, len);
 }
@@ -1175,8 +1355,11 @@ static const struct obmf_dialect obmf_lstp_dialect = {
 
 /*
  * LSTP 1.0, 2: no functional descriptor and bulk endpoints of at least
- * 64 bytes. A message is one packet of at most 512 bytes, and a
- * response may take up to a second.
+ * 64 bytes. It lets a message span packets and a packet carry several;
+ * the driver keeps to one message of at most 512 bytes per packet, the
+ * form LSTP firmware handles. A response is waited for at least a
+ * second, ten times the 100 ms LSTP 1.0, 1 asks of the device, so that
+ * a slow device's answer is not taken for none.
  */
 static const struct obmf_usb_profile obmf_lstp_usb_profile = {
 	.max_packet = OBMF_LSTP_MAX_MSG,
@@ -1200,6 +1383,7 @@ const struct obmf_usb_proto obmf_lstp_usb_proto = {
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/serial.h>
+#include <linux/spi/spi.h>
 #include <linux/tracepoint.h>
 #include <linux/tty.h>
 #include <linux/workqueue.h>
@@ -1211,8 +1395,19 @@ const struct obmf_usb_proto obmf_lstp_usb_proto = {
 static struct obmf_channel *lt_chan(struct kunit *test, u8 type)
 {
 	struct obmf_channel *ch = kunit_kzalloc(test, sizeof(*ch), GFP_KERNEL);
+	static atomic_t ids = ATOMIC_INIT(0);
+	struct device *dev;
+	char name[32];
 
 	KUNIT_ASSERT_NOT_NULL(test, ch);
+	ch->core = kunit_kzalloc(test, sizeof(*ch->core), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ch->core);
+	/* Names the debug lines of the code under test */
+	snprintf(name, sizeof(name), "obmf-lstp-test.%d",
+		 atomic_inc_return(&ids));
+	dev = kunit_device_register(test, name);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	ch->core->dev = dev;
 	ch->dialect_data =
 		kunit_kzalloc(test, sizeof(struct obmf_lstp_ch), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ch->dialect_data);
@@ -1403,7 +1598,7 @@ static void lt_i2c_decode_status(struct kunit *test)
 		{ 0x03, 0x03 },
 		{ 0x04, OBMF_STATUS_I2C_NACK },
 		{ 0x05, OBMF_STATUS_I2C_ARB_LOST },
-		{ 0x06, 0x06 },
+		{ 0x06, OBMF_STATUS_INVALID },
 		{ 0x07, OBMF_STATUS_SIZE_UNSUPPORTED },
 		{ 0x08, 0x08 },
 		{ 0x7f, 0x7f },
@@ -1449,6 +1644,225 @@ static void lt_i2c_decode_bad(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			obmf_lstp_decode(ch, r->wire, r->wire_len, out, 4,
 					 r->pending, NULL),
+			-EPROTO);
+}
+
+/* OBMF-ICP request (Table 50) and LSTP request; LSTP 1.0, 4.2.2 */
+static const struct lt_row lt_spi_requests[] = {
+	{ "read, CS0, assert and de-assert",
+	  0,
+	  { 2, 0, 5, 0, 0x31, 0, 0, 0x02, 0x01 },
+	  9,
+	  { 2, 0x31, 4, 0, 0x02, 0x01, 0, 0 },
+	  8 },
+	{ "write, CS1, assert",
+	  0,
+	  { 2, 0, 7, 0, 0x62, 2, 0, 0, 0, 0xaa, 0xbb },
+	  11,
+	  { 2, 0x62, 2, 0, 0xaa, 0xbb },
+	  6 },
+	{ "write-read, CS0, keep",
+	  0,
+	  { 2, 0, 6, 0, 0x03, 1, 0, 1, 0, 0x9f },
+	  10,
+	  { 2, 0x03, 1, 0, 0x9f },
+	  5 },
+	{ "write-read, CS1, de-assert",
+	  0,
+	  { 2, 0, 7, 0, 0x53, 2, 0, 2, 0, 0x05, 0x00 },
+	  11,
+	  { 2, 0x53, 2, 0, 0x05, 0x00 },
+	  6 },
+	{ "write without data, CS1, de-assert",
+	  0,
+	  { 2, 0, 5, 0, 0x52, 0, 0, 0, 0 },
+	  9,
+	  { 2, 0x52, 0, 0 },
+	  4 },
+};
+
+/* LSTP response and OBMF-ICP response (Table 51) */
+static const struct lt_row lt_spi_responses[] = {
+	{ "read",
+	  0x31,
+	  { 2, 0x80, 6, 0, 0x01, 3, 0, 1, 2, 3 },
+	  10,
+	  { 2, 0x80, 3, 0, 1, 2, 3 },
+	  7 },
+	{ "write", 0x62, { 2, 0x80, 3, 0, 0x02, 0, 0 }, 7, { 2, 0x80, 0, 0 }, 4 },
+	{ "write-read",
+	  0x73,
+	  { 2, 0x80, 4, 0, 0x03, 1, 0, 0xef },
+	  8,
+	  { 2, 0x80, 1, 0, 0xef },
+	  5 },
+	{ "error with data: the echo only",
+	  0x31,
+	  { 2, 0x81, 1, 0, 0x01 },
+	  5,
+	  { 2, 0x81, 2, 0, 9, 9 },
+	  6 },
+	{ "NOT_SUPP", 0x22, { 2, 0x81, 1, 0, 0x02 }, 5, { 2, 0x86, 0, 0 }, 4 },
+	{ "TOO_LARGE", 0x33, { 2, 0x86, 1, 0, 0x03 }, 5, { 2, 0x87, 0, 0 }, 4 },
+	{ "ARB_LOST", 0x33, { 2, 0x84, 1, 0, 0x03 }, 5, { 2, 0x85, 0, 0 }, 4 },
+};
+
+/*
+ * Every command with each chip select and CS flag pair, then the table:
+ * the READ request byte for byte, its 4-byte length included
+ */
+static void lt_spi_encode_table(struct kunit *test)
+{
+	struct obmf_channel *ch = lt_chan(test, OBMF_TYPE_SPI);
+	const struct lt_row *r;
+	u8 buf[32], cmd;
+	int i;
+
+	for (i = 0; i < 2 * 4 * 3; i++) {
+		cmd = (i / 12) << 6 | (i / 3 % 4) << 4 | (i % 3 + 1);
+		memset(buf, 0, sizeof(buf));
+		buf[0] = LT_CH;
+		buf[2] = 6;
+		buf[4] = cmd;
+		buf[5] = cmd & 2 ? 1 : 0;
+		buf[7] = cmd & 1 ? 1 : 0;
+		buf[9] = 0x5a;
+		KUNIT_EXPECT_EQ_MSG(test,
+				    obmf_lstp_encode(ch, buf, 9 + !!(cmd & 2),
+						     sizeof(buf)),
+				    (ssize_t)(cmd & 2 ? 5 : 8), "cmd %#x", cmd);
+		KUNIT_EXPECT_EQ_MSG(test, buf[1], cmd, "cmd %#x", cmd);
+	}
+	for (i = 0; i < ARRAY_SIZE(lt_spi_requests); i++) {
+		r = &lt_spi_requests[i];
+		memcpy(buf, r->icp, r->icp_len);
+		KUNIT_EXPECT_EQ_MSG(test,
+				    obmf_lstp_encode(ch, buf, r->icp_len,
+						     sizeof(buf)),
+				    (ssize_t)r->wire_len, "%s", r->what);
+		KUNIT_EXPECT_MEMEQ_MSG(test, buf, r->wire, r->wire_len, "%s",
+				       r->what);
+	}
+}
+
+/* What LSTP cannot carry, and sizes that do not match the data */
+static void lt_spi_encode_bad(struct kunit *test)
+{
+	static const struct lt_row bad[] = {
+		{ "short", 0, { 2, 0, 4, 0, 0x02, 0, 0, 0 }, 8 },
+		{ "CS2", 0, { 2, 0, 6, 0, 0x82, 1, 0, 0, 0, 7 }, 10 },
+		{ "CS3", 0, { 2, 0, 6, 0, 0xc2, 1, 0, 0, 0, 7 }, 10 },
+		{ "posted write", 0, { 2, 0, 6, 0, 0x04, 1, 0, 0, 0, 7 }, 10 },
+		{ "command 0", 0, { 2, 0, 6, 0, 0x00, 1, 0, 0, 0, 7 }, 10 },
+		{ "command 5", 0, { 2, 0, 6, 0, 0x05, 1, 0, 0, 0, 7 }, 10 },
+		{ "command 15", 0, { 2, 0, 6, 0, 0x0f, 1, 0, 0, 0, 7 }, 10 },
+		{ "write-read, sizes differ",
+		  0,
+		  { 2, 0, 6, 0, 0x03, 1, 0, 2, 0, 7 },
+		  10 },
+		{ "write with a read size",
+		  0,
+		  { 2, 0, 6, 0, 0x02, 1, 0, 1, 0, 7 },
+		  10 },
+		{ "read with data", 0, { 2, 0, 6, 0, 0x01, 1, 0, 1, 0, 7 }, 10 },
+		{ "read of 0", 0, { 2, 0, 5, 0, 0x01, 0, 0, 0, 0 }, 9 },
+		{ "write size above the data",
+		  0,
+		  { 2, 0, 6, 0, 0x02, 2, 0, 0, 0, 7 },
+		  10 },
+		{ "write size below the data",
+		  0,
+		  { 2, 0, 7, 0, 0x02, 1, 0, 0, 0, 7, 8 },
+		  11 },
+	};
+	struct obmf_channel *ch = lt_chan(test, OBMF_TYPE_SPI);
+	u8 buf[32];
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(bad); i++) {
+		memcpy(buf, bad[i].icp, bad[i].icp_len);
+		KUNIT_EXPECT_EQ_MSG(test,
+				    obmf_lstp_encode(ch, buf, bad[i].icp_len,
+						     sizeof(buf)),
+				    -EINVAL, "%s", bad[i].what);
+	}
+	/* A device request on the channel has no LSTP form */
+	memcpy(buf, lt_spi_responses[1].wire, 4);
+	buf[1] = 0x02;
+	KUNIT_EXPECT_EQ(test,
+			obmf_lstp_decode(ch, buf, 4, buf + 8, 16, 0, NULL),
+			-EOPNOTSUPP);
+}
+
+static void lt_spi_decode_table(struct kunit *test)
+{
+	struct obmf_channel *ch = lt_chan(test, OBMF_TYPE_SPI);
+	const struct lt_row *r;
+	u8 out[32];
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(lt_spi_responses); i++) {
+		r = &lt_spi_responses[i];
+		memset(out, 0xee, sizeof(out));
+		KUNIT_EXPECT_EQ_MSG(test,
+				    obmf_lstp_decode(ch, r->wire, r->wire_len,
+						     out, sizeof(out),
+						     r->pending, NULL),
+				    (ssize_t)r->icp_len, "%s", r->what);
+		KUNIT_EXPECT_MEMEQ_MSG(test, out, r->icp, r->icp_len, "%s",
+				       r->what);
+	}
+	/* a response past the cap */
+	r = &lt_spi_responses[0];
+	KUNIT_EXPECT_EQ(test,
+			obmf_lstp_decode(ch, r->wire, r->wire_len, out,
+					 r->icp_len - 1, r->pending, NULL),
+			-EPROTO);
+	KUNIT_EXPECT_EQ(test,
+			obmf_lstp_decode(ch, r->wire, r->wire_len, out,
+					 r->icp_len, r->pending, NULL),
+			(ssize_t)r->icp_len);
+}
+
+/*
+ * A WRITE answered with data, as LSTP firmware has been seen to: success
+ * with a read size of 0 and nothing copied. An error status still gives
+ * the echo alone, and a response past the cap is still refused.
+ */
+static void lt_spi_decode_write_data(struct kunit *test)
+{
+	struct obmf_channel *ch = lt_chan(test, OBMF_TYPE_SPI);
+	static const u8 one[] = { 2, 0x80, 1, 0, 0x00 };
+	static const u8 three[] = { 2, 0x80, 3, 0, 1, 2, 3 };
+	static const u8 err[] = { 2, 0x81, 1, 0, 0x00 };
+	static const u8 want[] = { 2, 0x80, 3, 0, 0x02, 0, 0 };
+	static const u8 want_err[] = { 2, 0x81, 1, 0, 0x02 };
+	u8 out[32];
+	int i;
+
+	memset(out, 0xee, sizeof(out));
+	KUNIT_EXPECT_EQ(test,
+			obmf_lstp_decode(ch, one, sizeof(one), out, sizeof(out),
+					 0x32, NULL),
+			(ssize_t)sizeof(want));
+	KUNIT_EXPECT_MEMEQ(test, out, want, sizeof(want));
+	for (i = sizeof(want); i < sizeof(out); i++)
+		KUNIT_EXPECT_EQ_MSG(test, out[i], 0xee, "byte %d", i);
+	memset(out, 0xee, sizeof(out));
+	KUNIT_EXPECT_EQ(test,
+			obmf_lstp_decode(ch, three, sizeof(three), out,
+					 sizeof(out), 0x02, NULL),
+			(ssize_t)sizeof(want));
+	KUNIT_EXPECT_MEMEQ(test, out, want, sizeof(want));
+	KUNIT_EXPECT_EQ(test, out[sizeof(want)], 0xee);
+	KUNIT_EXPECT_EQ(test,
+			obmf_lstp_decode(ch, err, sizeof(err), out, sizeof(out),
+					 0x12, NULL),
+			(ssize_t)sizeof(want_err));
+	KUNIT_EXPECT_MEMEQ(test, out, want_err, sizeof(want_err));
+	KUNIT_EXPECT_EQ(test,
+			obmf_lstp_decode(ch, one, sizeof(one), out,
+					 sizeof(want) - 1, 0x32, NULL),
 			-EPROTO);
 }
 
@@ -1592,9 +2006,12 @@ static void lt_uart_decode_status(struct kunit *test)
 	static const u8 ack_icp[] = { 3, 0x80, 3, 0, 0, 5, 0 };
 	static const u8 nack_icp[] = { 3, 0x80, 3, 0, OBMF_SERIAL_NACK, 0, 0 };
 	static const u8 map[][2] = {
-		{ 0x01, 0x01 }, { 0x02, 0x02 },
-		{ 0x03, 0x03 }, { 0x05, 0x05 },
-		{ 0x06, 0x06 }, { 0x07, OBMF_STATUS_SIZE_UNSUPPORTED },
+		{ 0x01, 0x01 },
+		{ 0x02, 0x02 },
+		{ 0x03, 0x03 },
+		{ 0x05, OBMF_STATUS_PERMANENT_ERROR },
+		{ 0x06, OBMF_STATUS_INVALID },
+		{ 0x07, OBMF_STATUS_SIZE_UNSUPPORTED },
 		{ 0x08, 0x08 },
 	};
 	u8 in[] = { 3, 0x80, 0, 0, 0 };
@@ -1692,7 +2109,7 @@ static void lt_uart_answer(struct kunit *test)
 static void lt_other_types(struct kunit *test)
 {
 	static const u8 types[] = { OBMF_TYPE_CONFIG, OBMF_TYPE_MMIO,
-				    OBMF_TYPE_IPMI, OBMF_TYPE_SPI, 0x20 };
+				    OBMF_TYPE_IPMI, 0x20 };
 	u8 req[] = { 5, 0x00, 1, 0, 0 };
 	u8 resp[] = { 5, 0x80, 1, 0, 0 };
 	struct obmf_channel *ch;
@@ -1771,7 +2188,7 @@ static const struct lt_row lt_gpio_responses[] = {
 	{ "set", 0x01, { 2, 0x80, 1, 0, 0x01 }, 5, { 2, 0x80, 0, 0 }, 4 },
 	{ "not supported",
 	  0x00,
-	  { 2, 0x86, 1, 0, 0x00 },
+	  { 2, 0x80 | OBMF_STATUS_INVALID, 1, 0, 0x00 },
 	  5,
 	  { 2, 0x86, 0, 0 },
 	  4 },
@@ -2333,12 +2750,18 @@ static void lt_stop(struct obmf_transport *tp)
 {
 }
 
+/* The case unbinds a failed core itself */
+static void lt_release(struct obmf_transport *tp)
+{
+}
+
 static const struct obmf_transport_ops lt_ops = {
 	.start = lt_start,
 	.stop = lt_stop,
 	.quiesce = lt_stop,
 	.resume = lt_start,
 	.send = lt_send,
+	.release = lt_release,
 };
 
 static void lt_blob(struct lt_fake *f, int nr, u8 type, const char *name,
@@ -2376,6 +2799,24 @@ static struct obmf_lstp_gpio_cfg *lt_gpio(u8 *p, const char *name, u8 dir,
 }
 
 /*
+ * The fake's function devices have the test names, which no function
+ * driver matches, except in the suite of the function drivers: there the
+ * driver binds the fake's devices, which reach no hardware
+ */
+static bool lt_fn_names;
+
+static int __maybe_unused lt_fn_suite_init(struct kunit_suite *suite)
+{
+	lt_fn_names = true;
+	return 0;
+}
+
+static void __maybe_unused lt_fn_suite_exit(struct kunit_suite *suite)
+{
+	lt_fn_names = false;
+}
+
+/*
  * Channel 0 with @n channels, I2C first, then UART, then GPIO: a block
  * with one open-drain output released at start, and an empty block
  */
@@ -2408,6 +2849,7 @@ static struct lt_fake *lt_create(struct kunit *test, size_t max_msg, int n)
 	f->tp.dev = kunit_device_register(test, name);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, f->tp.dev);
 	f->tp.ops = &lt_ops;
+	f->tp.test_names = !lt_fn_names;
 	f->tp.max_tx_msg = max_msg;
 	f->tp.max_rx_msg = max_msg;
 	f->tp.resp_timeout_floor_ms = 100;
@@ -2423,6 +2865,8 @@ static void lt_unbind_action(void *data)
 
 static int lt_bind(struct lt_fake *f)
 {
+	int ret;
+
 	KUNIT_ASSERT_EQ(f->test,
 			obmf_dialect_attach(&f->tp, &obmf_lstp_usb_proto), 0);
 	f->core = obmf_core_create(&f->tp);
@@ -2430,12 +2874,16 @@ static int lt_bind(struct lt_fake *f)
 	KUNIT_ASSERT_EQ(f->test,
 			kunit_add_action_or_reset(f->test, lt_unbind_action, f),
 			0);
-	return obmf_core_bind(f->core);
+	ret = obmf_core_bind(f->core);
+	if (ret)
+		return ret;
+	flush_work(&f->core->bind_work);
+	return f->core->bind_err;
 }
 
 /*
  * Three channels on 64-byte packets: the GPIO configuration takes two reads
- * and an empty one, and is kept as read beside its translation
+ * and an empty one, and only its translation is kept
  */
 static void lt_discover(struct kunit *test)
 {
@@ -2454,7 +2902,7 @@ static void lt_discover(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ch->info.type, OBMF_TYPE_I2C_CONTROLLER);
 	KUNIT_EXPECT_EQ(test, ch->info.role, OBMF_ROLE_PRODUCER);
 	KUNIT_EXPECT_STREQ(test, ch->info.name, "i2c");
-	KUNIT_EXPECT_EQ(test, ch->info.max_req, 63);
+	KUNIT_EXPECT_EQ(test, ch->info.max_req, 61);
 	KUNIT_EXPECT_EQ(test, ch->info.max_resp, 64);
 	KUNIT_ASSERT_EQ(test, ch->info.config_len, 2);
 	KUNIT_EXPECT_EQ(test, ch->info.config[0], 1);
@@ -2489,10 +2937,7 @@ static void lt_discover(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, e->line.drive, OBMF_LSTP_GPIO_OPEN_DRAIN);
 	KUNIT_EXPECT_EQ(test, le16_to_cpu(e->line.bias_strength), 0x0102);
 	lc = ch->dialect_data;
-	KUNIT_ASSERT_EQ(test, lc->cfg_len, 50);
-	KUNIT_EXPECT_EQ(test, lc->cfg[0], 1);
-	KUNIT_EXPECT_EQ(test, lc->cfg[1 + 33], OBMF_LSTP_GPIO_Z);
-	KUNIT_EXPECT_EQ(test, lc->cfg[49], 0);
+	KUNIT_EXPECT_EQ(test, lc->cfg_len, 50);
 	KUNIT_EXPECT_NULL(test, f->core->chans[4]);
 }
 
@@ -2508,7 +2953,7 @@ static void lt_discover_none(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, f->core->chans[1]);
 	KUNIT_EXPECT_FALSE(test,
 			   f->core->chans[1]->info.quirks.i2c_dev_retries);
-	KUNIT_EXPECT_EQ(test, f->core->chans[1]->info.max_req, 511);
+	KUNIT_EXPECT_EQ(test, f->core->chans[1]->info.max_req, 509);
 	KUNIT_EXPECT_EQ(test, f->core->chans[1]->info.max_resp, 512);
 
 	f = lt_create(test, 64, 0);
@@ -2578,6 +3023,75 @@ static void lt_discover_i2c_short(struct kunit *test)
 	lt_blob(f, 1, OBMF_LSTP_TYPE_I2C, "i2c", lt_i2c_cfg, 0);
 	KUNIT_ASSERT_EQ(test, lt_bind(f), 0);
 	KUNIT_EXPECT_NULL(test, f->core->chans[1]);
+}
+
+/* The SPI configuration (LSTP 1.0, 4.2.1) as OBMF-ICP Table 84 */
+static struct obmf_channel *lt_spi_bind(struct kunit *test, const u8 *cfg,
+					size_t len, unsigned int *warns)
+{
+	struct lt_fake *f = lt_create(test, 64, 1);
+
+	lt_blob(f, 1, OBMF_LSTP_TYPE_SPI, "spi", cfg, len);
+	KUNIT_ASSERT_EQ(test, lt_bind(f), 0);
+	*warns = f->core->bind_warns;
+	return f->core->chans[1];
+}
+
+/*
+ * The device count, clamped to the two chip selects a command can name
+ * with one warning, and the clock in both directions; mode 0, 8 bits.
+ * No devices or no clock are passed on; a configuration without the
+ * clock drops the channel.
+ */
+static void lt_discover_spi(struct kunit *test)
+{
+	static const u8 full[13] = { 2, 0x00, 0x36, 0x6e, 0x01, 1, 0, 2, 0 };
+	static const u8 three[5] = { 3, 0x40, 0x42, 0x0f, 0x00 };
+	static const u8 none[5] = { 0, 0x40, 0x42, 0x0f, 0x00 };
+	static const u8 slow[5] = { 1, 0, 0, 0, 0 };
+	const struct obmf_spi_cfg *c;
+	struct obmf_channel *ch;
+	unsigned int warns;
+
+	ch = lt_spi_bind(test, full, sizeof(full), &warns);
+	KUNIT_ASSERT_NOT_NULL(test, ch);
+	KUNIT_EXPECT_EQ(test, ch->info.type, OBMF_TYPE_SPI);
+	KUNIT_EXPECT_EQ(test, ch->info.role, OBMF_ROLE_PRODUCER);
+	KUNIT_EXPECT_NOT_NULL(test, ch->fdev);
+	KUNIT_ASSERT_EQ(test, ch->info.config_len, 20);
+	c = (const struct obmf_spi_cfg *)ch->info.config;
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(c->supported_flags), 0);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(c->flags), 0);
+	KUNIT_EXPECT_EQ(test, c->num_devices, 2);
+	KUNIT_EXPECT_EQ(test, c->reserved[0] | c->reserved[1] | c->reserved[2],
+			0);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(c->rd_max_speed_hz), 24000000);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(c->wr_max_speed_hz), 24000000);
+	KUNIT_EXPECT_EQ(test, warns, 0);
+
+	ch = lt_spi_bind(test, three, sizeof(three), &warns);
+	KUNIT_ASSERT_NOT_NULL(test, ch);
+	c = (const struct obmf_spi_cfg *)ch->info.config;
+	KUNIT_EXPECT_EQ(test, c->num_devices, 2);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(c->rd_max_speed_hz), 1000000);
+	KUNIT_EXPECT_EQ(test, warns, 1);
+
+	ch = lt_spi_bind(test, none, sizeof(none), &warns);
+	KUNIT_ASSERT_NOT_NULL(test, ch);
+	c = (const struct obmf_spi_cfg *)ch->info.config;
+	KUNIT_EXPECT_EQ(test, c->num_devices, 0);
+	KUNIT_EXPECT_EQ(test, warns, 0);
+
+	ch = lt_spi_bind(test, slow, sizeof(slow), &warns);
+	KUNIT_ASSERT_NOT_NULL(test, ch);
+	c = (const struct obmf_spi_cfg *)ch->info.config;
+	KUNIT_EXPECT_EQ(test, c->num_devices, 1);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(c->rd_max_speed_hz), 0);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(c->wr_max_speed_hz), 0);
+
+	ch = lt_spi_bind(test, full, 4, &warns);
+	KUNIT_EXPECT_NULL(test, ch);
+	KUNIT_EXPECT_EQ(test, warns, 1);
 }
 
 /*
@@ -3125,9 +3639,8 @@ static void lt_i2c_round_trip(struct kunit *test)
 		u8 status;
 		int err;
 	} st[] = {
-		{ 0x01, -EIO },	     { 0x02, -ETIMEDOUT },
-		{ 0x03, -EBUSY },    { 0x04, -ENXIO },
-		{ 0x05, -EAGAIN },   { 0x06, -EOPNOTSUPP },
+		{ 0x01, -EIO },	     { 0x02, -ETIME },	{ 0x03, -EBUSY },
+		{ 0x04, -ENXIO },    { 0x05, -EAGAIN }, { 0x06, -EOPNOTSUPP },
 		{ 0x07, -EMSGSIZE }, { 0x09, -EIO },
 	};
 	struct lt_fake *f = lt_create(test, 64, 2);
@@ -3184,6 +3697,125 @@ static void lt_i2c_round_trip(struct kunit *test)
 					sizeof(resp), &len, 0),
 			-EINVAL);
 	KUNIT_EXPECT_EQ(test, f->sends, i);
+}
+
+/* Channel 1 an SPI channel of one device at 1 MHz */
+static struct lt_fake *lt_spi_fake(struct kunit *test, size_t max_msg)
+{
+	static const u8 cfg[5] = { 1, 0x40, 0x42, 0x0f, 0x00 };
+	struct lt_fake *f = lt_create(test, max_msg, 1);
+
+	lt_blob(f, 1, OBMF_LSTP_TYPE_SPI, "spi", cfg, sizeof(cfg));
+	KUNIT_ASSERT_EQ(test, lt_bind(f), 0);
+	KUNIT_ASSERT_NOT_NULL(test, f->core->chans[1]);
+	KUNIT_ASSERT_EQ(test, f->core->chans[1]->info.type, OBMF_TYPE_SPI);
+	return f;
+}
+
+/* An SPI write-read through the core, then the statuses as errnos */
+static void lt_spi_round_trip(struct kunit *test)
+{
+	static const u8 wire[] = { 1, 0x33, 2, 0, 0x9f, 0x00 };
+	static const u8 reply[] = { 1, 0x80, 2, 0, 0xff, 0xef };
+	static const u8 resp_want[] = { 2, 0, 0xff, 0xef };
+	static const u8 req[] = { 2, 0, 2, 0, 0x9f, 0x00 };
+	static const u8 wr[] = { 1, 0, 0, 0, 0x06 };
+	static const struct {
+		u8 status;
+		int err;
+	} st[] = {
+		{ 0x01, -EIO },	     { 0x02, -ETIME }, { 0x03, -EBUSY },
+		{ 0x04, -EIO },	     { 0x05, -EIO },   { 0x06, -EOPNOTSUPP },
+		{ 0x07, -EMSGSIZE }, { 0x09, -EIO },
+	};
+	struct lt_fake *f = lt_spi_fake(test, 64);
+	struct obmf_channel *ch = f->core->chans[1];
+	u8 resp[16], m[4];
+	size_t len;
+	int i;
+
+	lt_set_reply(f, reply, sizeof(reply));
+	KUNIT_EXPECT_EQ(test,
+			obmf_ch_request(ch, 0x33, req, sizeof(req), resp,
+					sizeof(resp), &len, 0),
+			0);
+	KUNIT_EXPECT_EQ(test, f->sent_len, sizeof(wire));
+	KUNIT_EXPECT_MEMEQ(test, f->sent, wire, sizeof(wire));
+	KUNIT_ASSERT_EQ(test, len, sizeof(resp_want));
+	KUNIT_EXPECT_MEMEQ(test, resp, resp_want, sizeof(resp_want));
+
+	for (i = 0; i < ARRAY_SIZE(st); i++) {
+		obmf_lstp_hdr(m, 1, 0x80 | st[i].status, 0);
+		lt_set_reply(f, m, sizeof(m));
+		KUNIT_EXPECT_EQ_MSG(test,
+				    obmf_ch_request(ch, 0x33, req, sizeof(req),
+						    resp, sizeof(resp), &len,
+						    0),
+				    st[i].err, "status %#x", st[i].status);
+	}
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&ch->cnt[OBMF_CH_STATUS_ERRORS]),
+			ARRAY_SIZE(st));
+
+	/* A write's reply with data: success, nothing read */
+	lt_set_reply(f, reply, sizeof(reply));
+	KUNIT_EXPECT_EQ(test,
+			obmf_ch_request(ch, 0x22, wr, sizeof(wr), resp,
+					sizeof(resp), &len, 0),
+			0);
+	KUNIT_ASSERT_EQ(test, len, 2);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(resp), 0);
+	KUNIT_EXPECT_EQ(test,
+			atomic_long_read(&ch->cnt[OBMF_CH_PROTOCOL_ERRORS]), 0);
+	/* Refused before it is sent */
+	i = f->sends;
+	KUNIT_EXPECT_EQ(test,
+			obmf_ch_request(ch, 0xa2, wr, sizeof(wr), resp,
+					sizeof(resp), &len, 0),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, f->sends, i);
+}
+
+/*
+ * At 64-byte packets P is 60: a write and a write-read of P bytes fill
+ * the link, one byte more does not; a read reply of P bytes fits the
+ * channel's response limit
+ */
+static void lt_spi_limit(struct kunit *test)
+{
+	static const u8 cmds[] = { 0x22, 0x23 };
+	struct lt_fake *f = lt_spi_fake(test, 64);
+	struct obmf_channel *ch = f->core->chans[1];
+	size_t len, cap, p;
+	u8 buf[LT_MSG], out[LT_MSG];
+	int i;
+
+	cap = f->core->tp->max_tx_msg;
+	p = cap - OBMF_HDR_LEN;
+	KUNIT_EXPECT_EQ(test, ch->info.max_req, p + 5);
+	KUNIT_EXPECT_EQ(test, ch->info.max_resp, p + 3);
+	for (i = 0; i < ARRAY_SIZE(cmds); i++) {
+		len = OBMF_HDR_LEN + 5 + p;
+		memset(buf, 0xa5, sizeof(buf));
+		buf[0] = 1;
+		buf[1] = 0;
+		buf[4] = cmds[i];
+		put_unaligned_le16(p, buf + 5);
+		put_unaligned_le16(cmds[i] & 1 ? p : 0, buf + 7);
+		KUNIT_EXPECT_EQ_MSG(test, obmf_lstp_encode(ch, buf, len, cap),
+				    (ssize_t)cap, "command %#x", cmds[i]);
+		buf[4] = cmds[i];
+		put_unaligned_le16(p + 1, buf + 5);
+		put_unaligned_le16(cmds[i] & 1 ? p + 1 : 0, buf + 7);
+		KUNIT_EXPECT_EQ_MSG(test,
+				    obmf_lstp_encode(ch, buf, len + 1, cap),
+				    -EMSGSIZE, "command %#x", cmds[i]);
+	}
+	obmf_lstp_hdr(buf, 1, OBMF_HDR_RQRESP, p);
+	KUNIT_EXPECT_EQ(test,
+			obmf_lstp_decode(ch, buf, OBMF_HDR_LEN + p, out,
+					 OBMF_HDR_LEN + ch->info.max_resp, 0x21,
+					 NULL),
+			(ssize_t)(OBMF_HDR_LEN + ch->info.max_resp));
 }
 
 /* A UART write through the core, ACK then NACK */
@@ -3390,8 +4022,7 @@ static void lt_default_answer(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, lt_bind(f), 0);
 	core = f->core;
 	ch = core->chans[2];
-	/* A built-in obmf_tty holds the device */
-	device_release_driver(&ch->fdev->adev.dev);
+	KUNIT_ASSERT_NULL(test, ch->fdev->adev.dev.driver);
 
 	obmf_core_rx(core, write, sizeof(write));
 	flush_workqueue(core->wq);
@@ -3725,6 +4356,7 @@ static void lt_i2c_recovery(struct kunit *test)
 	struct lt_fake *f = lt_create(test, 64, 1);
 	struct obmf_channel *ch;
 	u8 status, specific, m[4];
+	int sends;
 
 	KUNIT_ASSERT_EQ(test, lt_bind(f), 0);
 	ch = f->core->chans[1];
@@ -3758,12 +4390,63 @@ static void lt_i2c_recovery(struct kunit *test)
 			0);
 	KUNIT_EXPECT_EQ(test, specific, OBMF_I2C_RECOVERY_FAILED);
 
+	/* A mask of 0 changes nothing and sends nothing */
+	sends = f->sends;
+	KUNIT_EXPECT_EQ(test, obmf_ch_control_update(ch->fdev, 0, 0xff), 0);
+	KUNIT_EXPECT_EQ(test, f->sends, sends);
+	KUNIT_EXPECT_EQ(test, obmf_ch_status_read(ch->fdev, &status, &specific),
+			0);
+	KUNIT_EXPECT_EQ(test, specific, OBMF_I2C_RECOVERY_FAILED);
+
 	/* BUS_RECOVERY's reply has no body */
 	lt_set_reply(f, body, sizeof(body));
 	KUNIT_EXPECT_EQ(test,
 			obmf_ch_control_update(ch->fdev,
 					       OBMF_I2C_TRIGGER_RECOVERY,
 					       OBMF_I2C_TRIGGER_RECOVERY),
+			-EMSGSIZE);
+}
+
+/* An OBMF-ICP I2C request of @len bytes, header included, to 0x50 */
+static void lt_i2c_req(u8 *buf, u8 cmd, u16 rlen, size_t len)
+{
+	buf[0] = 1;
+	buf[1] = 0;
+	put_unaligned_le16(len - OBMF_HDR_LEN, buf + 2);
+	buf[4] = cmd;
+	buf[5] = 0x50;
+	put_unaligned_le16(rlen, buf + 6);
+}
+
+/*
+ * At 64-byte packets, a write-read and a write whose write part is the
+ * adapter's limit (max_req less the command and its three bytes) both
+ * fit the link; a write-read one byte longer does not
+ */
+static void lt_i2c_write_limit(struct kunit *test)
+{
+	static const u8 cmds[] = { 0x03, 0x01 };
+	static const ssize_t wire[] = { 64, 62 };
+	struct lt_fake *f = lt_create(test, 64, 1);
+	struct obmf_channel *ch;
+	size_t len, cap;
+	u8 buf[LT_MSG];
+	int i;
+
+	KUNIT_ASSERT_EQ(test, lt_bind(f), 0);
+	ch = f->core->chans[1];
+	KUNIT_ASSERT_EQ(test, ch->info.type, OBMF_TYPE_I2C_CONTROLLER);
+	cap = f->core->tp->max_tx_msg;
+	len = OBMF_HDR_LEN + ch->info.max_req;
+	KUNIT_ASSERT_LT(test, len, sizeof(buf));
+	for (i = 0; i < ARRAY_SIZE(cmds); i++) {
+		memset(buf, 0xa5, sizeof(buf));
+		lt_i2c_req(buf, cmds[i], i ? 0 : 1, len);
+		KUNIT_EXPECT_EQ_MSG(test, obmf_lstp_encode(ch, buf, len, cap),
+				    wire[i], "command %#x", cmds[i]);
+	}
+	lt_i2c_req(buf, 0x03, 1, len + 1);
+	KUNIT_EXPECT_EQ(test, obmf_lstp_encode(ch, buf, len + 1, cap),
 			-EMSGSIZE);
 }
 
@@ -4004,6 +4687,63 @@ static void lt_info_line(struct kunit *test)
 			   "LSTP 1 device 'MCU': I2C ch2 'I2C', GPIO ch3 'gpio', serial ch5 'UART'");
 }
 
+/* The SPI controller driver on an LSTP device; only when built in */
+#if IS_BUILTIN(CONFIG_SPI_OBMF)
+
+KUNIT_DEFINE_ACTION_WRAPPER(lt_spi_put, put_device, struct device *);
+KUNIT_DEFINE_ACTION_WRAPPER(lt_spi_unregister, spi_unregister_device,
+			    struct spi_device *);
+
+/*
+ * A flash's JEDEC ID read on CS1 of two: one WRITE_READ that asserts and
+ * releases CS1, the ID back in the same transfer
+ */
+static void lt_spi_rdid(struct kunit *test)
+{
+	static const u8 cfg[5] = { 2, 0x40, 0x42, 0x0f, 0x00 };
+	static const u8 wire[] = { 1, 0x73, 4, 0, 0x9f, 0, 0, 0 };
+	static const u8 reply[] = { 1, 0x80, 4, 0, 0xff, 0xef, 0x40, 0x21 };
+	struct lt_fake *f = lt_create(test, 64, 1);
+	u8 tx[4] = { 0x9f }, rx[4] = {};
+	struct spi_transfer t = { .tx_buf = tx, .rx_buf = rx, .len = 4 };
+	struct spi_board_info info = {
+		.modalias = "obmf-kunit-spi",
+		.chip_select = 1,
+	};
+	struct spi_controller *ctlr;
+	struct obmf_channel *ch;
+	struct spi_device *spi;
+	struct device *dev;
+
+	lt_blob(f, 1, OBMF_LSTP_TYPE_SPI, "flash", cfg, sizeof(cfg));
+	KUNIT_ASSERT_EQ(test, lt_bind(f), 0);
+	ch = f->core->chans[1];
+	KUNIT_ASSERT_NOT_NULL(test, ch);
+	KUNIT_ASSERT_NOT_NULL(test, ch->fdev);
+	dev = device_find_any_child(&ch->fdev->adev.dev);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, lt_spi_put, dev),
+			0);
+	ctlr = container_of(dev, struct spi_controller, dev);
+	KUNIT_EXPECT_EQ(test, ctlr->num_chipselect, 2);
+	KUNIT_EXPECT_EQ(test, ctlr->max_speed_hz, 1000000);
+	KUNIT_EXPECT_EQ(test, ctlr->mode_bits, 0);
+
+	spi = spi_new_device(ctlr, &info);
+	KUNIT_ASSERT_NOT_NULL_MSG(test, spi, "client not added");
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, lt_spi_unregister, spi),
+			0);
+
+	lt_set_reply(f, reply, sizeof(reply));
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, &t, 1), 0);
+	KUNIT_EXPECT_EQ(test, f->sent_len, sizeof(wire));
+	KUNIT_EXPECT_MEMEQ(test, f->sent, wire, sizeof(wire));
+	KUNIT_EXPECT_MEMEQ(test, rx, reply + 4, 4);
+}
+
+#endif /* IS_BUILTIN(CONFIG_SPI_OBMF) */
+
 /* The GPIO driver on an LSTP device; only when built in */
 #if IS_BUILTIN(CONFIG_GPIO_OBMF)
 
@@ -4048,6 +4788,33 @@ static struct gpio_desc *lt_gpio_desc(struct kunit *test, struct gpio_chip *gc,
 }
 
 /*
+ * gpiod_set_value_cansleep() and the chip's set_multiple() with their
+ * result. Before v6.17 they return void, and a case that checks the
+ * result is skipped.
+ */
+static int lt_gpio_set_value(struct kunit *test, struct gpio_desc *desc,
+			     int value)
+{
+#ifdef OBMF_COMPAT_GPIO_SET_VOID
+	kunit_skip(test, "gpiod_set_value() returns void on this kernel");
+	return 0;
+#else
+	return gpiod_set_value_cansleep(desc, value);
+#endif
+}
+
+static int lt_gpio_set_multiple(struct kunit *test, struct gpio_chip *gc,
+				unsigned long *mask, unsigned long *bits)
+{
+#ifdef OBMF_COMPAT_GPIO_SET_VOID
+	kunit_skip(test, "set_multiple() returns void on this kernel");
+	return 0;
+#else
+	return gc->set_multiple(gc, mask, bits);
+#endif
+}
+
+/*
  * An LSTP output reads back the value last set, from its default output
  * on (Z on an open drain is high), whatever level the pin reports: nothing
  * is sent at probe or for the Get of an output. SET_VALUE sets it.
@@ -4068,13 +4835,13 @@ static void lt_gpio_chip_io(struct kunit *test)
 	reset = lt_gpio_desc(test, gc, 0);
 
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(reset), 1);
-	KUNIT_EXPECT_EQ(test, gpiod_set_value_cansleep(reset, 0), 0);
+	KUNIT_EXPECT_EQ(test, lt_gpio_set_value(test, reset, 0), 0);
 	KUNIT_EXPECT_EQ(test, f->gpio_sent_len, sizeof(set_wire));
 	KUNIT_EXPECT_MEMEQ(test, f->gpio_sent, set_wire, sizeof(set_wire));
 	KUNIT_EXPECT_FALSE(test, test_bit(0, f->gpio_level));
 	__set_bit(0, f->gpio_level);
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(reset), 0);
-	KUNIT_EXPECT_EQ(test, gpiod_set_value_cansleep(reset, 1), 0);
+	KUNIT_EXPECT_EQ(test, lt_gpio_set_value(test, reset, 1), 0);
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(reset), 1);
 	KUNIT_EXPECT_EQ(test, f->gpio_sends, 2);
 	KUNIT_EXPECT_EQ(test, f->sends, 0);
@@ -4098,12 +4865,12 @@ static void lt_gpio_out_shadow(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, gc);
 	reset = lt_gpio_desc(test, gc, 0);
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(reset), 1);
-	KUNIT_EXPECT_EQ(test, gpiod_set_value_cansleep(reset, 0), 0);
+	KUNIT_EXPECT_EQ(test, lt_gpio_set_value(test, reset, 0), 0);
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(reset), 0);
 
 	f->gpio_status = OBMF_LSTP_NACK;
 	f->gpio_prefix = 1;
-	KUNIT_EXPECT_EQ(test, gpiod_set_value_cansleep(reset, 1), -EIO);
+	KUNIT_EXPECT_EQ(test, lt_gpio_set_value(test, reset, 1), -EIO);
 	KUNIT_EXPECT_TRUE(test, test_bit(0, f->gpio_level));
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(reset), 0);
 	KUNIT_EXPECT_EQ(test, f->gpio_sends, 2);
@@ -4376,7 +5143,7 @@ static void lt_gpio_multiple(struct kunit *test)
 
 	mask = 0xb;
 	bits = 0x9;
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), 0);
+	KUNIT_EXPECT_EQ(test, lt_gpio_set_multiple(test, gc, &mask, &bits), 0);
 	KUNIT_EXPECT_EQ(test, f->gpio_sends, 1);
 	KUNIT_EXPECT_EQ(test, f->gpio_sent_len, sizeof(set_wire));
 	KUNIT_EXPECT_MEMEQ(test, f->gpio_sent, set_wire, sizeof(set_wire));
@@ -4395,7 +5162,8 @@ static void lt_gpio_multiple(struct kunit *test)
 	f->gpio_prefix = 2;
 	mask = 0xb;
 	bits = 0x2;
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), -EIO);
+	KUNIT_EXPECT_EQ(test, lt_gpio_set_multiple(test, gc, &mask, &bits),
+			-EIO);
 	KUNIT_EXPECT_EQ(test, f->gpio_sends, 3);
 	KUNIT_EXPECT_EQ(test, f->gpio_level[0], 0x1a);
 	f->gpio_status = 0;
@@ -4437,7 +5205,7 @@ static void lt_gpio_split(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, bits);
 	bitmap_set(mask, 0, 31);
 	bitmap_fill(bits, 62);
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, mask, bits), 0);
+	KUNIT_EXPECT_EQ(test, lt_gpio_set_multiple(test, gc, mask, bits), 0);
 	KUNIT_EXPECT_EQ(test, f->gpio_sends, 2);
 	KUNIT_EXPECT_EQ(test, f->gpio_sent_len, OBMF_HDR_LEN + 11 * 3);
 	KUNIT_EXPECT_TRUE(test, bitmap_full(f->gpio_level, 31));
@@ -4461,6 +5229,10 @@ static struct kunit_case obmf_lstp_cases[] = {
 	KUNIT_CASE(lt_i2c_encode_bad),
 	KUNIT_CASE(lt_i2c_decode_status),
 	KUNIT_CASE(lt_i2c_decode_bad),
+	KUNIT_CASE(lt_spi_encode_table),
+	KUNIT_CASE(lt_spi_encode_bad),
+	KUNIT_CASE(lt_spi_decode_table),
+	KUNIT_CASE(lt_spi_decode_write_data),
 	KUNIT_CASE(lt_uart_encode_table),
 	KUNIT_CASE(lt_uart_dreq_table),
 	KUNIT_CASE(lt_uart_bad),
@@ -4481,6 +5253,7 @@ static struct kunit_case obmf_lstp_cases[] = {
 	KUNIT_CASE(lt_discover_skip),
 	KUNIT_CASE(lt_discover_i2c_short),
 	KUNIT_CASE(lt_discover_uart_short),
+	KUNIT_CASE(lt_discover_spi),
 	KUNIT_CASE(lt_discover_budget),
 	KUNIT_CASE(lt_info_line),
 	KUNIT_CASE_SLOW(lt_discover_fail),
@@ -4494,22 +5267,40 @@ static struct kunit_case obmf_lstp_cases[] = {
 	KUNIT_CASE_SLOW(lt_discover_short),
 	KUNIT_CASE_SLOW(lt_discover_silent),
 	KUNIT_CASE(lt_i2c_round_trip),
+	KUNIT_CASE(lt_spi_round_trip),
+	KUNIT_CASE(lt_spi_limit),
 	KUNIT_CASE(lt_uart_round_trip),
 	KUNIT_CASE(lt_gpio_round_trip),
 	KUNIT_CASE(lt_default_answer),
 	KUNIT_CASE(lt_rx_before_publish),
+	KUNIT_CASE(lt_wire_then_request),
+	KUNIT_CASE(lt_late_reply),
+	KUNIT_CASE(lt_i2c_recovery),
+	KUNIT_CASE(lt_i2c_write_limit),
+	{}
+};
+
+static struct kunit_suite obmf_lstp_suite = {
+	.name = "obmf-lstp",
+	.test_cases = obmf_lstp_cases,
+};
+
+#if IS_BUILTIN(CONFIG_OBMF_TTY) || IS_BUILTIN(CONFIG_I2C_OBMF) || \
+	IS_BUILTIN(CONFIG_GPIO_OBMF) || IS_BUILTIN(CONFIG_SPI_OBMF)
+/* The function drivers on an LSTP device, those built in */
+static struct kunit_case obmf_lstp_fn_cases[] = {
 #if IS_BUILTIN(CONFIG_OBMF_TTY)
 	KUNIT_CASE(lt_uart_closed),
 	KUNIT_CASE(lt_uart_refused),
 	KUNIT_CASE(lt_uart_queue_full),
 #endif
-	KUNIT_CASE(lt_wire_then_request),
-	KUNIT_CASE(lt_late_reply),
-	KUNIT_CASE(lt_i2c_recovery),
 #if IS_BUILTIN(CONFIG_I2C_OBMF)
 	KUNIT_CASE(lt_i2c_pec),
 	KUNIT_CASE_SLOW(lt_i2c_no_recovery),
 	KUNIT_CASE_SLOW(lt_i2c_late_reply),
+#endif
+#if IS_BUILTIN(CONFIG_SPI_OBMF)
+	KUNIT_CASE(lt_spi_rdid),
 #endif
 #if IS_BUILTIN(CONFIG_GPIO_OBMF)
 	KUNIT_CASE(lt_gpio_chip_io),
@@ -4526,11 +5317,16 @@ static struct kunit_case obmf_lstp_cases[] = {
 	{}
 };
 
-static struct kunit_suite obmf_lstp_suite = {
-	.name = "obmf-lstp",
-	.test_cases = obmf_lstp_cases,
+static struct kunit_suite obmf_lstp_fn_suite = {
+	.name = "obmf-lstp-fn",
+	.suite_init = lt_fn_suite_init,
+	.suite_exit = lt_fn_suite_exit,
+	.test_cases = obmf_lstp_fn_cases,
 };
 
+kunit_test_suites(&obmf_lstp_suite, &obmf_lstp_fn_suite);
+#else
 kunit_test_suite(obmf_lstp_suite);
+#endif
 
 #endif /* CONFIG_OBMF_LSTP_KUNIT_TEST */

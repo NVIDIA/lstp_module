@@ -90,16 +90,18 @@ items about code or tools that are not in this drop.
 - Options: no busy during discovery; busy with a bounded host retry;
   busy leaving the channel out.
 - This driver: on OBMF-ICP, a busy answer to a channel 0 read fails
-  the bind with "discovery failed: -EBUSY". On LSTP, a busy device header
-  is retried for a few discovery passes and then fails the bind with
-  "device busy"; a busy answer to any read of a channel's
+  discovery with "discovery failed: -EBUSY", and the driver releases
+  the interface. On LSTP, a busy device header is retried for a few
+  discovery passes and then fails discovery the same way; a busy
+  answer to any read of a channel's
   configuration leaves that channel out with "channel <n>: status 0x3,
   ignored".
 - Prerequisites: answer channel 0 with status 0x00 from the first
   request after the interface is configured; if start-up takes time,
   connect to the bus later rather than answer busy.
-- If your device differs: it binds without channels, or without the
-  busy channel, until the interface is bound again or the device is
+- If your device differs: it gets no function device and the
+  interface is released, or on LSTP it binds without the busy
+  channel, until the interface is bound again or the device is
   replugged (KI-14).
 - Closes when: the specification answers it; with a bounded retry if
   busy is allowed.
@@ -141,19 +143,25 @@ items about code or tools that are not in this drop.
   driver resets the device.
 - Options: fail the message, no reset; resend it once; reset the device
   after repeated stalls.
-- This driver: on a bulk OUT stall it logs "bulk out stalled", clears
-  the halt and fails the message with `-EPIPE` (`-EIO` on I2C); a
-  message is never sent twice. On a bulk IN stall it logs "bulk in
-  stalled", clears the halt and goes on reading. A halt clear that
-  fails logs "bulk in clear halt failed: <errno>" or "bulk out clear
-  halt failed: <errno>". It resets
+- This driver: on a bulk OUT stall it logs "bulk out stalled" and
+  fails the message with `-EPIPE` (`-EIO` on I2C and SPI); a message is never
+  sent twice. Its recovery work then cancels every message queued on
+  the endpoint behind the stalled one (they fail with `-EPIPE` too)
+  and clears the halt, once per burst of stalls; until the clear
+  succeeds, every send fails with `-EPIPE` and sends nothing. A serial
+  port drops the characters of a write caught this way (KI-33). On a
+  bulk IN stall it logs "bulk in stalled", clears the halt and goes on
+  reading. A halt clear that fails logs "bulk in clear halt failed:
+  <errno>" or "bulk out clear halt failed: <errno>" and is tried again
+  after 250 ms; ten failures in a row stop the device. It resets
   neither the device nor the port; only the USB core does that, on its
   own errors.
 - Prerequisites: after `CLEAR_FEATURE(ENDPOINT_HALT)` on either bulk
   endpoint, take and answer new messages with no reset (8.2 step 1);
   treat the stalled message as gone.
 - If your device differs: a device that expects a resend loses the
-  request; a device that needs a reset after a stall stays stopped
+  request, and the requests of other channels caught by the same
+  stall; a device that needs a reset after a stall stays stopped
   until it is re-enumerated (KI-11).
 - Closes when: the specification answers both points.
 
@@ -607,7 +615,8 @@ items about code or tools that are not in this drop.
   set lines: <errno>", counted in `events/gpio_set_failed`). A Set
   split over several messages stops at the first refused one; the
   messages before it stay set.
-- Prerequisites: apply all entries of a Set Values message or none.
+- Prerequisites: apply all entries of a Set Values message or none
+  (AS-104).
 - If your device differs: after a refused Set an output can be at a
   level the driver does not know: reads give the value set before,
   until the line is set again.
@@ -837,7 +846,9 @@ items about code or tools that are not in this drop.
   devices, with a counter per event; a rate limit per device; none.
 - This driver: counts every event in the interface's `events/`
   directory in debugfs and logs it at most 10 times per 5 s from each
-  place in the code, for all devices together.
+  place in the code, for all devices together. The configuration
+  warnings of a bind are not part of this: each bind logs its first
+  ten and then one line with the number not logged.
 - Prerequisites: a report carries the first lines and the `events/`
   counters (`TESTING.md`, "What to send with a report").
 - If your setup differs: with several devices failing at once, the
@@ -996,20 +1007,6 @@ items about code or tools that are not in this drop.
   fails with `-EOPNOTSUPP`.
 - Closes when: LSTP or OBMF-ICP defines a target mode.
 
-## AS-61: two devices' I2C adapters can have the same name
-
-- Specification: none; the I2C core does not require unique adapter
-  names.
-- Options: "<device name>_<channel name>"; add the USB path to the
-  name.
-- This driver: names each adapter "<device name>_<channel name>", from
-  the names the device reports; the I2C core numbers the buses.
-- Prerequisites: on a board with two identical devices, find a bus by
-  its firmware node, its USB path or its number, not by name alone.
-- If your board differs: a lookup by name finds one of the two
-  adapters, so a tool can talk to the wrong device.
-- Closes when: a board needs unique names.
-
 ## AS-62: a Set Interrupt Config the device refuses leaves the interrupt off until the next change
 
 - Specification: OBMF-ICP 1.0.0, Table 17, lets a device refuse a Set
@@ -1094,16 +1091,415 @@ items about code or tools that are not in this drop.
 - Closes when: a device with GPIO interrupts is run under a burst of
   edges.
 
-## AS-67: two devices' GPIO chips can have the same label
+## AS-68: a request the device does not take off the bus within the response wait would not have been answered
 
-- Specification: none; the GPIO core does not require unique chip
-  labels, and a GPIO lookup table names its chip by label.
-- Options: "<device name>_<channel name>"; add the USB path to the
-  label.
-- This driver: labels each chip "<device name>_<channel name>", from
-  the names the device reports, as it names the I2C adapters (AS-61).
-- Prerequisites: on a board with two identical devices, describe GPIO
-  consumers through firmware nodes, not lookup tables.
-- If your board differs: a lookup by label finds one of the two chips,
-  so a consumer can drive the other device's line.
-- Closes when: a board needs unique labels.
+- Specification: OBMF-ICP over USB 1.0 gives no time within which a
+  device must accept a request on its bulk OUT endpoint.
+- Options: one wait for sending and answering, both `ETIMEDOUT`; a
+  shorter send wait with its own errno.
+- This driver: waits for the bulk OUT transfer for the whole response
+  wait; a send that does not finish in that time fails with
+  `ETIMEDOUT`, and on a serial channel the wait doubles after it as
+  after no answer. Each request has its own bulk OUT transfer,
+  cancelled when its wait runs out, whatever the other channels send;
+  the time it spends queued on the endpoint behind other channels'
+  transfers counts against its wait.
+- Prerequisites: take a request off the bus within the response wait,
+  or do not answer it either.
+- If your device differs: a device that takes requests slowly but
+  answers at once costs the whole wait per request; on a serial
+  channel the wait doubles up to 10 s until the port is opened again,
+  also when the time went on other channels' transfers queued ahead of
+  it on the endpoint (the characters are kept).
+- Closes when: a device is seen whose bulk OUT transfer does not
+  finish within the response wait.
+
+## AS-69: a device sends a timeout status only after its own timeout ran
+
+- Specification: OBMF-ICP 1.0.0 Table 4 (status 0x02) and Table 21
+  (0x40) do not say how long the device waits before it answers with
+  them.
+- Options: keep the serial wait on a timeout status; double it as
+  after no answer.
+- This driver: a timeout status is an answer in time; the serial
+  driver keeps its wait and sends the characters again 10 ms later.
+- Prerequisites: answer 0x02 or 0x40 only after the request's own time
+  on the line ran out.
+- If your device differs: a device that answers 0x40 at once gets the
+  same characters every 10 ms plus the request's time, with "transmit
+  stalled" lines in the log.
+- Closes when: the time a device waits before 0x02 or 0x40 is known.
+
+## AS-70: a timeout status on channel 0 during discovery means the device is still starting
+
+- Specification: OBMF-ICP 1.0.0 Table 4 gives status 0x02 but not when
+  channel 0 sends it.
+- Options: run the discovery pass again until its deadline; fail the
+  bind at once.
+- This driver: discards a discovery pass that ends in a timeout
+  status, no answer or a malformed response, and runs it again after a
+  delay, until the discovery deadline (30 s).
+- Prerequisites: answer a channel 0 read with 0x02 only while starting
+  up.
+- If your device differs: a device whose channel 0 always answers
+  0x02 keeps discovery running until its deadline; discovery then
+  fails and the interface is released.
+- Closes when: the use of 0x02 on channel 0 is known.
+
+## AS-72: a request in flight at an unplug can time out before the disconnect
+
+- Specification: none; the USB core calls the driver's disconnect some
+  time after the cable is pulled, with no bound against the response
+  wait.
+- Options: return what happens first; turn a timeout followed by a
+  disconnect into `ENODEV`, which would delay every timeout.
+- This driver: a request whose wait runs out before the disconnect
+  fails with `ETIMEDOUT`; the disconnect ends the other waiting
+  requests with `ENODEV`, and cancels a send in flight at once, which
+  then fails with `ENODEV` too.
+- Prerequisites: none from the device. Callers do not read
+  `ETIMEDOUT` as "the device is still there".
+- If your setup differs: a caller that retries after `ETIMEDOUT`
+  sends one more request, which fails with `ENODEV`.
+- Closes when: unplug runs show which errnos occur.
+
+## AS-73: a device acknowledges a Generate Break, whether or not it can make one
+
+- Specification: LSTP 1.0, 4.5.2, asks a device to ignore an event
+  flag it does not support; OBMF-ICP 1.0.0 Table 22 says nothing.
+- Options: a break request succeeds when the device acknowledges it;
+  also accept a refusal as "no break support".
+- This driver: `tcsendbreak()` (TCSBRK) sends one Generate Break; a
+  refusal (NACK) is sent again up to 20 times, 10 ms apart, then fails
+  with `EIO`.
+- Prerequisites: a device without break support acknowledges the
+  request.
+- If your device differs: after 20 refusals `tcsendbreak()` fails with
+  `EIO` after at least 190 ms; an error status fails it with `EIO` at
+  once. On LSTP, "not supported" (0x06) gives "Operation not
+  supported", which the kernel's tty layer turns into success: no
+  break is sent, and the channel's `status_errors` counts it (seen on
+  the USB4715 board's LSTP UART, KI-35). A success shows only that the
+  device took the request, not that a break reached the line.
+- Seen in this drop's runs: the development microcontroller board's
+  OBMF-ICP and LSTP firmware acknowledge it; the USB4715 board's LSTP
+  UART refuses it (KI-35).
+- Closes when: each device's break support is known.
+
+## AS-74: an LSTP device does not send a lost arbitration on a serial channel
+
+- Specification: LSTP 1.0 defines ARB_LOST (0x05) for any request; a
+  UART has no arbitration.
+- Options: treat it as a permanent error; give it a code of its own.
+- This driver: on a channel other than I2C, ARB_LOST is reported as
+  the OBMF-ICP permanent error, the same status a serial NACK has
+  (AS-10), with `EIO`. A debug line gives the LSTP status next to the
+  OBMF-ICP one.
+- Prerequisites: send ARB_LOST only on I2C channels.
+- If your device differs: a serial lost arbitration and a serial NACK
+  give the same status and errno; only the debug line tells them
+  apart.
+- Closes when: LSTP device makers confirm it, or a run with the debug
+  line shows which status a device sends on a serial channel.
+
+## AS-76: an SPI Write without data and with de-assert only releases the chip select
+
+- Specification: Table 50 (p51) gives Write Data Size and the CS Control
+  bits with no minimum size. A device may refuse a zero-length Write, or
+  clock nothing and still not move the chip select.
+- Options: (a) rely on it (chosen); (b) no release on native devices:
+  the chip select waits for the next message's assert; (c) ask the
+  authors first.
+- This driver: On every error but -ENODEV the controller sends the Write
+  with CS Control 0b01 and sizes 0 (`spi-obmf.c:obmf_spi_release`); a
+  failure is logged once per ratelimit window and the next message
+  asserts afresh.
+- Prerequisites: A device takes an SPI Write with Write Data Size 0 and
+  moves the chip select by the CS Control bits alone.
+- If your device differs: The release fails ("chip select N not
+  released") or does nothing, and the chip select stays asserted until
+  the next message asserts it again; a device on another chip select may
+  see two selected.
+- Seen in this drop's runs: the development microcontroller board's
+  LSTP firmware answers this release with status 0x01 (KI-34).
+- Closes when: The firmware authors confirm a zero-length Write, or a run
+  shows the chip select released after an error.
+
+## AS-77: an OBMF-ICP SPI Write/Read is full duplex
+
+- Specification: Table 50 has separate Write and Read Data Sizes for
+  Write/Read and does not say whether the read happens during or after
+  the write.
+- Options: (a) full duplex (chosen; LSTP's reading); (b) write then
+  read: the controller would set SPI_CONTROLLER_HALF_DUPLEX and the SPI
+  core would refuse tx+rx transfers.
+- This driver: tx and rx in one transfer are one Write/Read with Write
+  Data Size = Read Data Size = len.
+- Prerequisites: A native device clocks both directions at once for
+  Write/Read.
+- If your device differs: Read data shifted by the write length; flash
+  ID reads return the wrong bytes. The fix is one flag.
+- Closes when: The OBMF-ICP authors say how a Write/Read clocks.
+
+## AS-78: on OBMF-ICP, a command with neither CS Control bit keeps the chip select as it was
+
+- Specification: Table 50 defines bit 5 (assert before) and bit 4
+  (de-assert after) but not what a command with neither does.
+- Options: (a) held to the next command (chosen); (b) released after
+  each command: no chip select held across transfers or the core's cut;
+  (c) ask.
+- This driver: The first transfer asserts, the middle ones keep, the
+  last de-asserts.
+- Prerequisites: A device leaves the chip select as it was when a
+  command has neither bit set.
+- If your device differs: Multi-transfer flash commands (command,
+  address, then data) lose the chip select between transfers and fail.
+- Closes when: The OBMF-ICP authors say what a command with neither
+  bit does.
+
+## AS-79: the LSTP SPI command's chip select bits are those of its bit table
+
+- Specification: LSTP 1.0 4.2.2 says "The upper 3 indicate what CS pins
+  to use" (p13), which could read as a mask of three pins, while the
+  table on p15 gives bits 4-5 as CS state flags and bit 6 as the CS
+  select.
+- Options: (a) the bit table (chosen; what existing LSTP devices use);
+  (b) the "upper 3 bits" mask: three chip selects, no CS state flags.
+- This driver: CS0 0x00 and CS1 0x40 with assert 0x20 and de-assert
+  0x10; CS2 and CS3 refused.
+- Prerequisites: An LSTP device reads bits 4-6 as the bit table on p15
+  says.
+- If your device differs: The wrong chip select, or none, is driven; a
+  flash ID read returns 0x00 or 0xff.
+- Closes when: The LSTP authors confirm the bit table, or a hardware
+  run reads the right ID on each chip select.
+
+## AS-80: an LSTP SPI channel runs mode 0 with 8-bit words, most significant bit first
+
+- Specification: LSTP 1.0 4.2.1 lists no mode, polarity, bit order or
+  word size, and the device cannot be asked.
+- Options: (a) mode 0, 8 bits, MSB first (chosen; what SPI NOR flash
+  uses); (b) refuse clients until the mode is known.
+- This driver: Table 84 flags 0: the controller offers mode 0 only and
+  8-bit words; a client asking another mode is refused at setup.
+- Prerequisites: An LSTP device clocks mode 0, 8 bits, MSB first.
+- If your device differs: Garbage on every transfer; the setup check
+  cannot catch it because the device's mode is unknown.
+- Closes when: The LSTP authors say which mode and word size a device
+  runs.
+
+## AS-81: only 8-bit SPI words are served
+
+- Specification: Table 84 (p76) defines the word-size fields; Tables 50
+  and 51 carry bytes only.
+- Options: (a) 8 bits only, another width refused at probe (chosen); (b)
+  a byte layout guessed (little endian words padded to bytes).
+- This driver: A channel configured for another width gets no controller
+  and the probe message names the widths.
+- Prerequisites: A device that wants other widths is reconfigured to 8
+  bits, or the authors define the layout.
+- If your device differs: The channel is not served; visible at probe,
+  never wrong data.
+- Closes when: The spec defines the layout of wider words.
+
+## AS-82: the higher of the read and write clocks is the channel's clock
+
+- Specification: Table 84 (p77) names both as "Requested maximum SPI
+  clock frequency" for each direction, not how one transfer in both
+  directions is clocked.
+- Options: (a) the higher (chosen): no client is overclocked; (b)
+  the lower: a client rated between the two runs
+  above its rating in one direction.
+- This driver: min_speed_hz = max_speed_hz = max(RD, WR); setup refuses
+  a client slower than that; the length cut uses min(RD, WR).
+- Prerequisites: A device clocks each direction at or below its own
+  maximum.
+- If your device differs: A client rated below the higher clock is
+  refused at setup though it would work in one direction.
+- Closes when: Device behaviour is known or the authors say which clock
+  a Write/Read uses.
+
+## AS-83: an SPI transfer of at most 400 ms on the wire is answered within the default timeout
+
+- Specification: Neither specification bounds the device's time to
+  answer a long SPI transfer.
+- Options: (a) the default wait and the clock / 20 cut (chosen); (b) a
+  wait scaled by the length (up to 10 s, longer than the SPI core waits at unbind); (c)
+  a smaller cut.
+- This driver: Requests pass timeout 0 (the default); max_transfer_size
+  includes clock / 20.
+- Prerequisites: A device answers an SPI request within 1000 ms when its
+  wire time is at most 400 ms.
+- If your device differs: -ETIMEDOUT, then the release after the core's
+  hold; the message fails.
+- Closes when: A hardware run of long reads at the slowest clock, or a
+  device timing statement.
+
+## AS-90: an LSTP NOT_SUPP means the request is not valid for that channel
+
+- Specification: LSTP 1.0 3.1.1 has NOT_SUPP (0x06), "Device does not
+  support this command or option"; OBMF-ICP 1.0.0 Table 4 has no such
+  code, and its own 0x06 means "Request size not supported".
+- Options: INVALID with `-EOPNOTSUPP` (chosen); INVALID with `-EIO`, as
+  LSTP_ERROR and a native INVALID; the raw 0x06 passed through (read as
+  a size error; the old behaviour).
+- This driver: NOT_SUPP becomes OBMF-ICP INVALID on every channel type;
+  the caller gets `-EOPNOTSUPP`; the channel's status errors count it;
+  no device-error line is logged.
+- Prerequisites: a device sends NOT_SUPP only for a command or option
+  the channel never supports, and LSTP_ERROR for a bad parameter.
+- If your device differs: a device fault answered NOT_SUPP reaches the
+  user as `-EOPNOTSUPP`, the same as a host refusal, with no warning;
+  only the counter and the debug line show it.
+- Closes when: the firmware authors say when a device sends NOT_SUPP, or
+  a run with the debug line shows which requests get it.
+
+## AS-91: ten configuration warnings a bind, and a count of the rest, are enough to diagnose a device's channel table
+
+- Specification: neither specification bounds how many channels a device
+  lists with faults or says what a host logs about them.
+- Options: ten lines a bind and a count (chosen); one line per bad
+  channel; a ratelimit per call site; the count or the list in debugfs
+  as well.
+- This driver: the first ten channel warnings of each bind are logged,
+  then "N more configuration warnings not logged".
+- Prerequisites: a device's channel faults are few or repeat one cause.
+- If your device differs: with more than ten different faults, the log
+  says how many are missing, not which.
+- Closes when: field use shows ten lines are enough, or a report needs
+  the rest.
+
+## AS-98: a 5-byte LSTP SPI configuration (count and clock) is complete
+
+- Specification: LSTP 1.0 4.2.1 lists 13 bytes and does not say whether
+  a device may send only the fields a host uses.
+- Options: 5 bytes complete (chosen, as for the UART and I2C
+  translations); all 13 bytes required.
+- This driver: reads the device count and the clock from the first 5
+  bytes; a shorter configuration is the "short config (N), ignored" bind
+  warning and drops the channel.
+- Prerequisites: a device's SPI configuration carries the device count
+  and the clock in its first 5 bytes.
+- If your device differs: nothing is lost (the later fields are not
+  used); under 5 bytes the SPI channel is dropped with a bind warning.
+- Closes when: the LSTP firmware authors say which fields a device always
+  sends, or a hardware run shows each SPI device's configuration length.
+
+## AS-99: an OBMF-ICP SPI Write's response may end after the echo
+
+- Specification: Table 51 shows a Read Data Size in every SPI response
+  and does not say whether a write-only response may leave it out.
+- Options: both forms accepted (chosen, as the I2C driver's write-only
+  response); Read Data Size 0 required; only the echo.
+- This driver: a write-only request answered with no payload, or with a
+  Read Data Size of 0, succeeds; any other payload is -EPROTO, counted
+  as a protocol error.
+- Prerequisites: a device answers an SPI Write with no payload or with a
+  Read Data Size of 0.
+- If your device differs: that write fails with -EPROTO and a
+  protocol-error count; nothing is lost silently.
+- Closes when: the OBMF-ICP authors say which form a write-only response
+  takes, or a hardware run shows the device's form.
+
+## AS-102: a device whose firmware has stopped NAKs bulk OUT, so host sends time out
+
+- Specification: OBMF-ICP over USB 1.0 names a NAK only for bulk IN
+  with no data, and a STALL as the failure signal (6, p14; 8.1, p17);
+  it does not say what a device that stops taking OUT data does.
+- Options: it NAKs, and the host's sends time out; it keeps taking
+  data, and the responses time out; it stalls or does not answer the
+  transfer, and sends fail at once.
+- This driver: sends each request in its own bulk OUT transfer, waits
+  for it at most the request's timeout and then cancels it, whatever
+  the other channels send; so every option is bounded the same way.
+- Prerequisites: none.
+- If your device differs: a stuck device shows response timeouts
+  ("no response") instead of send timeouts, or `EPIPE` or `EIO` at
+  once; nothing else changes.
+- Closes when: a run with the firmware halted shows which, or the
+  device controller's documentation says it.
+
+## AS-103: the host cancels a timed-out send within about 0.5 s, so an SPI unbind with a silent device ends inside the SPI core's wait
+
+- Specification: none; this is host behaviour. With a device that does
+  not answer, an SPI unbind waits for the message in flight and one
+  request that releases its chip select, each up to a hold, a wait and
+  the cancel of its transfer: about 4 s plus twice the cancel time,
+  against the SPI core's wait for its queue of at least 5 s.
+- Options: rely on a cancel within about 0.5 s; skip the release for a
+  removed client, which would halve the bound.
+- This driver: sends one release after the request in flight fails,
+  also when its client is gone; every later message of a removed
+  client fails at once with `ESHUTDOWN`.
+- Prerequisites: none from the device; the host's USB controller
+  cancels a bulk OUT transfer, and a small buffer is allocated, within
+  about 0.5 s each.
+- If your setup differs: on a host that is much slower, the SPI core
+  gives up waiting for its queue ("problem destroying queue") while a
+  message is still running; that message can then use memory the
+  unbind has freed and crash the host (the use after free this drop
+  fixed, KI-31 in `CHANGELOG.md`).
+- Closes when: the cancel time is measured on the target hosts.
+
+## AS-104: a GPIO Set Values message with an invalid entry changes no line and returns one status
+
+- Specification: a Set Values response has one status for the whole
+  message (OBMF-ICP 1.0.0 Table 19, p33; Table 3, p26); neither
+  OBMF-ICP 1.0.0, 5.4 (p30), nor LSTP 1.0, 4.3.2 (p19), says whether a
+  message with one invalid entry changes the other lines, or which
+  status the device returns.
+- Options: all or none per message; the valid entries applied (the
+  host would then have to read the lines back).
+- This driver: never sends an invalid entry itself; after a refused
+  Set it keeps the values set before for that message's lines and
+  reads nothing back (AS-34); a Set of more lines than one message
+  holds goes out as several messages.
+- Prerequisites: on a Set with any invalid entry, change no line, and
+  answer 0x40 for an unknown index, 0x42 for a write to an input, 0x01
+  for reserved data or a bad payload, the first failing entry in the
+  message deciding.
+- If your device differs: lines it did change read back their old
+  values, without an error, until they are set again.
+- Closes when: the specification or the device's documentation says
+  it.
+
+## AS-105: a device answers a second request on a busy channel with busy (0x03) and never sends the first one's late response after it
+
+- Specification: one outstanding request per channel (OBMF-ICP 1.0.0
+  Table 1 #15, p12; OBMF-ICP over USB 1.0, 6, p14), with no status for
+  a second one and no tag that matches a response to its request
+  (Table 3, p26).
+- Options: busy (0x03), not run, counted per channel; 0x01; queue it
+  or run it.
+- This driver: sends a channel's next request only after the one
+  before has been answered, or has timed out and a hold of up to 1 s
+  has passed; drops a response that comes with no request waiting;
+  gives the caller `EBUSY` for 0x03.
+- Prerequisites: answer within the host's timeout (0x02 if needed);
+  answer a second request 0x03 at once, without running it; send the
+  first one's late response before that or not at all.
+- If your device differs: 0x01 gives `EIO` and a "device error"
+  warning; a late response sent after the busy answer can answer the
+  host's next request (KI-1).
+- Closes when: the specification says it.
+
+## AS-106: an LSTP SPI WRITE answer may carry data; it is ignored
+
+- Specification: LSTP 1.0, 4.2.2 (p14) gives the response to a WRITE
+  as the 4-byte header alone; whether a longer one is malformed is not
+  said. LSTP firmware has been seen to answer a WRITE with status
+  0 and one data byte. Not stated in the specification.
+- Options: the status decides and the data is ignored (chosen); the
+  header only, data an error (every write-only SPI transfer then fails
+  on such firmware); exactly one extra byte.
+- This driver: a WRITE answered with status 0 and any data succeeds
+  with nothing read; the data is not passed on, and a rate-limited
+  debug line gives the channel and the length. An error status decides
+  the outcome whatever data follows; an answer longer than the
+  request's buffer is still a protocol error (`EPROTO`).
+- Prerequisites: status 0 on a WRITE means the data was written; data
+  after the header carries nothing the host needs.
+- If your device differs: if the data reports a partial write, the
+  host reports success for a write the device did not finish.
+- Closes when: the firmware or specification authors say what the data
+  is.

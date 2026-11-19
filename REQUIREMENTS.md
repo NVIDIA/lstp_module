@@ -6,9 +6,13 @@ platform description, and what it offers to user space.
 ## Kernel versions
 
 The code is written against the current mainline kernel interfaces.
-It was built against Linux 6.12 and 6.18 (arm64)
+It was built against Linux 6.12 (v6.12.0 and a 6.12 stable release)
+and 6.18 (arm64)
 and Linux v7.3-rc6 (arm64 and x86_64); Linux 6.12 is the oldest kernel
-it was built for. Older kernels are not supported yet.
+it was built for. Older kernels are not supported yet. It builds on
+6.18 stable releases whose `kzalloc_obj()` takes the allocation flags
+as a required argument (v6.18.34), as on those where they are
+optional.
 
 `compat/obmf-compat.h` lets the same sources build against kernels
 older than v7.3. The out-of-tree `Kbuild` includes it in every file.
@@ -16,18 +20,37 @@ It defines the newer helpers the code uses (allocation helpers, the
 scoped firmware node walk, the symbol namespace macros of 6.12, the
 default workqueue name, a tty driver flag, and for the GPIO driver
 the older form of the set callbacks and, below 6.15, the check of the
-line mask on request) when the kernel lacks them, and is empty on a
+line mask on request, and the tty port hang-up helper missing from
+v6.12) when the kernel lacks them, and is empty on a
 kernel that has them all. `Kbuild` checks the kernel headers, or for
 the GPIO line mask the kernel version, for four of them. In a kernel tree the
 header is not used.
 
 ## Kernel configuration
 
-The kernel needs `CONFIG_USB` and `CONFIG_AUXILIARY_BUS=y`. The I2C
+The kernel needs `CONFIG_USB` and `CONFIG_AUXILIARY_BUS=y`.
+
+Out of tree, the kernel the modules are built for must have
+`CONFIG_AUXILIARY_BUS=y` itself: the `select AUXILIARY_BUS` of the
+driver's Kconfig entry applies only in a kernel tree. The option has
+no prompt, so it is set only when something in the kernel's
+configuration selects it. From Linux 7.0 `CONFIG_ACPI` selects it;
+before 7.0, and on kernels without ACPI (often the case for arm64
+boards and BMCs), it depends on other drivers that select it, and a
+kernel may lack it. Without it the modules cannot be built or loaded:
+the auxiliary bus functions they call are missing. Check with
+`grep AUXILIARY_BUS /boot/config-$(uname -r)` or the build tree's
+`.config`; to get it, enable a driver that selects it, or build the
+driver in the kernel tree.
+
+The I2C
 driver needs `CONFIG_I2C`, the serial driver the tty layer, and the
 GPIO driver `CONFIG_GPIOLIB` with `CONFIG_GPIOLIB_IRQCHIP`; out of
 tree, `gpio-obmf.ko` is built only against a kernel that has
-`CONFIG_GPIOLIB_IRQCHIP`.
+`CONFIG_GPIOLIB_IRQCHIP`. The SPI driver needs
+`CONFIG_SPI_MASTER`; out of tree, `spi-obmf.ko` is built only against
+a kernel that has it. `auto_bind_spidev` needs the spidev driver
+(`CONFIG_SPI_SPIDEV`).
 `CONFIG_DEBUG_FS` gives the counters, `CONFIG_DYNAMIC_DEBUG` the debug
 messages at run time, and `CONFIG_FAULT_INJECTION_DEBUG_FS` the
 transfer fault injection.
@@ -41,6 +64,10 @@ In a kernel tree, `drivers/usb/misc/obmf/Kconfig` has:
 | `CONFIG_OBMF_LSTP` | bool | LSTP devices; depends on `OBMF_DIALECTS` |
 | `CONFIG_OBMF_KUNIT_TEST` | bool | the KUnit suites; depends on `KUNIT`, selects `DTC` |
 | `CONFIG_OBMF_LSTP_KUNIT_TEST` | bool | the LSTP suite; depends on `OBMF_LSTP` |
+| `CONFIG_I2C_OBMF` | tristate | `i2c-obmf.ko`; depends on `I2C` and `USB_OBMF` |
+| `CONFIG_OBMF_TTY` | tristate | `obmf_tty.ko`; depends on `TTY` and `USB_OBMF` |
+| `CONFIG_GPIO_OBMF` | tristate | `gpio-obmf.ko`; depends on `GPIOLIB` and `USB_OBMF`, selects `GPIOLIB_IRQCHIP` |
+| `CONFIG_SPI_OBMF` | tristate | `spi-obmf.ko`; depends on `SPI_MASTER` and `USB_OBMF` |
 
 Out of tree, the `make` switches set the same options:
 `OBMF_DIALECTS=y`, `OBMF_LSTP=y` (which also sets the dialect
@@ -48,11 +75,13 @@ support), `OBMF_KUNIT_TEST=y` (which needs a kernel with
 `CONFIG_KUNIT` and `CONFIG_DTC`, and with `OBMF_LSTP=y` adds the LSTP
 suite), and `OBMF_DEBUG=y`, which builds every file with `DEBUG`.
 
-The I2C, serial and GPIO drivers have no Kconfig entries yet. Their
-KUnit cases are built only when the driver is built into the kernel
-(`CONFIG_I2C_OBMF=y`, `CONFIG_OBMF_TTY=y`, `CONFIG_GPIO_OBMF=y`, the
-names the entries will have), so an out-of-tree KUnit build has none
-of them. The serial
+The KUnit cases of the function drivers are built only when the
+driver is built into the kernel (`CONFIG_I2C_OBMF=y`,
+`CONFIG_OBMF_TTY=y`, `CONFIG_GPIO_OBMF=y`,
+`CONFIG_SPI_OBMF=y`), so an out-of-tree KUnit build
+has none of them. `.kunitconfig` enables every
+suite, with the dialects and LSTP. The KUnit build is for test kernels
+only: do not load it on a system that drives real devices. The serial
 cases that check the kernel log read it from the console tracepoint:
 they need `CONFIG_PRINTK` and tracepoints (`.kunitconfig` sets
 `CONFIG_FTRACE=y`) and are skipped without them.
@@ -95,7 +124,20 @@ Messages:
   one request per channel at a time. After a timeout the host waits
   up to 1000 ms more for the late response, which it drops, before
   the channel's next request; a response later than that is taken as
-  the answer to the next request (`ASSUMPTIONS.md`).
+  the answer to the next request (`ASSUMPTIONS.md`);
+- requests and answers of different channels can follow each other on
+  the bulk OUT endpoint without waiting for one another: each is its
+  own bulk transfer (OBMF-ICP over USB 1.0, 6). The time a message
+  waits on the endpoint behind other channels' messages counts against
+  its timeout, so a device that takes messages off the bus slowly
+  makes busy channels time out (`ASSUMPTIONS.md`);
+- after a bulk OUT stall, the host sends one
+  `CLEAR_FEATURE(ENDPOINT_HALT)` for the burst; the messages queued
+  behind the stalled one are cancelled before the clear and are not
+  sent again (OBMF-ICP over USB 1.0, 8.2; `ASSUMPTIONS.md`);
+- a device whose firmware stops taking bulk OUT data may NAK it, stall
+  it or keep taking it: each host send is bounded by its own timeout
+  whichever it does (`ASSUMPTIONS.md`).
 
 Channel 0 (OBMF-ICP 1.0.0, 5.15):
 
@@ -215,6 +257,26 @@ The GPIO driver expects this of a device:
 
 GPIO interrupts were tested with unit-test fakes only.
 
+### SPI channels
+
+The SPI driver expects this of a device:
+
+- A configuration (Table 84) with 1 to 4 chip selects, a clock of at
+  least 20 Hz, 8 bits per word, and mode bits without no chip select, ready,
+  dual, quad, octal or a chip select per word; the request and response
+  limits larger than the SPI headers (5 and 3 bytes). Otherwise the
+  channel gets no controller. The host never writes the
+  configuration.
+- Write/Read clocks both ways together, with the same length out and
+  in (full duplex), and answers with the bytes read.
+- The chip select bits of each request are followed: assert before,
+  release after, or neither (the chip select stays as it is until the
+  next request). A Write with no data and the release bit releases the
+  chip select and nothing else; the host sends one after a failed
+  transfer.
+- An answer within the default wait of 1 s: a transfer is cut to at
+  most 400 ms on the wire at the configured clock.
+
 ## Device requirements: LSTP
 
 The interface has no functional descriptor. Each message is one bulk
@@ -232,7 +294,10 @@ out. A channel may end at most 683 slices short, and a discovery pass
 at most 5461; past either, the channel is left out with "over
 budget".
 
-I2C, UART and GPIO channels get function devices. An I2C configuration
+I2C, UART, GPIO and SPI
+channels get function devices. An I2C write-read is one byte shorter
+on the wire than in OBMF-ICP form and a plain write three; the
+adapter's write limit is that of a write-read. An I2C configuration
 needs at least its first byte, the speed; the fields it lacks read as
 0. The UART configuration starts with the bytes of OBMF-ICP Table 78,
 needs at least those 7, and follows the serial rules above: the host
@@ -245,6 +310,13 @@ support is left out of the GPIO chip. GET_VALUE is answered with the
 states in the order of the request. SET_IRQ_CONFIG carries one line;
 an IRQ_EVENT lists lines whose offsets fit 12 bits, each with a state
 of 0 or 1, which the host checks and does not use.
+An SPI configuration (LSTP 1.0, 4.2.1) needs at least its first 5
+bytes, the device count and the clock; the fields after them are not
+used (`ASSUMPTIONS.md`). A shorter one leaves the channel out, with
+one warning ("short config"). More than two chip selects are cut to
+two, with one warning. SPI requests use the chip select bits of LSTP
+1.0, 4.2.2; no posted write is sent. LSTP SPI is taken as mode 0 and 8
+bits per word (`ASSUMPTIONS.md`).
 
 ## Describing function devices: device tree, ACPI, software nodes
 
@@ -284,6 +356,16 @@ consumer that takes a line as an interrupt from device tree needs the
 node to be an interrupt controller with two cells (the line and the
 edge). Only the match of the node to the function device is tested
 (KUnit); consumers through a node are not tested yet.
+
+An SPI channel's node belongs to its function device,
+`obmf.spi.<id>`, and the SPI controller takes it. On device tree the
+clients are its child nodes, with `reg` the chip select and
+`#address-cells = <1>`, `#size-cells = <0>` in the channel's node, as
+for any SPI controller; on ACPI they are the devices whose
+`SpiSerialBus` resource names the channel's object. A client must ask
+for the channel's mode and a clock at or above the channel's, and for
+no chip select setup or hold time, or it is refused at setup. SPI
+clients through a firmware node are not tested yet.
 
 If an I2C channel's node has `clock-frequency`, it must equal the bus
 speed in the channel's configuration; otherwise the I2C probe fails with
@@ -434,7 +516,8 @@ On the USB interface:
   (`ARCHITECTURE.md`, "Counters").
 
 On the auxiliary bus, one device per function channel, named
-`obmf.i2c.<id>`, `obmf.serial.<id>` or `obmf.gpio.<id>` in
+`obmf.i2c.<id>`, `obmf.serial.<id>`, `obmf.gpio.<id>` or
+`obmf.spi.<id>` in
 `/sys/bus/auxiliary/devices/`, each with:
 
 - `name`: the channel name (CHANNEL_NAME, Table 65);
@@ -446,6 +529,13 @@ the SMBus commands emulated on them except Quick (no Host Notify and
 no block read yet). Its quirks: no zero-length messages, and read and
 write lengths up to the channel's payload limits less four bytes.
 Only 7-bit addresses. The adapter's timeout covers its retries.
+
+SPI: an SPI controller, a child of the auxiliary device, with a
+dynamic bus number (`/sys/class/spi_master/spi<B>`), its clients as
+`spi<B>.<cs>`. It takes the SPI core's messages with the limits and
+refusals of `ARCHITECTURE.md`. With `auto_bind_spidev=1` (out of tree
+only, for development and debugging only) and no firmware clients,
+each chip select is `/dev/spidev<B>.<cs>`.
 
 Serial: a tty `/dev/ttyOBMF<n>`, with up to 256 ports in the system,
 below its auxiliary device, in

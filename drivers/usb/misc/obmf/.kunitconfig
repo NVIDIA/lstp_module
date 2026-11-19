@@ -10,6 +10,15 @@ CONFIG_OF=y
 CONFIG_OF_OVERLAY=y
 CONFIG_GPIOLIB=y
 CONFIG_GPIO_OBMF=y
+CONFIG_TTY=y
+CONFIG_SPI=y
+CONFIG_SPI_MASTER=y
+CONFIG_SPI_OBMF=y
+
+# Every suite: the dialect core and LSTP, with their tests
+CONFIG_OBMF_DIALECTS=y
+CONFIG_OBMF_LSTP=y
+CONFIG_OBMF_LSTP_KUNIT_TEST=y
 
 # The console tracepoint, for the serial cases' log checks
 CONFIG_FTRACE=y

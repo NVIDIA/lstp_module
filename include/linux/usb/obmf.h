@@ -134,6 +134,16 @@ struct obmf_gpio_cfg_entry {
 	u8 reserved[3];
 } __packed;
 
+/* OBMF-ICP 1.0.0, 5.15.2, Table 84 */
+struct obmf_spi_cfg {
+	__le32 supported_flags;
+	__le32 flags;
+	u8 num_devices;
+	u8 reserved[3];
+	__le32 rd_max_speed_hz;
+	__le32 wr_max_speed_hz;
+} __packed;
+
 #define OBMF_DEFAULT_TIMEOUT_MS 1000
 #define OBMF_MAX_TIMEOUT_MS 10000
 

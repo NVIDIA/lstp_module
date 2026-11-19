@@ -57,7 +57,10 @@ struct obmf_i2c {
 	struct obmf_i2c_resp *resp;
 };
 
-/* Documentation/i2c/fault-codes.rst has no -ECHRNG, -EPIPE or -EMSGSIZE */
+/*
+ * Documentation/i2c/fault-codes.rst has no -ECHRNG, -EPIPE, -EMSGSIZE or
+ * -ETIME; a timeout the device reports is -ETIMEDOUT, as no answer is
+ */
 static int obmf_i2c_errno(int err)
 {
 	switch (err) {
@@ -66,6 +69,8 @@ static int obmf_i2c_errno(int err)
 		return -EIO;
 	case -EMSGSIZE:
 		return -EOPNOTSUPP;
+	case -ETIME:
+		return -ETIMEDOUT;
 	}
 	return err;
 }

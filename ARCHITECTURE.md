@@ -5,12 +5,13 @@ instance of the lower three; the function drivers bind the devices the
 instance creates.
 
 ```text
-  user space      /dev/i2c-N        /dev/ttyOBMFn      /dev/gpiochipN
-                      |                  |                  |
-  function        i2c-obmf.ko        obmf_tty.ko        gpio-obmf.ko
-  drivers             |                  |                  |
-                 obmf.i2c.<id>     obmf.serial.<id>   obmf.gpio.<id>   auxiliary bus
-                      +--------+---------+------------------+
+  user space      /dev/i2c-N     /dev/ttyOBMFn    /dev/gpiochipN   SPI clients
+                      |               |                |              |
+  function        i2c-obmf.ko     obmf_tty.ko      gpio-obmf.ko    spi-obmf.ko
+  drivers             |               |                |              |
+                 obmf.i2c.<id>  obmf.serial.<id>  obmf.gpio.<id>  obmf.spi.<id>
+                      +--------+------+----------------+--------------+
+                               |  (auxiliary bus)
   obmf.ko                      |  include/linux/usb/obmf.h
                  function device registry (obmf-bus.c)
                  channel 0 and discovery  (obmf-ctrl.c)
@@ -45,9 +46,31 @@ transfer carries one whole message, header included; the send limit
 is the descriptor's write size, and each IN buffer holds the read
 size plus one header.
 
-Two bulk IN transfers are kept queued, and one bulk OUT transfer is in
-flight at a time. A message is never sent twice: a failed or timed-out
-send is an error for the caller.
+Two bulk IN transfers are kept queued. Each send has its own bulk OUT
+transfer, allocated for it, and several can be in flight at once
+(each channel still has at most one request in flight, see "Requests
+from the host"): the channels are independent (OBMF-ICP over USB 1.0, 6), and the
+endpoint's queue keeps each channel's messages in order. No lock is
+held across a transfer. A send submits its transfer, waits for it at
+most its own timeout and then cancels it, whatever the other sends
+do, so the time a request spends in the transport is bounded by its
+own timeout. A short spinlock covers only a send's check of the
+transport's state (stopped, quiesced, bulk OUT halted), its count of
+sends in flight and its submission; the submission therefore does
+not sleep. The stop cancels every bulk OUT transfer and refuses new
+ones (`-ENODEV`), the quiesce of a system suspend refuses new ones
+(`-EAGAIN`) and waits until none is in flight. A send can fail with
+`-ENOMEM` when its transfer cannot be allocated or the USB core
+refuses its submission for lack of memory; any other refused
+submission is `-EIO`. Time a transfer
+spends queued on the endpoint behind other channels' transfers counts
+against its own timeout. A message is never sent twice: a failed or
+timed-out send is an error for the caller.
+
+When a device takes no data, every send ends at its own timeout; none
+waits for another send to end before its own timeout starts. (Before
+drop 5 one bulk OUT transfer was in flight at a time, under a lock,
+and a send waited for the others first.)
 
 On a stalled bulk IN endpoint the transport logs "bulk in stalled",
 clears the halt and queues the transfers again (OBMF-ICP over USB 1.0,
@@ -57,9 +80,17 @@ message. Ten bulk IN errors or stalls in a row stop the device: the
 core logs "transport failed: <errno>, device stopped", tells the
 function drivers (see "Lifetime"), and every later request fails with
 `-EIO` until the interface is bound again. On a stalled bulk OUT
-endpoint the transport logs "bulk out stalled", the halt is cleared
-(a failure logs "bulk out clear halt failed: <errno>" and counts as a
-failed bulk OUT transfer) and that send fails with `-EPIPE`. None of
+endpoint the send that met the stall fails with `-EPIPE` at once, and
+the transport logs "bulk out stalled" and marks the endpoint halted.
+The recovery work, which also clears bulk IN halts, then cancels
+every bulk OUT transfer still queued (each fails with `-EPIPE`),
+clears the halt, and lets sends through again. While the endpoint is
+marked, every send fails with `-EPIPE` and sends nothing, so the
+endpoint is idle during the clear (OBMF-ICP over USB 1.0, 8.2). A
+failed clear logs "bulk out clear halt failed: <errno>", counts as a
+failed bulk OUT transfer and is tried again after 250 ms, on its own
+count: ten failures in a row stop the device as above. A resume
+queues the recovery work again while the endpoint is marked. None of
 these lines is logged while the device goes away (`-ENODEV`). The driver does not reset the port or the device; that
 is left to the USB core.
 
@@ -89,6 +120,13 @@ The response is checked before the caller sees it:
   taken, and the length must be the one asked for;
 - a response longer than the caller's buffer is `-EPROTO`.
 
+A timeout status from the device (0x02, or the channel type's timeout
+0x40 on I2C, I3C and serial channels) is `-ETIME`, so a function
+driver can tell it from no response in time (`-ETIMEDOUT`). The I2C
+and GPIO drivers give their users `-ETIMEDOUT` for both, as does a
+serial break; the serial driver uses the difference for its wait
+(below).
+
 The wait is the caller's timeout, or 1000 ms by default, at most
 10000 ms, and at least the profile's floor. A request that gets no
 response in time fails with `-ETIMEDOUT` and logs "channel <n>: no
@@ -98,11 +136,25 @@ for one default timeout (1000 ms), so that response does not answer
 it. A stop or suspend of the device ends such a wait. A response that
 comes after it ended is still taken by the next request (see
 `KNOWN-ISSUES.md` and `ASSUMPTIONS.md`). A send that times out sets
-no such wait. During a software unbind, the
+no such wait. During a software unbind of the interface, the
 first timeout, of a send or of a response, stops the device ("no
 response during unbind, device stopped"). From then on requests fail
 at once and no answer is sent, so that the removal of the function
 drivers does not wait a timeout for every request.
+
+That rule is for the whole interface only. While one function
+driver is unbound, the device and the other channels stay in use and
+the core keeps no state for that unbind: each request of the
+driver's teardown goes out over the live transport and ends on its
+own timeout like any other request, and a timeout fails no later
+request (a device that drops one reply still gets the rest of the
+teardown). Answers to the device's requests still go out, and the
+other channels are not affected.
+
+With one transfer per send (above), a request ends within its slot
+(the channel's earlier request), the hold for a late response, its
+own wait and the cancel of its transfer, whatever the other channels
+do.
 
 ### Events
 
@@ -201,9 +253,19 @@ transport can carry.
 A pass that times out, gets a malformed response, or sees the device
 header change is discarded and run again, after the device has been
 quiet for one response timeout. There are at most three passes within
-30 seconds. Any other error fails the probe at once, with "discovery
+30 seconds. Any other error ends discovery at once, with "discovery
 failed: <errno>", or "channel 0 changed during discovery" when the
-header kept changing.
+header kept changing; the interface is then released (see Lifetime).
+
+Discovery does not run in probe: probe starts the transfers and
+queues discovery in a work item, so a device that gives no answer
+holds neither probe nor the parent device's lock. `obmf/name` reads
+empty until discovery has read the device's name. Each discovery logs
+at most ten configuration warnings (a wrong channel number, a bad
+layout, small limits, a channel left out, a cut configuration, a node
+that does not fit, a function device not added); the rest are counted
+and summed up in one line, "<n> more configuration warnings not
+logged".
 
 ### Enabled channels only
 
@@ -234,11 +296,12 @@ driver:
 | GPIO (0x02) | producer | `obmf.gpio.<id>` |
 | I2C controller (0x04) | producer | `obmf.i2c.<id>` |
 | serial (0x03) | producer or symmetric | `obmf.serial.<id>` |
+| SPI (0x08) | producer | `obmf.spi.<id>` |
 
 Each kind looks for a firmware node: GPIO channels a node named
 `gpio`, I2C channels one named `i2c`, serial channels one named
-`serial`. Every other channel is discovered
-and logged at debug level, but gets no device yet. `<id>` is unique
+`serial`, SPI channels one named `spi`. Every other channel is
+discovered and logged at debug level, but gets no device yet. `<id>` is unique
 across all OBMF-ICP interfaces in the system; it is not the channel
 number.
 
@@ -263,6 +326,9 @@ data and per-channel quirks) and calls the functions of
 
 - `devm_obmf_enable()`, first in probe, and `devm_obmf_publish()`,
   last in probe, which also hands over the device request operations;
+  its undo is the first step of the driver's unbind, after which
+  device requests get the default answer; teardown requests after it
+  go out over the live transport, each ending on its own timeout;
 - `obmf_request()`, one request and its response;
 - `obmf_respond()` and `obmf_dreq_drop()`, for device requests;
 - `obmf_fdev_label()`, a name of the form `<device name>_<channel
@@ -277,7 +343,7 @@ data and per-channel quirks) and calls the functions of
   core cannot decode;
 - `obmf_fdev_errno()`, the errno a request would fail with now (0
   while the device works, `-EAGAIN` while it is suspended, `-EIO`
-  after a transport failure, `-ENODEV` once it is gone).
+  after a transport failure, `-ENODEV` once it is gone or stopped).
 
 The operations a driver publishes may include `failed`: the core
 calls it once, in process context, after a transport failure stopped
@@ -456,6 +522,79 @@ driver's locks. At unbind the device requests stop before the chip is
 removed. The interrupt configuration is not sent again after a device
 reset (`ASSUMPTIONS.md`).
 
+### SPI (`spi-obmf.ko`)
+
+One SPI controller per SPI channel (`devm_spi_alloc_host()`), with
+the channel's firmware node, so the SPI core creates the clients from
+device tree children (`reg` is the chip select) or ACPI
+`SpiSerialBus` resources. `bus_num` is dynamic. The probe enables the
+channel, reads and checks its configuration (OBMF-ICP Table 84), and
+registers the controller, then publishes the channel last; a refused
+configuration logs one message and binds nothing.
+
+- Transfers: the SPI core's message loop calls `transfer_one` for
+  each transfer, and the driver sends one request: Write/Read (equal
+  sizes, full duplex), Write or Read (OBMF-ICP Tables 50 and 51). The
+  driver has no `set_cs`: the chip select number and its assert and
+  release bits travel in each request. The first transfer of a
+  message asserts, the last one and a middle one with `cs_change`
+  release; the last transfer's `cs_change` is ignored, so the chip
+  select is always free between messages.
+- Checks before anything is sent, `EINVAL`. In `optimize_message`,
+  with a debug line only, as user space can send such messages at
+  will and the SPI core logs nothing for them: the transfers whose
+  chip select move would reach no wire (a first or last transfer
+  without data, one without data that has `cs_change`, one without
+  data with a delay right after a `cs_change`), `word_delay`, a delay
+  on a transfer that releases the chip select (`cs_change`, or the
+  last), `cs_off`. At setup: mode bits the channel
+  does not have, `SPI_NO_CS` among them, are refused by the SPI core's
+  own mode check (`setup: unsupported mode bits`, an error line); the
+  driver refuses fewer mode bits than the channel's and a client
+  slower than the channel's clock with a debug line, and chip select
+  setup and hold times with an error line, and the SPI core logs
+  `Failed to setup device: -22` (an error line) for each of these.
+- Settings: `mode_bits` are the configured wire bits; 8 bits per
+  word; one clock, the higher of the read and write maxima of Table
+  84, which is also the minimum (`min_speed_hz` = `max_speed_hz`).
+  `num_chipselect` is SPI_NUM_DEVICES (1 to 4).
+- Limits: `max_transfer_size` is the smallest of the request limit
+  less 5 header bytes, the response limit less 3, 65535, and the
+  clock divided by 20 (at most 400 ms on the wire). The SPI core
+  splits longer transfers with the chip select held. Every request
+  uses the default wait (1000 ms).
+- Errors: a device timeout status is `-ETIMEDOUT` for SPI clients, as
+  no answer is; the channel statuses give `-EIO` and the generic ones
+  their errnos; a response of the wrong size is a protocol error,
+  `-EPROTO`. After an error on a request that held or may have held
+  the chip select, one Write with no data and the release bit goes
+  out (not after `-ENODEV`); the failed data is never sent again.
+- Unbind and unplug: devres undoes the channel's publication first,
+  then unregisters the controller. The SPI core removes every client
+  first and calls the controller's `cleanup` after each; the driver
+  then marks that chip select's client gone. The message in flight,
+  if it has another transfer, fails there with `-ESHUTDOWN`, after
+  one request that releases the chip select if it is held; a message
+  the client left queued fails at its first transfer and sends
+  nothing, as `prepare_message` clears the held mark at the start of
+  every message. The next client of that chip select clears the gone
+  mark at its setup. Only then does the SPI core wait for its queue
+  (about 5 s): the message in flight ends within its own request's
+  bound, and at most one release follows it, so the unbind ends
+  inside that wait for any device behaviour, as long as the host
+  cancels a timed-out transfer in under about 0.5 s
+  (`ASSUMPTIONS.md`), on an unbind of the SPI function device and of
+  the whole interface alike. An unplug stops the core first, so
+  every request ends with `-ENODEV`; a release that fails with
+  `-ENODEV` sends nothing and logs nothing.
+- Sleep: `spi_controller_suspend()` and `spi_controller_resume()`;
+  nothing is cached, since the configuration does not change. A
+  suspend while the device does not answer is a known issue
+  (`KNOWN-ISSUES.md`).
+- `auto_bind_spidev` (out of tree only, default off; for development
+  and debugging only): with no firmware children, one spidev device
+  per chip select, by `driver_override`, removed at unbind.
+
 ## Dialects: devices with another wire protocol
 
 A dialect lets the core serve a device whose interface speaks another
@@ -477,6 +616,12 @@ optional, and a member left unset means the native OBMF-ICP step:
 | `ch_reg` | reads and writes of a channel header byte (status, control, channel-specific status and control) | MMIO reads and writes of channel 0 |
 | `ch0_whole_msgs` (flag) | channel 0 is read in whole wire messages | 64-byte chunks |
 | `keep_ch_limits` (flag) | the channel limits are the device's, in OBMF-ICP form, and are not cut to the transport's | cut to the transport |
+
+The core gives `encode` and `decode` a buffer and its size and checks
+the length each returns against that size. A length past the buffer
+is the dialect's bug: it warns once and the message is not used (a
+request fails with `-EINVAL`, a response is a protocol error, a device
+request is malformed, an answer is not sent).
 
 `obmf_dialect_attach()` checks the table when the interface is probed.
 The probe fails with `-EINVAL` and a warning for a table that sets
@@ -540,25 +685,56 @@ every response wait is at least 1000 ms. What it translates:
   nothing sends one, as the I2C driver offers no bus recovery.
 
 The channel limits are the packet size less the header, plus what the
-OBMF-ICP form of the type adds. SPI and IPMI channels get a record
-but no translation and no device yet. Channels of other LSTP
+OBMF-ICP form of the type adds. SPI channels get their configuration
+(LSTP 1.0, 4.2.1) translated to OBMF-ICP Table 84, with at most two
+chip selects (a larger number is cut to two with one warning) and a
+configuration without the device count and the clock (its first 5
+bytes) ignored with a warning, and their requests translated both
+ways; a posted write is not used. A WRITE answered with status 0 and
+data (LSTP 1.0, 4.2.2 gives the header alone; LSTP firmware has been
+seen to add a byte) becomes the OBMF-ICP write response with a Read
+Data Size of 0: the status decides, and the data is dropped with a
+rate-limited debug line (`ASSUMPTIONS.md`). IPMI channels get a record but no translation and
+no device yet. Channels of other LSTP
 types (vendor, OEM or reserved) are left out with a warning. LSTP
 devices give no PCI-SIG vendor ID, so the core records 0 for it.
 
 An LSTP device that answers BUSY to its device header is asked again
-in the next pass. If it is still busy on the last pass, the probe
-fails with "device busy" and `-EBUSY`.
+in the next pass. If it is still busy on the last pass, discovery
+fails with "device busy" and `-EBUSY`, and the interface is released.
+
+The LSTP statuses are rewritten to their OBMF-ICP codes; "not
+supported" (0x06) becomes "invalid", and a lost arbitration (0x05) on
+a channel other than I2C a permanent error. A response that carries
+an error logs, at debug level, the LSTP status next to the OBMF-ICP
+status it became. An I2C write-read is one byte shorter on the wire
+than its OBMF-ICP form, a plain write three, and the I2C channel's
+request limit counts one, so a write-read at the adapter's write
+limit fits. Only the length of a channel's raw configuration is kept;
+the function drivers use its translation.
 
 ## Lifetime
 
-**Bind.** The probe checks the interface, starts the bulk transfers,
-runs discovery, looks up the firmware nodes, and then creates the
-function devices. A probe that fails leaves nothing behind. A probe
-that succeeds with no function device is valid: the counters and the
-debug log still describe the device.
+**Bind.** The probe checks the interface, starts the bulk transfers
+and queues discovery. Discovery then runs in a work item: it reads the
+channels, looks up the firmware nodes, and creates the function
+devices. A probe that fails leaves nothing behind. A discovery that
+finds no channel with a function driver is valid: the counters and
+the debug log still describe the device.
+
+**Failed discovery.** When discovery fails, the core asks the USB
+transport to release the interface: a work item of the transport's
+own takes the USB device's lock and unbinds the driver from the
+interface, if the same binding still holds it. A replug or a manual
+bind runs discovery again. The release removes the interface's
+counters with the binding, so the log line is the record. A software
+unbind or an unplug that comes first cancels the discovery and the
+release is not needed.
 
 **Software unbind** (writing to the USB driver's `unbind` file, or
-unloading `obmf.ko`). The device is still there, so the function
+unloading `obmf.ko`). A discovery still running is ended at its next
+request or in the wait between passes, and the unbind waits for it.
+The device is still there, so the function
 devices are removed first, while requests still work: their drivers
 answer the device requests they kept. Then the
 transfers stop. The first request or answer that times out, in its
@@ -568,11 +744,22 @@ or whose bulk OUT stops completing, costs the unbind one timeout. A
 device that keeps sending device requests during the unbind gets no
 answers once the device is stopped.
 
+**Function driver unbind** (writing to a function driver's `unbind`
+file, or unloading its module). The device and the other channels
+stay in use. The driver's teardown runs while its channel still
+works, and each of its requests ends on its own timeout: if the
+device does not answer, each costs at most the hold of the one
+before and its own wait (about 2 s with the default wait), and other
+channels' sends do not lengthen it. A device request the driver kept
+is answered with the default answer ("Requests from the device"
+above).
+
 **Unplug.** The device is gone, so the transfers stop first. Waiting
 requests fail at once with `-ENODEV`, and then the function devices
 are removed.
 
-**Module unload.** `i2c-obmf.ko`, `obmf_tty.ko` and `gpio-obmf.ko` use
+**Module unload.** `i2c-obmf.ko`, `obmf_tty.ko`, `gpio-obmf.ko` and
+`spi-obmf.ko` use
 symbols of `obmf.ko`, so they are unloaded first; each unbinds its
 devices. A GPIO line that a consumer holds keeps `gpio-obmf.ko` in
 use until it is released.
@@ -593,12 +780,18 @@ stay until the interface is unbound, or the device is unplugged.
 the interface, because it is the interface's child: the I2C adapter
 is marked suspended, and the serial port stops sending. The interface
 then waits for the requests in flight, stops delivering device
-requests, and stops the transfers. New requests fail with `-EAGAIN`
+requests, and stops the transfers; the transport refuses new sends
+and waits for every send in flight, each within its own timeout. New requests fail with `-EAGAIN`
 until resume. Resume starts the transfers again and delivers the
 device requests that were queued. A resume that cannot start the
 transfers stops the device, as a transport failure. When the USB core
 resets the device during resume, the interface is unbound and bound
-again, with a new discovery and new function devices.
+again, with a new discovery and new function devices. A suspend
+that comes while discovery runs ends it at its next request or in
+the wait between passes, and resume runs it again; if that discovery
+fails, the interface is released as above, at most once
+(`KNOWN-ISSUES.md` has the case of function devices that discovery adds while
+the system prepares to suspend).
 
 **Runtime power management.** The driver has no autosuspend support,
 so the USB core keeps the device active while it is bound.

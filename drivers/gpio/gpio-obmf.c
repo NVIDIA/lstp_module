@@ -83,6 +83,15 @@ struct obmf_gpio {
 	char label[OBMF_GPIO_LABEL_SIZE];
 };
 
+/*
+ * gpiolib's users get no -ETIME: a timeout the device reports is
+ * -ETIMEDOUT to them, as no answer is
+ */
+static int obmf_gpio_errno(int err)
+{
+	return err == -ETIME ? -ETIMEDOUT : err;
+}
+
 /* The value of each line of the @n entries goes to @bits */
 static void obmf_gpio_apply(const __le16 *ent, unsigned int n,
 			    unsigned long *bits)
@@ -183,20 +192,20 @@ static int obmf_gpio_get(struct gpio_chip *gc, unsigned int offset)
 		return test_bit(offset, og->value);
 	og->req[0] = cpu_to_le16(offset);
 	ret = obmf_gpio_get_chunk(og, 1, og->rd);
-	return ret ?: test_bit(offset, og->rd);
+	return ret ? obmf_gpio_errno(ret) : test_bit(offset, og->rd);
 }
 
 /*
  * Callers may drop the errno of a Set (leds-gpio does), so a failure is
  * reported: of line @line, or of several lines when it is -1. A Set of a
  * line that is not an output, refused here or by the device (-EPERM), and
- * a device that is gone are not.
+ * a device that is gone are not. The report keeps the core's errno.
  */
 static int obmf_gpio_set_done(struct obmf_gpio *og, long line, int ret)
 {
 	if (ret && ret != -ENODEV && ret != -EPERM)
 		obmf_fdev_report(og->fdev, OBMF_EV_GPIO_SET, line, ret);
-	return ret;
+	return obmf_gpio_errno(ret);
 }
 
 static int obmf_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
@@ -231,7 +240,7 @@ static int obmf_gpio_get_multiple(struct gpio_chip *gc, unsigned long *mask,
 	bitmap_and(og->rd, mask, og->out, gc->ngpio);
 	bitmap_replace(bits, bits, og->value, og->rd, gc->ngpio);
 	bitmap_andnot(og->rd, mask, og->out, gc->ngpio);
-	return obmf_gpio_read(og, og->rd, bits);
+	return obmf_gpio_errno(obmf_gpio_read(og, og->rd, bits));
 }
 
 /* Set Values of the lines in @mask to @bits, @per_set lines a message */

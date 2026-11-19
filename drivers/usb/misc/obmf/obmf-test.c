@@ -19,16 +19,20 @@
 #include <linux/gpio/machine.h>
 #include <linux/hrtimer.h>
 #include <linux/i2c.h>
+#include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/irq.h>
 #include <linux/jiffies.h>
+#include <linux/kthread.h>
 #include <linux/ktime.h>
+#include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/property.h>
 #include <linux/serial.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/spi/spi.h>
 #include <linux/string.h>
 #include <linux/tracepoint.h>
 #include <linux/tty.h>
@@ -39,6 +43,7 @@
 #include <trace/events/printk.h>
 
 #include "obmf-core.h"
+#include "obmf-kunit.h"
 
 #define FAKE_LOG_LEN 256
 #define FAKE_KEEP 72
@@ -104,6 +109,8 @@ enum fake_how {
  * @channel: channel of the reply, -1 for the request's
  * @echo: the reply payload starts with the request's command byte
  * @fill: payload byte k is k ^ 0x5a instead of @payload[k]
+ * @spi_read: an SPI answer: the request's read size, then byte k of the
+ *	data is k ^ 0x5a; @plen and @fill are set from it
  * @plen: payload length after the echo byte
  * @payload: payload after the echo byte
  */
@@ -117,6 +124,7 @@ struct fake_step {
 	int channel;
 	bool echo;
 	bool fill;
+	bool spi_read;
 	size_t plen;
 	u8 payload[16];
 };
@@ -139,6 +147,8 @@ struct obmf_test_fn {
 	atomic_t calls;
 	bool hold;
 	bool keep;
+	/* answers, then returns -EINPROGRESS as if it had kept the request */
+	bool answer_keep;
 	bool ignore;
 	struct obmf_dreq *kept;
 	struct completion entered;
@@ -162,13 +172,27 @@ struct obmf_fake {
 	unsigned int nlog;
 	bool nolog;
 	unsigned int sends;
+	/* sends per channel number, the message's first byte */
+	unsigned int ch_sends[U8_MAX + 1];
 	unsigned int quiesced_sends;
 	bool stopped;
 	bool quiesced;
 	int resume_ret;
+	/*
+	 * A send sleeps send_sleep_ms, at most its own timeout, and then
+	 * fails with send_sleep_ret if set: with -ETIMEDOUT, a device that
+	 * takes no data. Only on the channels in send_sleep_chans, a bit
+	 * each, if any are set.
+	 */
 	unsigned int send_sleep_ms;
+	int send_sleep_ret;
+	unsigned long send_sleep_chans;
 	bool send_until_unbind;
 	int answer_ret;
+	/* answer_ret fails one answer only */
+	bool answer_once;
+	/* a channel whose requests get no reply, after their step's send */
+	int silent_ch;
 	struct fake_step steps[FAKE_STEPS];
 	unsigned int nsteps;
 	unsigned int step;
@@ -187,6 +211,8 @@ struct obmf_fake {
 	unsigned int hdr_reads;
 	int read_ret;
 	unsigned int drop_read;
+	/* the read answered with the timeout status */
+	unsigned int status_read;
 	bool drop_hdr;
 	unsigned int bump_from;
 	unsigned int bump_to;
@@ -212,7 +238,33 @@ struct obmf_fake {
 	bool stop_respond;
 	int stop_respond_ret;
 	int stop_out;
+	/* a device request whose work runs after the stop */
+	struct obmf_channel *stop_dreq_ch;
+	long stop_dreq_answers;
+	long stop_dreq_errors;
+	/*
+	 * sends refused after the stop, from any context; fake_unbind()
+	 * expects none unless the case sets late_send_ok and says why
+	 */
+	atomic_t sends_after_stop;
+	bool late_send_ok;
 	long stop_events[OBMF_EV_NR];
+
+	/*
+	 * the release operation's calls; with release_unbinds it unbinds
+	 * from a work under dev_lock, as the USB transport does
+	 */
+	atomic_t releases;
+	bool release_unbinds;
+	struct work_struct release_work;
+	struct completion release_done;
+	unsigned int released;
+	/* the USB device's lock, which every unbind holds */
+	struct mutex dev_lock;
+	/* the release operation waits for release_go */
+	bool release_hold;
+	struct completion release_entered;
+	struct completion release_go;
 
 	struct hrtimer fatal_timer;
 	int fatal_err;
@@ -249,6 +301,7 @@ struct test_log {
 	raw_spinlock_t lock;
 	int reg;
 	char dev[48];
+	char dev2[48];
 	unsigned int n;
 	unsigned int lost;
 	char line[TEST_LOG_LINES][TEST_LOG_LINE];
@@ -264,7 +317,8 @@ static void test_log_probe(void *data, const char *buf, size_t len)
 	if (in_nmi())
 		return;
 	raw_spin_lock_irqsave(&log->lock, flags);
-	if (log->dev[0] && strnstr(buf, log->dev, len)) {
+	if ((log->dev[0] && strnstr(buf, log->dev, len)) ||
+	    (log->dev2[0] && strnstr(buf, log->dev2, len))) {
 		/* @buf is not NUL-terminated */
 		if (log->n < TEST_LOG_LINES)
 			strscpy(log->line[log->n++], buf,
@@ -306,10 +360,39 @@ static struct test_log *test_log_start(struct kunit *test, struct device *dev)
 		kunit_skip(test, "needs CONFIG_PRINTK and CONFIG_TRACEPOINTS");
 	scoped_guard(raw_spinlock_irqsave, &log->lock) {
 		snprintf(log->dev, sizeof(log->dev), " %s: ", dev_name(dev));
+		log->dev2[0] = '\0';
 		log->n = 0;
 		log->lost = 0;
 	}
 	return log;
+}
+
+/* Keeps the lines of @dev too, as test_log_start() keeps its device's */
+static void __maybe_unused test_log_also(struct test_log *log,
+					 struct device *dev)
+{
+	guard(raw_spinlock_irqsave)
+		(&log->lock);
+	snprintf(log->dev2, sizeof(log->dev2), " %s: ", dev_name(dev));
+}
+
+static void test_log_exit_action(void *data)
+{
+	test_log_exit(data);
+}
+
+/* A log for a case of a suite without one, from now on */
+static struct test_log *test_log_case(struct kunit *test, struct device *dev)
+{
+	struct test_log *log = kunit_kzalloc(test, sizeof(*log), GFP_KERNEL);
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, log);
+	KUNIT_ASSERT_NULL(test, test->priv);
+	test_log_init(test, log);
+	ret = kunit_add_action_or_reset(test, test_log_exit_action, test);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	return test_log_start(test, dev);
 }
 
 /* Lines in @log, since test_log_start(), that contain @text */
@@ -364,6 +447,7 @@ static void fake_log(struct obmf_fake *f, enum fake_ev ev, const u8 *msg,
 	scoped_guard(spinlock_irqsave, &f->lock) {
 		if (ev == FAKE_SEND) {
 			f->sends++;
+			f->ch_sends[*msg]++;
 			if (f->quiesced)
 				f->quiesced_sends++;
 		}
@@ -553,8 +637,15 @@ static int fake_ch0(struct obmf_fake *f, const u8 *msg, size_t len)
 	u32 addr;
 	bool hdr;
 
+	/*
+	 * Called from the core's thread, which a failed assertion must not
+	 * end: a short message fails the case and is not read
+	 */
+	if (plen < 6) {
+		KUNIT_FAIL(f->test, "channel 0 message of %zu bytes", len);
+		return -EINVAL;
+	}
 	/* the reserved bytes are 0 */
-	KUNIT_EXPECT_GE(f->test, plen, 6);
 	KUNIT_EXPECT_EQ(f->test, p[0] & ~7, 0);
 	KUNIT_EXPECT_EQ(f->test, p[1], 0);
 	addr = get_unaligned_le32(p + 2);
@@ -573,7 +664,10 @@ static int fake_ch0(struct obmf_fake *f, const u8 *msg, size_t len)
 		return 0;
 	}
 
-	KUNIT_EXPECT_EQ(f->test, plen, 8);
+	if (plen != 8) {
+		KUNIT_FAIL(f->test, "channel 0 read of %zu bytes", len);
+		return -EINVAL;
+	}
 	n = get_unaligned_le16(p + 6);
 	hdr = !addr;
 	scoped_guard(spinlock_irqsave, &f->lock) {
@@ -589,6 +683,13 @@ static int fake_ch0(struct obmf_fake *f, const u8 *msg, size_t len)
 		return f->read_ret;
 	if (idx == f->drop_read || (hdr && f->drop_hdr))
 		return 0;
+	if (idx == f->status_read) {
+		fake_deliver(f, FAKE_INLINE, 0, out,
+			     fake_msg(out, 0,
+				      OBMF_HDR_RQRESP | OBMF_STATUS_TIMEOUT,
+				      NULL, 0));
+		return 0;
+	}
 	if ((f->stale_first && idx == 1) || (f->stale_hdr && hdr))
 		fake_rx(f, out,
 			fake_msg(out, 0, OBMF_HDR_RQRESP, stale,
@@ -635,7 +736,17 @@ static int fake_reply_step(struct obmf_fake *f, const u8 *msg)
 	}
 	if (s.send_ret && !s.raced)
 		return s.send_ret;
+	if (msg[0] == READ_ONCE(f->silent_ch))
+		return s.send_ret;
 
+	/* Table 51: the read size of the request (Table 50), then the data */
+	if (s.spi_read) {
+		k = get_unaligned_le16(msg + OBMF_HDR_LEN + 3);
+		s.plen = 2 + k;
+		s.fill = false;
+		s.payload[0] = k;
+		s.payload[1] = k >> 8;
+	}
 	plen = s.plen + s.echo;
 	if (WARN_ON(OBMF_HDR_LEN + plen > sizeof(out)))
 		return -EINVAL;
@@ -646,8 +757,9 @@ static int fake_reply_step(struct obmf_fake *f, const u8 *msg)
 		out[OBMF_HDR_LEN] = msg[OBMF_HDR_LEN];
 	for (k = 0; k < s.plen; k++)
 		out[OBMF_HDR_LEN + s.echo + k] =
-			s.fill ? (u8)(k ^ 0x5a) :
-				 s.payload[min_t(size_t, k, 15)];
+			s.fill		     ? (u8)(k ^ 0x5a) :
+			s.spi_read && k >= 2 ? (u8)((k - 2) ^ 0x5a) :
+					       s.payload[min_t(size_t, k, 15)];
 	for (i = 0; i < max(s.count, 1U); i++) {
 		if (i && plen)
 			out[OBMF_HDR_LEN + plen - 1] ^= 0xff;
@@ -707,6 +819,14 @@ static void fake_stop(struct obmf_transport *tp)
 	}
 	fake_cancel(f);
 	WRITE_ONCE(f->stopped, true);
+	if (f->stop_dreq_ch) {
+		struct obmf_channel *ch = f->stop_dreq_ch;
+
+		fake_inject(f, ch->info.number, 0, (u8[]){ 0x01 }, 1);
+		flush_work(&ch->work);
+		f->stop_dreq_answers = ch_cnt(ch, OBMF_CH_TX_ANSWERS);
+		f->stop_dreq_errors = ch_cnt(ch, OBMF_CH_TX_ERRORS);
+	}
 }
 
 static void fake_quiesce(struct obmf_transport *tp)
@@ -733,6 +853,15 @@ static int fake_resume(struct obmf_transport *tp)
 	return 0;
 }
 
+static bool fake_send_sleeps(struct obmf_fake *f, u8 ch)
+{
+	unsigned long chans = READ_ONCE(f->send_sleep_chans);
+
+	if (!READ_ONCE(f->send_sleep_ms))
+		return false;
+	return !chans || (ch < BITS_PER_LONG && (chans & BIT(ch)));
+}
+
 static int fake_send(struct obmf_transport *tp, const void *buf, size_t len,
 		     unsigned int timeout_ms)
 {
@@ -740,32 +869,79 @@ static int fake_send(struct obmf_transport *tp, const void *buf, size_t len,
 	/* Read before fake_log() wakes the test, which may then set it */
 	bool until = READ_ONCE(f->send_until_unbind);
 	const u8 *msg = buf;
-	int state;
+	int state, err;
 
+	/* As the USB transport: refused, nothing sent */
 	if (READ_ONCE(f->stopped)) {
-		KUNIT_FAIL(f->test, "send after stop");
+		atomic_inc(&f->sends_after_stop);
 		return -ENODEV;
 	}
-	/* A request carries its command byte; an answer may be empty */
+	/*
+	 * A request carries its command byte; an answer may be empty. A
+	 * message shorter than its header fails the case and is not read.
+	 */
+	if (len < OBMF_HDR_LEN) {
+		KUNIT_FAIL(f->test, "a message of %zu bytes", len);
+		return -EINVAL;
+	}
 	KUNIT_EXPECT_GE(f->test, len,
 			OBMF_HDR_LEN + !(msg[1] & OBMF_HDR_RQRESP));
 	KUNIT_EXPECT_LE(f->test, len, tp->max_tx_msg);
 	KUNIT_EXPECT_EQ(f->test, get_unaligned_le16(msg + 2),
 			len - OBMF_HDR_LEN);
 	fake_log(f, FAKE_SEND, msg, len, timeout_ms);
-	if (f->send_sleep_ms)
-		msleep(f->send_sleep_ms);
+	if (fake_send_sleeps(f, msg[0])) {
+		msleep(min(READ_ONCE(f->send_sleep_ms), timeout_ms));
+		err = READ_ONCE(f->send_sleep_ret);
+		if (err)
+			return err;
+	}
 	if (until &&
 	    read_poll_timeout(obmf_core_state, state, state != OBMF_LIVE, 1000,
 			      FAKE_WAIT_MS * 1000, false, tp->core))
 		KUNIT_FAIL(f->test, "send: still live");
 	if (READ_ONCE(f->quiesced))
 		return -EAGAIN;
-	if (msg[1] & OBMF_HDR_RQRESP)
-		return READ_ONCE(f->answer_ret);
+	if (msg[1] & OBMF_HDR_RQRESP) {
+		int ret = READ_ONCE(f->answer_ret);
+
+		if (ret && READ_ONCE(f->answer_once))
+			WRITE_ONCE(f->answer_ret, 0);
+		return ret;
+	}
 	if (!msg[0])
 		return fake_ch0(f, msg, len);
 	return fake_reply_step(f, msg);
+}
+
+static void fake_unbind(struct obmf_fake *f);
+
+/* As the USB transport: only the binding that asked, under the lock */
+static void fake_release_work(struct work_struct *work)
+{
+	struct obmf_fake *f =
+		container_of(work, struct obmf_fake, release_work);
+
+	scoped_guard(mutex, &f->dev_lock) {
+		if (f->core && obmf_core_state(f->core) == OBMF_FAILED) {
+			f->released++;
+			fake_unbind(f);
+		}
+	}
+	complete(&f->release_done);
+}
+
+static void fake_release(struct obmf_transport *tp)
+{
+	struct obmf_fake *f = to_fake(tp);
+
+	atomic_inc(&f->releases);
+	if (f->release_unbinds)
+		queue_work(f->callwq, &f->release_work);
+	if (f->release_hold) {
+		complete(&f->release_entered);
+		wait_for_completion(&f->release_go);
+	}
 }
 
 static const struct obmf_transport_ops fake_ops = {
@@ -774,6 +950,7 @@ static const struct obmf_transport_ops fake_ops = {
 	.quiesce = fake_quiesce,
 	.resume = fake_resume,
 	.send = fake_send,
+	.release = fake_release,
 };
 
 static enum hrtimer_restart fake_fatal_timer(struct hrtimer *t)
@@ -798,7 +975,31 @@ static void fake_cancel_action(void *data)
 KUNIT_DEFINE_ACTION_WRAPPER(obmf_test_destroy_wq, destroy_workqueue,
 			    struct workqueue_struct *);
 
+static void obmf_test_mutex_destroy(void *lock)
+{
+	mutex_destroy(lock);
+}
+
 static atomic_t obmf_test_ids = ATOMIC_INIT(0);
+
+/*
+ * A fake transport's function devices are named "test-<name>", so no
+ * function driver binds them and the cases' own drivers bind nothing
+ * else. The function driver suites name them as a device does: their
+ * driver then binds the fake's devices, which reach no hardware.
+ */
+static bool obmf_test_fn_names;
+
+static int __maybe_unused obmf_test_fn_suite_init(struct kunit_suite *suite)
+{
+	obmf_test_fn_names = true;
+	return 0;
+}
+
+static void __maybe_unused obmf_test_fn_suite_exit(struct kunit_suite *suite)
+{
+	obmf_test_fn_names = false;
+}
 
 static struct obmf_fake *fake_create(struct kunit *test, size_t max_msg,
 				     unsigned int floor_ms)
@@ -839,10 +1040,20 @@ static struct obmf_fake *fake_create(struct kunit *test, size_t max_msg,
 	f->tp.dev = kunit_device_register(test, name);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, f->tp.dev);
 	f->tp.ops = &fake_ops;
+	f->tp.test_names = !obmf_test_fn_names;
 	f->tp.max_tx_msg = max_msg;
 	f->tp.max_rx_msg = max_msg;
 	f->tp.resp_timeout_floor_ms = floor_ms;
 
+	INIT_WORK(&f->release_work, fake_release_work);
+	init_completion(&f->release_done);
+	init_completion(&f->release_entered);
+	init_completion(&f->release_go);
+	mutex_init(&f->dev_lock);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, obmf_test_mutex_destroy,
+						  &f->dev_lock),
+			0);
 	f->callwq = alloc_workqueue("obmf-test", WQ_UNBOUND, 0);
 	KUNIT_ASSERT_NOT_NULL(test, f->callwq);
 	KUNIT_ASSERT_EQ(test,
@@ -871,6 +1082,18 @@ struct test_chan {
 static u32 fake_ch_off(struct obmf_fake *f, int nr)
 {
 	return get_unaligned_le32(f->mem + FAKE_CH0_OFFSETS + 4 * (nr - 1));
+}
+
+/* An SPI channel's configuration (OBMF-ICP 1.0.0, 5.15.2, Table 84) */
+static void fake_spi_cfg(u8 *p, u32 flags, u8 devices, u32 hz)
+{
+	struct obmf_spi_cfg *c = (struct obmf_spi_cfg *)p;
+
+	memset(c, 0, sizeof(*c));
+	c->flags = cpu_to_le32(flags);
+	c->num_devices = devices;
+	c->rd_max_speed_hz = cpu_to_le32(hz);
+	c->wr_max_speed_hz = cpu_to_le32(hz);
 }
 
 /* Channel 0's configuration space for @n channels, numbered from 1 */
@@ -915,6 +1138,10 @@ static void fake_layout(struct obmf_fake *f, const struct test_chan *c, int n)
 			h[FAKE_CH_HDR_LEN] = 0x00;
 			h[FAKE_CH_HDR_LEN + 1] = 0x01;
 		}
+		/* Table 84: mode 0, 8 bits, one device, 1 MHz both ways */
+		if (c[i].type == OBMF_TYPE_SPI &&
+		    c[i].config_len >= sizeof(struct obmf_spi_cfg))
+			fake_spi_cfg(h + FAKE_CH_HDR_LEN, 0, 1, 1000000);
 		off += ALIGN(FAKE_CH_HDR_LEN + c[i].config_len, 16);
 	}
 }
@@ -935,6 +1162,12 @@ static void fake_unbind(struct obmf_fake *f)
 		return;
 	obmf_core_unbind(core, f->attached);
 	f->core = NULL;
+	/*
+	 * The core's works are disabled by now, so no send of the core can
+	 * still be counted; only one of the case's own threads could
+	 */
+	if (!f->late_send_ok)
+		KUNIT_EXPECT_EQ(f->test, atomic_read(&f->sends_after_stop), 0);
 }
 
 static void fake_unbind_action(void *data)
@@ -942,10 +1175,13 @@ static void fake_unbind_action(void *data)
 	fake_unbind(data);
 }
 
-static int fake_bind(struct obmf_fake *f)
+/* Probe: returns once the transport is up; the bind work is not waited for */
+static int fake_probe(struct obmf_fake *f)
 {
 	struct kunit *test = f->test;
 
+	/* a bind after an unbind is a new probe, on a transport not stopped */
+	WRITE_ONCE(f->stopped, false);
 	f->core = obmf_core_create(&f->tp);
 	KUNIT_ASSERT_NOT_NULL(test, f->core);
 	KUNIT_ASSERT_EQ(test,
@@ -954,12 +1190,23 @@ static int fake_bind(struct obmf_fake *f)
 	return obmf_core_bind(f->core);
 }
 
+/* Probe, then the bind work's result: discovery's errno or 0 */
+static int fake_bind(struct obmf_fake *f)
+{
+	int ret = fake_probe(f);
+
+	if (ret)
+		return ret;
+	flush_work(&f->core->bind_work);
+	return f->core->bind_err;
+}
+
 /* The channels the message layer cases use */
 static const struct test_chan core_chans[] = {
 	{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c", 516, 0, 2 },
 	{ OBMF_TYPE_GPIO, OBMF_ROLE_PRODUCER, "gpio", 516 },
 	{ OBMF_TYPE_IPMI, OBMF_ROLE_PRODUCER, "ipmi", 516 },
-	{ OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, "spi", 516 },
+	{ OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, "spi", 516, 0, 20 },
 	{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "uart", 516 },
 	{ OBMF_TYPE_TPM, OBMF_ROLE_PRODUCER, "tpm", 516 },
 	{ OBMF_TYPE_MMIO, OBMF_ROLE_PRODUCER, "mmio", 516 },
@@ -995,6 +1242,104 @@ static struct obmf_channel *chan(struct obmf_fake *f, int nr)
 
 	KUNIT_ASSERT_NOT_NULL(f->test, ch);
 	return ch;
+}
+
+/* Requests in a loop on one channel, from a thread, until it is stopped */
+struct test_busy {
+	struct obmf_channel *ch;
+	int nr;
+	/* the channel's sends before the thread started */
+	unsigned int sends;
+	unsigned int timeout_ms;
+	struct task_struct *task;
+	unsigned int n;
+	int ret;
+};
+
+static int test_busy_fn(void *data)
+{
+	struct test_busy *b = data;
+	size_t rlen;
+	u8 resp[8];
+	int ret;
+
+	while (!kthread_should_stop()) {
+		ret = obmf_ch_request(b->ch, 0x01, NULL, 0, resp, sizeof(resp),
+				      &rlen, b->timeout_ms);
+		WRITE_ONCE(b->ret, ret);
+		WRITE_ONCE(b->n, b->n + 1);
+		/* A refused request returns at once */
+		if (ret != -ETIMEDOUT)
+			usleep_range(1000, 2000);
+	}
+	return 0;
+}
+
+static void test_busy_stop(void *data)
+{
+	struct test_busy *b = data;
+
+	kthread_stop(b->task);
+}
+
+/* Whether each of the @n threads @b has sent on its channel */
+static bool test_busy_sent(struct obmf_fake *f, struct test_busy *b, int n)
+{
+	int i;
+
+	guard(spinlock_irqsave)
+		(&f->lock);
+	for (i = 0; i < n; i++)
+		if (f->ch_sends[b[i].nr] == b[i].sends)
+			return false;
+	return true;
+}
+
+/*
+ * A thread on each of the @n channels @chs sending requests that wait
+ * @timeout_ms, until test_busy_end(); returns once each has sent one
+ */
+static struct test_busy *test_busy_start(struct obmf_fake *f, const int *chs,
+					 int n, unsigned int timeout_ms)
+{
+	struct kunit *test = f->test;
+	struct test_busy *b;
+	bool sent;
+	int i;
+
+	b = kunit_kcalloc(test, n, sizeof(*b), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, b);
+	for (i = 0; i < n; i++) {
+		b[i].ch = chan(f, chs[i]);
+		b[i].nr = chs[i];
+		scoped_guard(spinlock_irqsave, &f->lock)
+			b[i].sends = f->ch_sends[b[i].nr];
+		b[i].timeout_ms = timeout_ms;
+		b[i].task = kthread_run(test_busy_fn, &b[i], "obmf-busy-%d",
+					chs[i]);
+		KUNIT_ASSERT_FALSE(test, IS_ERR(b[i].task));
+		KUNIT_ASSERT_EQ(test,
+				kunit_add_action_or_reset(test, test_busy_stop,
+							  &b[i]),
+				0);
+	}
+	KUNIT_ASSERT_EQ(test,
+			read_poll_timeout(test_busy_sent, sent, sent, 1000,
+					  1000000, false, f, b, n),
+			0);
+	return b;
+}
+
+/* Stops the threads; each has sent a request and the last timed out */
+static void test_busy_end(struct obmf_fake *f, struct test_busy *b, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		kunit_release_action(f->test, test_busy_stop, &b[i]);
+		KUNIT_EXPECT_GE(f->test, b[i].n, 1);
+		KUNIT_EXPECT_EQ(f->test, b[i].ret, -ETIMEDOUT);
+	}
 }
 
 /* A request run from a work item, so the test can act while it waits */
@@ -1090,6 +1435,11 @@ static int test_fn_request(struct obmf_fdev *fdev, struct obmf_dreq *dreq)
 		fn->kept = dreq;
 		return -EINPROGRESS;
 	}
+	if (fn->answer_keep) {
+		fn->answer_ret =
+			obmf_respond(fdev, dreq, OBMF_STATUS_SUCCESS, NULL, 0);
+		return -EINPROGRESS;
+	}
 	if (fn->ignore)
 		return 0;
 	if (dreq->answer_due)
@@ -1135,12 +1485,14 @@ static size_t gpio_notify(u8 *msg, u8 ch)
 	return fake_msg(msg, ch, 0, body, sizeof(body));
 }
 
+/* The last request sent on @ch; the case stops if there is none */
 static int send_index(struct obmf_fake *f, int ch)
 {
 	int i = -1, last = -1;
 
 	while ((i = fake_find(f, i + 1, FAKE_SEND, ch, 0)) >= 0)
 		last = i;
+	KUNIT_ASSERT_GE_MSG(f->test, last, 0, "no request on channel %d", ch);
 	return last;
 }
 
@@ -1379,7 +1731,7 @@ static void obmf_test_mmio_forms(struct kunit *test)
 /* ICP Table 4 and the per-type tables, each status with its errno */
 static int test_status_errno(u8 type, u8 st)
 {
-	static const int generic[] = { 0,    -EIO,    -ETIMEDOUT, -EBUSY,
+	static const int generic[] = { 0,    -EIO,    -ETIME,	-EBUSY,
 				       -EIO, -ECHRNG, -EMSGSIZE };
 
 	if (st < ARRAY_SIZE(generic))
@@ -1390,7 +1742,7 @@ static int test_status_errno(u8 type, u8 st)
 	case OBMF_TYPE_I2C_CONTROLLER:
 		switch (st) {
 		case 0x40:
-			return -ETIMEDOUT;
+			return -ETIME;
 		case 0x41:
 			return -EAGAIN;
 		case 0x42:
@@ -1401,7 +1753,7 @@ static int test_status_errno(u8 type, u8 st)
 		break;
 	case OBMF_TYPE_SERIAL:
 		if (st == 0x40)
-			return -ETIMEDOUT;
+			return -ETIME;
 		break;
 	case OBMF_TYPE_CONFIG:
 	case OBMF_TYPE_MMIO:
@@ -1421,7 +1773,7 @@ static int test_status_errno(u8 type, u8 st)
 	case OBMF_TYPE_I3C:
 		switch (st) {
 		case 0x40:
-			return -ETIMEDOUT;
+			return -ETIME;
 		case 0x41:
 			return -EAGAIN;
 		case 0x42:
@@ -1631,6 +1983,44 @@ static void obmf_test_wait_timeout(struct kunit *test)
 	KUNIT_EXPECT_LT(test, ms, 440);
 	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_GPIO, 0), 2);
 	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_TIMEOUTS), 2);
+}
+
+/*
+ * A send that takes its whole wait and succeeds: the reply wait is what
+ * is left of the deadline, at least a jiffy, so a reply already in is
+ * taken and a missing one times out at once
+ */
+static void obmf_test_wait_send_late(struct kunit *test)
+{
+	struct obmf_fake *f = core_setup(test, 0);
+	struct obmf_channel *ch = chan(f, CH_GPIO);
+	struct fake_step s = { .how = FAKE_NEVER, .channel = -1 };
+	size_t rlen;
+	u8 resp[8];
+	s64 ms;
+	ktime_t t;
+
+	WRITE_ONCE(f->send_sleep_ms, 250);
+	t = ktime_get();
+	KUNIT_EXPECT_EQ(test,
+			obmf_ch_request(ch, 1, NULL, 0, resp, sizeof(resp),
+					&rlen, 250),
+			0);
+	ms = ktime_ms_delta(ktime_get(), t);
+	KUNIT_EXPECT_GE(test, ms, 250);
+	KUNIT_EXPECT_LT(test, ms, 250 + 300);
+
+	fake_push(f, &s);
+	t = ktime_get();
+	KUNIT_EXPECT_EQ(test,
+			obmf_ch_request(ch, 1, NULL, 0, resp, sizeof(resp),
+					&rlen, 250),
+			-ETIMEDOUT);
+	ms = ktime_ms_delta(ktime_get(), t);
+	WRITE_ONCE(f->send_sleep_ms, 0);
+	KUNIT_EXPECT_GE(test, ms, 250);
+	KUNIT_EXPECT_LT(test, ms, 250 + 300);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_TIMEOUTS), 1);
 }
 
 /* a 1000 ms floor under a 20 ms request */
@@ -1908,10 +2298,10 @@ static void obmf_test_reply_other_channel(struct kunit *test)
 {
 	struct obmf_fake *f = core_setup(test, 0);
 	struct obmf_channel *gpio = chan(f, CH_GPIO);
-	struct obmf_channel *spi = chan(f, CH_SPI);
+	struct obmf_channel *ipmi = chan(f, CH_IPMI);
 	struct fake_step s = {
 		.how = FAKE_INLINE,
-		.channel = CH_SPI,
+		.channel = CH_IPMI,
 		.echo = true,
 		.plen = 1,
 	};
@@ -1926,7 +2316,7 @@ static void obmf_test_reply_other_channel(struct kunit *test)
 					&rlen, 30),
 			-ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, ch_cnt(gpio, OBMF_CH_TIMEOUTS), 1);
-	KUNIT_EXPECT_EQ(test, ch_cnt(spi, OBMF_CH_RX_LATE), 1);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ipmi, OBMF_CH_RX_LATE), 1);
 
 	s.channel = 200;
 	fake_push(f, &s);
@@ -1943,9 +2333,9 @@ static void obmf_test_reply_other_channel(struct kunit *test)
 	sends = f->sends;
 	a = call_start(f, call_request, gpio, 0x02, 2000);
 	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
-	b = call_start(f, call_request, spi, 0x03, 2000);
+	b = call_start(f, call_request, ipmi, 0x03, 2000);
 	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 2));
-	fake_inject(f, CH_SPI, OBMF_HDR_RQRESP, (u8[]){ 0x03, 0x33 }, 2);
+	fake_inject(f, CH_IPMI, OBMF_HDR_RQRESP, (u8[]){ 0x03, 0x33 }, 2);
 	fake_inject(f, CH_GPIO, OBMF_HDR_RQRESP, (u8[]){ 0x02, 0x22 }, 2);
 	KUNIT_ASSERT_TRUE(test, call_wait(a));
 	KUNIT_ASSERT_TRUE(test, call_wait(b));
@@ -2277,7 +2667,7 @@ static void obmf_test_stopped(struct kunit *test)
 	c = call_start(f, call_request, ch, 1, 5000);
 	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
 	f->probe_stop = true;
-	f->probe_ch = chan(f, CH_SPI);
+	f->probe_ch = chan(f, CH_IPMI);
 	f->attached = false;
 	fake_unbind(f);
 	KUNIT_ASSERT_TRUE(test, call_wait(c));
@@ -2288,6 +2678,37 @@ static void obmf_test_stopped(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->stop_req_ret, -ENODEV);
 	KUNIT_EXPECT_EQ(test, f->stop_sends_after, f->stop_sends_before);
 	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_STOP, -1, -1), 1);
+}
+
+/*
+ * On unplug every waiting request, one per channel up to the last
+ * channel, ends -ENODEV at once, not at its timeout
+ */
+static void obmf_test_unplug_waiters(struct kunit *test)
+{
+	static const int nr[] = { CH_GPIO, CH_IPMI, CH_IO, CH_MEMDEV };
+	struct obmf_fake *f = core_setup(test, 0);
+	struct fake_step s = { .how = FAKE_NEVER, .channel = -1 };
+	struct test_call *c[ARRAY_SIZE(nr)];
+	unsigned int sends;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(nr); i++) {
+		fake_push(f, &s);
+		sends = f->sends;
+		c[i] = call_start(f, call_request, chan(f, nr[i]), 1, 5000);
+		KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
+	}
+	f->attached = false;
+	fake_unbind(f);
+	for (i = 0; i < ARRAY_SIZE(nr); i++) {
+		KUNIT_ASSERT_TRUE(test, call_wait(c[i]));
+		KUNIT_EXPECT_EQ_MSG(test, c[i]->ret, -ENODEV, "channel %d",
+				    nr[i]);
+		KUNIT_EXPECT_LT_MSG(test,
+				    ktime_ms_delta(c[i]->end, c[i]->start),
+				    1000, "channel %d", nr[i]);
+	}
 }
 
 /*
@@ -2482,6 +2903,8 @@ static void obmf_test_resume_fails(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, obmf_core_resume(f->core), -EPROTO);
 	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_FAILED);
 	KUNIT_EXPECT_EQ(test, if_cnt(f->core, OBMF_IF_FATAL_ERRORS), 1);
+	/* Its function devices stay: only a failed discovery gives it up */
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 0);
 
 	sends = f->sends;
 	KUNIT_EXPECT_EQ(test,
@@ -2511,8 +2934,9 @@ static void test_slow_remove(struct auxiliary_device *adev)
 	msleep(1000);
 }
 
+/* The cases' drivers bind only a fake transport's I2C device */
 static const struct auxiliary_device_id test_slow_ids[] = {
-	{ .name = "obmf.i2c" },
+	{ .name = "obmf.test-i2c" },
 	{}
 };
 
@@ -2538,8 +2962,7 @@ static void obmf_test_unbind_timeout(struct kunit *test)
 	struct test_call *quick, *slow;
 	unsigned int sends;
 
-	/* A built-in i2c-obmf holds the device */
-	device_release_driver(&chan(f, CH_I2C)->fdev->adev.dev);
+	KUNIT_ASSERT_NULL(test, chan(f, CH_I2C)->fdev->adev.dev.driver);
 	KUNIT_ASSERT_EQ(test, auxiliary_driver_register(&test_slow_driver), 0);
 	KUNIT_ASSERT_EQ(test,
 			kunit_add_action_or_reset(test, test_slow_unregister,
@@ -2552,7 +2975,7 @@ static void obmf_test_unbind_timeout(struct kunit *test)
 	fake_push(f, &s);
 	sends = f->sends;
 	quick = call_start(f, call_request, chan(f, CH_GPIO), 1, 100);
-	slow = call_start(f, call_request, chan(f, CH_SPI), 1, 5000);
+	slow = call_start(f, call_request, chan(f, CH_IO), 1, 5000);
 	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 2));
 	f->probe_stop = true;
 	f->probe_ch = chan(f, CH_IPMI);
@@ -2585,17 +3008,19 @@ static void obmf_test_unbind_send_timeout(struct kunit *test)
 	struct test_call *quick, *slow;
 	unsigned int sends;
 
-	device_release_driver(&chan(f, CH_I2C)->fdev->adev.dev);
+	KUNIT_ASSERT_NULL(test, chan(f, CH_I2C)->fdev->adev.dev.driver);
 	KUNIT_ASSERT_EQ(test, auxiliary_driver_register(&test_slow_driver), 0);
 	KUNIT_ASSERT_EQ(test,
 			kunit_add_action_or_reset(test, test_slow_unregister,
 						  &test_slow_driver),
 			0);
+	KUNIT_ASSERT_PTR_EQ(test, chan(f, CH_I2C)->fdev->adev.dev.driver,
+			    &test_slow_driver.driver);
 
 	fake_push(f, &never);
 	fake_push(f, &out);
 	sends = f->sends;
-	slow = call_start(f, call_request, chan(f, CH_SPI), 1, 5000);
+	slow = call_start(f, call_request, chan(f, CH_IO), 1, 5000);
 	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
 	/* the second send returns its -ETIMEDOUT once the unbind runs */
 	WRITE_ONCE(f->send_until_unbind, true);
@@ -2609,6 +3034,121 @@ static void obmf_test_unbind_send_timeout(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, slow->ret, -ENODEV);
 	KUNIT_EXPECT_LT(test, ktime_ms_delta(slow->end, slow->start), 500);
 	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_STOP, -1, -1), 1);
+}
+
+/*
+ * A live core that fails, then is quiesced and resumed, stays failed and
+ * keeps its function devices: the transport is quiesced and resumed, and
+ * nothing gives the device up. The same for one that fails while
+ * quiesced and whose transport resumes.
+ */
+static void obmf_test_pm_failed(struct kunit *test)
+{
+	struct obmf_fake *f = core_setup(test, 0);
+
+	obmf_core_fatal(f->core, -EIO);
+	KUNIT_ASSERT_EQ(test, obmf_core_state(f->core), OBMF_FAILED);
+	KUNIT_EXPECT_EQ(test, obmf_core_quiesce(f->core), 0);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_FAILED);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_QUIESCE, -1, -1), 1);
+	KUNIT_EXPECT_EQ(test, obmf_core_resume(f->core), 0);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_FAILED);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_RESUME, -1, -1), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 0);
+	KUNIT_EXPECT_NOT_NULL(test, chan(f, CH_I2C)->fdev);
+	KUNIT_EXPECT_EQ(test, if_cnt(f->core, OBMF_IF_FATAL_ERRORS), 1);
+
+	f = core_setup(test, 0);
+	KUNIT_EXPECT_EQ(test, obmf_core_quiesce(f->core), 0);
+	obmf_core_fatal(f->core, -EIO);
+	KUNIT_EXPECT_EQ(test, obmf_core_resume(f->core), 0);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_FAILED);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 0);
+	KUNIT_EXPECT_NOT_NULL(test, chan(f, CH_I2C)->fdev);
+}
+
+/* The hold driver's remove waits until the case lets it go */
+static DECLARE_COMPLETION(test_hold_entered);
+static DECLARE_COMPLETION(test_hold_go);
+
+static int test_hold_probe(struct auxiliary_device *adev,
+			   const struct auxiliary_device_id *id)
+{
+	return 0;
+}
+
+static void test_hold_remove(struct auxiliary_device *adev)
+{
+	complete(&test_hold_entered);
+	wait_for_completion_timeout(&test_hold_go,
+				    msecs_to_jiffies(FAKE_WAIT_MS));
+}
+
+static struct auxiliary_driver test_hold_driver = {
+	.name = "test-hold",
+	.probe = test_hold_probe,
+	.remove = test_hold_remove,
+	.id_table = test_slow_ids,
+};
+
+struct test_unbind_call {
+	struct work_struct work;
+	struct obmf_fake *f;
+};
+
+static void test_unbind_work(struct work_struct *work)
+{
+	struct test_unbind_call *u =
+		container_of(work, struct test_unbind_call, work);
+
+	fake_unbind(u->f);
+}
+
+/*
+ * A quiesce and a resume while an unbind waits for a function driver's
+ * remove leave the core UNBINDING: the unbind goes on to stop the
+ * transport once, and nothing gives the device up
+ */
+static void obmf_test_pm_unbinding(struct kunit *test)
+{
+	struct obmf_fake *f = core_setup(test, 0);
+	struct obmf_core *core = f->core;
+	struct test_unbind_call u = { .f = f };
+	int state, q, r;
+
+	KUNIT_ASSERT_NULL(test, chan(f, CH_I2C)->fdev->adev.dev.driver);
+	reinit_completion(&test_hold_entered);
+	reinit_completion(&test_hold_go);
+	KUNIT_ASSERT_EQ(test, auxiliary_driver_register(&test_hold_driver), 0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, test_slow_unregister,
+						  &test_hold_driver),
+			0);
+	KUNIT_ASSERT_PTR_EQ(test, chan(f, CH_I2C)->fdev->adev.dev.driver,
+			    &test_hold_driver.driver);
+
+	INIT_WORK_ONSTACK(&u.work, test_unbind_work);
+	queue_work(f->callwq, &u.work);
+	if (!wait_for_completion_timeout(&test_hold_entered,
+					 msecs_to_jiffies(FAKE_WAIT_MS))) {
+		complete(&test_hold_go);
+		flush_work(&u.work);
+		destroy_work_on_stack(&u.work);
+		KUNIT_FAIL_AND_ABORT(test, "the unbind never reached remove");
+	}
+	q = obmf_core_quiesce(core);
+	r = obmf_core_resume(core);
+	state = obmf_core_state(core);
+	complete(&test_hold_go);
+	flush_work(&u.work);
+	destroy_work_on_stack(&u.work);
+
+	KUNIT_EXPECT_EQ(test, q, 0);
+	KUNIT_EXPECT_EQ(test, r, 0);
+	KUNIT_EXPECT_EQ(test, state, OBMF_UNBINDING);
+	KUNIT_EXPECT_NULL(test, f->core);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_STOP, -1, -1), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 0);
 }
 
 #define TEST_FLOOD 8
@@ -2657,8 +3197,7 @@ static void obmf_test_unbind_answers(struct kunit *test)
 	struct obmf_fdev *fdev = chan(f, CH_I2C)->fdev;
 	int ret, rx, answers;
 
-	/* A built-in i2c-obmf holds the device */
-	device_release_driver(&fdev->adev.dev);
+	KUNIT_ASSERT_NULL(test, fdev->adev.dev.driver);
 	test_flood_fake = f;
 	ret = auxiliary_driver_register(&test_flood_driver);
 	KUNIT_ASSERT_EQ(test, ret, 0);
@@ -2686,6 +3225,560 @@ static struct fake_rec *last_answer(struct obmf_fake *f, int nr)
 		last = i;
 	KUNIT_ASSERT_GE(f->test, last, 0);
 	return &f->log[last];
+}
+
+/* The answers sent on channel @nr with header status @status */
+static int answers_with(struct obmf_fake *f, int nr, u8 status)
+{
+	int i = -1, n = 0;
+
+	while ((i = fake_find(f, i + 1, FAKE_SEND, nr, 1)) >= 0)
+		n += (f->log[i].msg[1] & OBMF_HDR_STATUS) == status;
+	return n;
+}
+
+/* The request the keep driver kept last */
+static struct obmf_dreq *test_keep_dreq;
+
+static int test_keep_request(struct obmf_fdev *fdev, struct obmf_dreq *dreq)
+{
+	WRITE_ONCE(test_keep_dreq, dreq);
+	return -EINPROGRESS;
+}
+
+static const struct obmf_fdev_ops test_keep_ops = {
+	.device_request = test_keep_request,
+};
+
+static int test_keep_probe(struct auxiliary_device *adev,
+			   const struct auxiliary_device_id *id)
+{
+	struct obmf_fdev *fdev = to_obmf_fdev(adev);
+	int ret;
+
+	ret = devm_obmf_enable(fdev);
+	if (ret)
+		return ret;
+	return devm_obmf_publish(fdev, &test_keep_ops);
+}
+
+/* Binds only a fake transport's GPIO device */
+static const struct auxiliary_device_id test_keep_ids[] = {
+	{ .name = "obmf.test-gpio" },
+	{}
+};
+
+static struct auxiliary_driver test_keep_driver = {
+	.name = "test-keep",
+	.probe = test_keep_probe,
+	.id_table = test_keep_ids,
+};
+
+/*
+ * A driver unbound while it keeps a device request due an answer: the
+ * unbind answers it, once, with the default answer
+ */
+static void obmf_test_unbind_kept(struct kunit *test)
+{
+	struct obmf_fake *f = core_setup(test, 0);
+	struct obmf_channel *ch = chan(f, CH_GPIO);
+	struct obmf_fdev *fdev = ch->fdev;
+	struct obmf_dreq *dreq;
+	struct fake_rec *r;
+	u8 msg[16];
+
+	KUNIT_ASSERT_NOT_NULL(test, fdev);
+	KUNIT_ASSERT_NULL(test, fdev->adev.dev.driver);
+	WRITE_ONCE(test_keep_dreq, NULL);
+	KUNIT_ASSERT_EQ(test, auxiliary_driver_register(&test_keep_driver), 0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, test_slow_unregister,
+						  &test_keep_driver),
+			0);
+	KUNIT_ASSERT_PTR_EQ(test, fdev->adev.dev.driver,
+			    &test_keep_driver.driver);
+
+	fake_rx(f, msg, gpio_notify(msg, CH_GPIO));
+	flush_workqueue(f->core->wq);
+	dreq = READ_ONCE(test_keep_dreq);
+	KUNIT_ASSERT_NOT_NULL(test, dreq);
+	KUNIT_EXPECT_TRUE(test, dreq->answer_due);
+	KUNIT_EXPECT_EQ(test, dreq_out(ch), 1);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_GPIO, 1), 0);
+
+	device_release_driver(&fdev->adev.dev);
+	WRITE_ONCE(test_keep_dreq, NULL);
+	KUNIT_EXPECT_NULL(test, fdev->adev.dev.driver);
+	KUNIT_EXPECT_FALSE(test, ch->bound);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_GPIO, 1), 1);
+	r = last_answer(f, CH_GPIO);
+	KUNIT_EXPECT_EQ(test, r->msg[1], OBMF_HDR_RQRESP | OBMF_STATUS_SUCCESS);
+	KUNIT_EXPECT_EQ(test, r->msg[4], FAKE_GPIO_INTERRUPT_NOTIFY);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_DEFAULT_ANSWERS), 1);
+	KUNIT_EXPECT_EQ(test, dreq_out(ch), 0);
+}
+
+/* What the channel unbind cases' driver does in its teardown, and saw */
+struct test_ub {
+	struct obmf_fake *f;
+	bool keep;
+	unsigned int nreq;
+	bool io;
+	int ret[3];
+	s64 ms[3];
+	int errno_after;
+	int io_ret;
+};
+
+static struct test_ub *test_ub_seen;
+
+/*
+ * Between unpublish and disable: @nreq requests on its channel, then
+ * with @io one on another channel; once
+ */
+static void test_ub_teardown(void *data)
+{
+	struct obmf_fdev *fdev = data;
+	struct test_ub *u = test_ub_seen;
+	unsigned int i, n = u->nreq;
+	ktime_t start;
+	size_t rlen;
+	u8 resp[8];
+
+	u->nreq = 0;
+	for (i = 0; i < n && i < ARRAY_SIZE(u->ret); i++) {
+		start = ktime_get();
+		u->ret[i] = obmf_request(fdev, 0x01, NULL, 0, resp,
+					 sizeof(resp), &rlen, 0);
+		u->ms[i] = ktime_ms_delta(ktime_get(), start);
+		if (!i)
+			u->errno_after = obmf_fdev_errno(fdev);
+	}
+	if (u->io)
+		u->io_ret = obmf_ch_request(u->f->core->chans[CH_IO], 0x01,
+					    NULL, 0, resp, sizeof(resp), &rlen,
+					    0);
+	u->io = false;
+}
+
+static int test_ub_probe(struct auxiliary_device *adev,
+			 const struct auxiliary_device_id *id)
+{
+	struct obmf_fdev *fdev = to_obmf_fdev(adev);
+	const struct obmf_fdev_ops *ops = test_ub_seen->keep ? &test_keep_ops :
+							       NULL;
+	int ret;
+
+	ret = devm_obmf_enable(fdev);
+	if (!ret)
+		ret = devm_add_action_or_reset(&adev->dev, test_ub_teardown,
+					       fdev);
+	if (!ret)
+		ret = devm_obmf_publish(fdev, ops);
+	return ret;
+}
+
+static struct auxiliary_driver test_ub_driver = {
+	.name = "test-unbind",
+	.probe = test_ub_probe,
+	.id_table = test_slow_ids,
+};
+
+/* The core cases' fake with test_ub_driver bound to the I2C channel */
+static struct obmf_fake *ub_setup(struct kunit *test, bool keep,
+				  struct test_ub **up)
+{
+	struct obmf_fake *f = core_setup(test, 0);
+	struct obmf_fdev *fdev = chan(f, CH_I2C)->fdev;
+	struct test_ub *u;
+
+	u = kunit_kzalloc(test, sizeof(*u), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, u);
+	u->f = f;
+	u->keep = keep;
+	test_ub_seen = u;
+	KUNIT_ASSERT_NOT_NULL(test, fdev);
+	KUNIT_ASSERT_NULL(test, fdev->adev.dev.driver);
+	KUNIT_ASSERT_EQ(test, auxiliary_driver_register(&test_ub_driver), 0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, test_slow_unregister,
+						  &test_ub_driver),
+			0);
+	KUNIT_ASSERT_PTR_EQ(test, fdev->adev.dev.driver,
+			    &test_ub_driver.driver);
+	*up = u;
+	return f;
+}
+
+/* Unbinds the I2C channel's driver only; its time in ms */
+static s64 ub_unbind(struct obmf_fake *f)
+{
+	struct device *dev = &chan(f, CH_I2C)->fdev->adev.dev;
+	ktime_t start = ktime_get();
+
+	device_release_driver(dev);
+	KUNIT_EXPECT_NULL(f->test, dev->driver);
+	return ktime_ms_delta(ktime_get(), start);
+}
+
+/* The bound on one request: a hold, its own wait, and some slack */
+#define UB_REQ_MS (2 * OBMF_DEFAULT_TIMEOUT_MS + 300)
+
+/*
+ * A function driver unbound while the device has stopped answering, its
+ * teardown sending three requests, the first held by an earlier timeout:
+ * each is sent and times out on its own, within the hold of the timeout
+ * before it and its own wait, and each is reported as any timeout. The
+ * core stays live, another channel is answered during and after the
+ * unbind, and the next binding's requests are answered.
+ */
+static void obmf_test_ch_unbind_silent(struct kunit *test)
+{
+	struct test_ub *u;
+	struct obmf_fake *f = ub_setup(test, false, &u);
+	struct obmf_channel *ch = chan(f, CH_I2C);
+	struct obmf_fdev *fdev = ch->fdev;
+	struct test_log *log = test_log_case(test, f->tp.dev);
+	long ev = ev_cnt(f->core, OBMF_EV_NO_RESPONSE);
+	int sends, i;
+	size_t rlen;
+	u8 resp[8];
+
+	WRITE_ONCE(f->silent_ch, CH_I2C);
+	/* Reported, and the next request waits the hold */
+	KUNIT_EXPECT_EQ(test,
+			obmf_ch_request(ch, 0x01, NULL, 0, resp, sizeof(resp),
+					&rlen, 100),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, ev_cnt(f->core, OBMF_EV_NO_RESPONSE), ev + 1);
+	sends = fake_count(f, FAKE_SEND, CH_I2C, 0);
+	u->nreq = 3;
+	u->io = true;
+	KUNIT_EXPECT_LT(test, ub_unbind(f), 3 * UB_REQ_MS);
+	for (i = 0; i < 3; i++) {
+		KUNIT_EXPECT_EQ_MSG(test, u->ret[i], -ETIMEDOUT, "request %d",
+				    i);
+		KUNIT_EXPECT_LT_MSG(test, u->ms[i], UB_REQ_MS, "request %d", i);
+	}
+	KUNIT_EXPECT_EQ(test, u->errno_after, 0);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0), sends + 3);
+	KUNIT_EXPECT_EQ(test, u->io_ret, 0);
+	KUNIT_EXPECT_EQ(test, ev_cnt(f->core, OBMF_EV_NO_RESPONSE), ev + 4);
+	KUNIT_EXPECT_EQ(test, test_log_wait(test, log, "during unbind", 1, 500),
+			0);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_LIVE);
+	KUNIT_EXPECT_EQ(test, obmf_fdev_errno(fdev), 0);
+	KUNIT_EXPECT_EQ(test,
+			obmf_ch_request(chan(f, CH_IO), 0x01, NULL, 0, resp,
+					sizeof(resp), &rlen, 0),
+			0);
+
+	/* The next binding: its requests go out and are answered */
+	WRITE_ONCE(f->silent_ch, 0);
+	KUNIT_ASSERT_EQ(test, device_attach(&fdev->adev.dev), 1);
+	KUNIT_EXPECT_EQ(test, obmf_fdev_errno(fdev), 0);
+	KUNIT_EXPECT_EQ(test,
+			obmf_request(fdev, 0x01, NULL, 0, resp, sizeof(resp),
+				     &rlen, 0),
+			0);
+}
+
+/*
+ * The same with every send timing out: each request fails on its own
+ * send's timeout, with no hold, and a device request on the channel still
+ * gets its default answer
+ */
+static void obmf_test_ch_unbind_send_timeout(struct kunit *test)
+{
+	static const u8 other[] = { 0x01, 0x00 };
+	struct test_ub *u;
+	struct obmf_fake *f = ub_setup(test, false, &u);
+	struct obmf_channel *ch = chan(f, CH_I2C);
+	struct test_log *log = test_log_case(test, f->tp.dev);
+	long tx_errors = ch_cnt(ch, OBMF_CH_TX_ERRORS);
+	int sends = fake_count(f, FAKE_SEND, CH_I2C, 0);
+	long answers, dflt;
+
+	fake_push(f, &(struct fake_step){ .send_ret = -ETIMEDOUT });
+	fake_push(f, &(struct fake_step){ .send_ret = -ETIMEDOUT });
+	u->nreq = 2;
+	KUNIT_EXPECT_LT(test, ub_unbind(f), 500);
+	KUNIT_EXPECT_EQ(test, u->ret[0], -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, u->errno_after, 0);
+	KUNIT_EXPECT_EQ(test, u->ret[1], -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0), sends + 2);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_TX_ERRORS), tx_errors + 2);
+
+	answers = ch_cnt(ch, OBMF_CH_TX_ANSWERS);
+	dflt = ch_cnt(ch, OBMF_CH_DEFAULT_ANSWERS);
+	fake_inject(f, CH_I2C, 0, other, sizeof(other));
+	flush_workqueue(f->core->wq);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_DEFAULT_ANSWERS), dflt + 1);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_TX_ANSWERS), answers + 1);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_LIVE);
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "during unbind"), 0);
+}
+
+/*
+ * A device that drops one reply during a function driver's unbind and
+ * then answers again: the teardown request after the timeout waits the
+ * hold, goes out and is answered, as at any time
+ */
+static void obmf_test_ch_unbind_transient(struct kunit *test)
+{
+	struct test_ub *u;
+	struct obmf_fake *f = ub_setup(test, false, &u);
+	struct obmf_channel *ch = chan(f, CH_I2C);
+	long ev = ev_cnt(f->core, OBMF_EV_NO_RESPONSE);
+	long timeouts = ch_cnt(ch, OBMF_CH_TIMEOUTS);
+	int sends = fake_count(f, FAKE_SEND, CH_I2C, 0);
+
+	fake_push(f, &(struct fake_step){ .how = FAKE_NEVER, .channel = -1 });
+	u->nreq = 2;
+	KUNIT_EXPECT_LT(test, ub_unbind(f), 2 * UB_REQ_MS);
+	KUNIT_EXPECT_EQ(test, u->ret[0], -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, u->errno_after, 0);
+	KUNIT_EXPECT_EQ(test, u->ret[1], 0);
+	KUNIT_EXPECT_LT(test, u->ms[1], UB_REQ_MS);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0), sends + 2);
+	KUNIT_EXPECT_EQ(test, ev_cnt(f->core, OBMF_EV_NO_RESPONSE), ev + 1);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_TIMEOUTS), timeouts + 1);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_LIVE);
+}
+
+/*
+ * Two device requests the driver kept when it is unbound: the first
+ * default answer's send times out, the second answer is still sent, and
+ * a request after the unbind goes out and is answered
+ */
+static void obmf_test_ch_unbind_answer_timeout(struct kunit *test)
+{
+	static const u8 other[] = { 0x01, 0x00 };
+	struct test_ub *u;
+	struct obmf_fake *f = ub_setup(test, true, &u);
+	struct obmf_channel *ch = chan(f, CH_I2C);
+	struct test_log *log = test_log_case(test, f->tp.dev);
+	int answers = fake_count(f, FAKE_SEND, CH_I2C, 1);
+	long tx = ch_cnt(ch, OBMF_CH_TX_ANSWERS);
+	int sends, i;
+	size_t rlen;
+	u8 resp[8];
+
+	for (i = 0; i < 2; i++)
+		fake_inject(f, CH_I2C, 0, other, sizeof(other));
+	flush_workqueue(f->core->wq);
+	KUNIT_ASSERT_EQ(test, dreq_out(ch), 2);
+	WRITE_ONCE(f->answer_once, true);
+	WRITE_ONCE(f->answer_ret, -ETIMEDOUT);
+	ub_unbind(f);
+	WRITE_ONCE(test_keep_dreq, NULL);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 1), answers + 2);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_TX_ANSWERS), tx + 1);
+	KUNIT_EXPECT_EQ(test, dreq_out(ch), 0);
+	sends = fake_count(f, FAKE_SEND, CH_I2C, 0);
+	KUNIT_EXPECT_EQ(test,
+			obmf_ch_request(ch, 0x01, NULL, 0, resp, sizeof(resp),
+					&rlen, 0),
+			0);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0), sends + 1);
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "during unbind"), 0);
+}
+
+/*
+ * A function driver unbound while the device answers: every request is
+ * answered and nothing is logged. Once it is unbound, an answer whose
+ * send times out changes nothing for the next request.
+ */
+static void obmf_test_ch_unbind_answered(struct kunit *test)
+{
+	static const u8 other[] = { 0x01, 0x00 };
+	struct test_ub *u;
+	struct obmf_fake *f = ub_setup(test, false, &u);
+	struct obmf_channel *ch = chan(f, CH_I2C);
+	struct test_log *log = test_log_case(test, f->tp.dev);
+	size_t rlen;
+	u8 resp[8];
+	int i;
+
+	u->nreq = 3;
+	ub_unbind(f);
+	for (i = 0; i < 3; i++)
+		KUNIT_EXPECT_EQ(test, u->ret[i], 0);
+	KUNIT_EXPECT_EQ(test, u->errno_after, 0);
+
+	WRITE_ONCE(f->answer_once, true);
+	WRITE_ONCE(f->answer_ret, -ETIMEDOUT);
+	fake_inject(f, CH_I2C, 0, other, sizeof(other));
+	flush_workqueue(f->core->wq);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->answer_ret), 0);
+	KUNIT_EXPECT_EQ(test,
+			obmf_ch_request(ch, 0x01, NULL, 0, resp, sizeof(resp),
+					&rlen, 0),
+			0);
+	KUNIT_EXPECT_EQ(test, test_log_wait(test, log, "during unbind", 1, 500),
+			0);
+}
+
+/*
+ * The interface unbound with the driver bound and the device silent: the
+ * core stops at the first timeout, with one line, and the next request
+ * fails -ENODEV at once
+ */
+static void obmf_test_ch_unbind_interface(struct kunit *test)
+{
+	struct test_ub *u;
+	struct obmf_fake *f = ub_setup(test, false, &u);
+	struct test_log *log = test_log_case(test, f->tp.dev);
+
+	WRITE_ONCE(f->silent_ch, CH_I2C);
+	u->nreq = 2;
+	fake_unbind(f);
+	KUNIT_EXPECT_EQ(test, u->ret[0], -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, u->ret[1], -ENODEV);
+	KUNIT_EXPECT_LT(test, u->ms[1], 300);
+	KUNIT_EXPECT_EQ(test,
+			test_log_wait(test, log, "device stopped", 1, 1000), 1);
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "during unbind"), 1);
+}
+
+/* The other channels that send while one channel's driver is unbound */
+static const int ub_busy_chs[] = { CH_GPIO, CH_IPMI, CH_SPI, CH_SERIAL, CH_IO };
+
+/*
+ * The device takes no data, and five other channels send in a loop, each
+ * send taking its whole timeout: each request of a channel's unbind
+ * still ends within the hold of an earlier timeout plus its own wait, as
+ * each send ends within its own timeout, and the other channels go on
+ */
+static void obmf_test_ch_unbind_busy(struct kunit *test)
+{
+	struct test_ub *u;
+	struct obmf_fake *f = ub_setup(test, false, &u);
+	struct obmf_channel *ch = chan(f, CH_I2C);
+	int n = ARRAY_SIZE(ub_busy_chs);
+	struct test_busy *b;
+	size_t rlen;
+	u8 resp[8];
+	s64 ms;
+	int i;
+
+	/* A reply timeout first: the unbind's first request waits the hold */
+	WRITE_ONCE(f->silent_ch, CH_I2C);
+	KUNIT_EXPECT_EQ(test,
+			obmf_ch_request(ch, 0x01, NULL, 0, resp, sizeof(resp),
+					&rlen, 100),
+			-ETIMEDOUT);
+	WRITE_ONCE(f->send_sleep_ret, -ETIMEDOUT);
+	WRITE_ONCE(f->send_sleep_ms, OBMF_MAX_TIMEOUT_MS);
+	b = test_busy_start(f, ub_busy_chs, n, 0);
+	u->nreq = 3;
+	ms = ub_unbind(f);
+	KUNIT_EXPECT_LT(test, ms, 3 * UB_REQ_MS);
+	for (i = 0; i < 3; i++) {
+		KUNIT_EXPECT_EQ_MSG(test, u->ret[i], -ETIMEDOUT, "request %d",
+				    i);
+		KUNIT_EXPECT_LT_MSG(test, u->ms[i], UB_REQ_MS, "request %d", i);
+	}
+	test_busy_end(f, b, n);
+	WRITE_ONCE(f->send_sleep_ms, 0);
+	WRITE_ONCE(f->send_sleep_ret, 0);
+	for (i = 0; i < n; i++) {
+		KUNIT_EXPECT_EQ(test,
+				obmf_ch_request(b[i].ch, 0x01, NULL, 0, resp,
+						sizeof(resp), &rlen, 0),
+				0);
+	}
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_LIVE);
+}
+
+/*
+ * A driver that answers a device request and then returns -EINPROGRESS:
+ * the answer is the only one sent, and the request is not kept
+ */
+static void obmf_test_answer_then_keep(struct kunit *test)
+{
+	struct obmf_fake *f = core_setup(test, 0);
+	struct obmf_channel *ch = chan(f, CH_GPIO);
+	struct obmf_test_fn *fn = test_fn_publish(f, ch);
+	bool kept;
+	u8 msg[16];
+
+	fn->answer_keep = true;
+	fake_rx(f, msg, gpio_notify(msg, CH_GPIO));
+	flush_workqueue(f->core->wq);
+	KUNIT_EXPECT_EQ(test, atomic_read(&fn->calls), 1);
+	KUNIT_EXPECT_EQ(test, fn->answer_ret, 0);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_GPIO, 1), 1);
+	KUNIT_EXPECT_EQ(test, answers_with(f, CH_GPIO, OBMF_STATUS_SUCCESS), 1);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_DEFAULT_ANSWERS), 0);
+	KUNIT_EXPECT_EQ(test, dreq_out(ch), 0);
+	scoped_guard(spinlock_irqsave, &ch->dreq_lock)
+		kept = !list_empty(&ch->kept);
+	KUNIT_EXPECT_FALSE(test, kept);
+}
+
+/*
+ * Table 22: a serial device request is a command byte and a length, then
+ * at least that many bytes. A shorter one is malformed and answered
+ * invalid; one with its bytes, or more, is delivered (here: no driver, so
+ * the default answer). An answer of the channel's request limit, echo
+ * byte included, is sent; one byte more is refused -EMSGSIZE.
+ */
+static void obmf_test_dreq_len_bounds(struct kunit *test)
+{
+	static const u8 none[] = { 0x00, 0x02 };
+	static const u8 short_by_one[] = { 0x00, 0x02, 0x00, 'o' };
+	static const u8 exact[] = { 0x00, 0x01, 0x00, 'o' };
+	static const u8 empty[] = { 0x00, 0x00, 0x00 };
+	static const u8 more[] = { 0x00, 0x01, 0x00, 'o', 'k' };
+	struct obmf_fake *f = core_setup(test, 0);
+	struct obmf_channel *ch = chan(f, CH_SERIAL);
+	struct obmf_channel *gpio = chan(f, CH_GPIO);
+	struct obmf_test_fn *fn;
+	long malformed, dreqs;
+	size_t lim = gpio->info.max_req;
+	u8 msg[16], *body;
+
+	KUNIT_ASSERT_NULL(test, ch->fdev->adev.dev.driver);
+	malformed = if_cnt(f->core, OBMF_IF_RX_MALFORMED);
+	dreqs = ch_cnt(ch, OBMF_CH_RX_DEVICE_REQUESTS);
+	fake_inject(f, CH_SERIAL, 0, none, sizeof(none));
+	fake_inject(f, CH_SERIAL, 0, short_by_one, sizeof(short_by_one));
+	fake_inject(f, CH_SERIAL, 0, exact, sizeof(exact));
+	fake_inject(f, CH_SERIAL, 0, empty, sizeof(empty));
+	fake_inject(f, CH_SERIAL, 0, more, sizeof(more));
+	flush_workqueue(f->core->wq);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_RX_DEVICE_REQUESTS),
+			dreqs + 5);
+	KUNIT_EXPECT_EQ(test, if_cnt(f->core, OBMF_IF_RX_MALFORMED),
+			malformed + 2);
+	KUNIT_EXPECT_EQ(test, answers_with(f, CH_SERIAL, OBMF_STATUS_INVALID),
+			2);
+	KUNIT_EXPECT_EQ(test, answers_with(f, CH_SERIAL, OBMF_STATUS_SUCCESS),
+			3);
+	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_DEFAULT_ANSWERS), 5);
+
+	/* the GPIO type echoes the command byte */
+	body = kunit_kzalloc(test, lim, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, body);
+	fn = test_fn_publish(f, gpio);
+	fn->keep = true;
+	fake_rx(f, msg, gpio_notify(msg, CH_GPIO));
+	flush_workqueue(f->core->wq);
+	KUNIT_ASSERT_NOT_NULL(test, fn->kept);
+	KUNIT_EXPECT_EQ(test,
+			obmf_respond(&fn->fdev, fn->kept, OBMF_STATUS_SUCCESS,
+				     body, lim),
+			-EMSGSIZE);
+	fn->kept = NULL;
+	fake_rx(f, msg, gpio_notify(msg, CH_GPIO));
+	flush_workqueue(f->core->wq);
+	KUNIT_ASSERT_NOT_NULL(test, fn->kept);
+	KUNIT_EXPECT_EQ(test,
+			obmf_respond(&fn->fdev, fn->kept, OBMF_STATUS_SUCCESS,
+				     body, lim - 1),
+			0);
+	KUNIT_EXPECT_EQ(test, last_answer(f, CH_GPIO)->len, OBMF_HDR_LEN + lim);
 }
 
 /*
@@ -3079,6 +4172,21 @@ static void obmf_test_respond_edges(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_GPIO, 1), 0);
 }
 
+/*
+ * A device request whose work runs once the transport has stopped gets
+ * no answer: the core starts none, and nothing is counted as an error
+ */
+static void obmf_test_stop_default_answer(struct kunit *test)
+{
+	struct obmf_fake *f = core_setup(test, 0);
+
+	f->stop_dreq_ch = chan(f, CH_TPM);
+	fake_unbind(f);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->sends_after_stop), 0);
+	KUNIT_EXPECT_EQ(test, f->stop_dreq_answers, 0);
+	KUNIT_EXPECT_EQ(test, f->stop_dreq_errors, 0);
+}
+
 static struct kunit_case obmf_core_cases[] = {
 	KUNIT_CASE(obmf_test_request_encode),
 	KUNIT_CASE(obmf_test_request_lengths),
@@ -3090,6 +4198,7 @@ static struct kunit_case obmf_core_cases[] = {
 	KUNIT_CASE(obmf_test_wait_clamp),
 	KUNIT_CASE(obmf_test_wait_timeout),
 	KUNIT_CASE_SLOW(obmf_test_wait_floor),
+	KUNIT_CASE(obmf_test_wait_send_late),
 	KUNIT_CASE(obmf_test_reply_contexts),
 	KUNIT_CASE(obmf_test_first_reply_wins),
 	KUNIT_CASE(obmf_test_late_reply),
@@ -3104,6 +4213,7 @@ static struct kunit_case obmf_core_cases[] = {
 	KUNIT_CASE(obmf_test_late_reply_resume),
 	KUNIT_CASE(obmf_test_fatal),
 	KUNIT_CASE(obmf_test_stopped),
+	KUNIT_CASE(obmf_test_unplug_waiters),
 	KUNIT_CASE(obmf_test_quiesce_armed_reply),
 	KUNIT_CASE(obmf_test_quiesce_armed_timeout),
 	KUNIT_CASE(obmf_test_quiesce_new_request),
@@ -3122,6 +4232,19 @@ static struct kunit_case obmf_core_cases[] = {
 	KUNIT_CASE(obmf_test_dreq_malformed),
 	KUNIT_CASE(obmf_test_dreq_unanswered),
 	KUNIT_CASE(obmf_test_respond_edges),
+	KUNIT_CASE(obmf_test_stop_default_answer),
+	KUNIT_CASE(obmf_test_unbind_kept),
+	KUNIT_CASE_SLOW(obmf_test_ch_unbind_silent),
+	KUNIT_CASE(obmf_test_ch_unbind_send_timeout),
+	KUNIT_CASE_SLOW(obmf_test_ch_unbind_transient),
+	KUNIT_CASE(obmf_test_ch_unbind_answer_timeout),
+	KUNIT_CASE(obmf_test_ch_unbind_answered),
+	KUNIT_CASE(obmf_test_ch_unbind_interface),
+	KUNIT_CASE_SLOW(obmf_test_ch_unbind_busy),
+	KUNIT_CASE(obmf_test_answer_then_keep),
+	KUNIT_CASE(obmf_test_dreq_len_bounds),
+	KUNIT_CASE(obmf_test_pm_failed),
+	KUNIT_CASE(obmf_test_pm_unbinding),
 	{}
 };
 
@@ -3166,7 +4289,11 @@ static int disc_reads_at(struct obmf_fake *f, u32 addr)
 	return n;
 }
 
-/* Milliseconds between the header reads that start passes @a and @b */
+/*
+ * Milliseconds between the header reads that start passes @a and @b. The
+ * wait between passes is counted in jiffies, so on a busy machine it can
+ * read up to one jiffy short of the time asked.
+ */
 static s64 disc_gap(struct obmf_fake *f, int a, int b)
 {
 	int i = -1, n = 0, ia = -1, ib = -1;
@@ -3288,6 +4415,12 @@ static void obmf_test_ch_regs(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(r->msg + 6),
 			fake_ch_off(f, 1) + OBMF_CH_REG_SPECIFIC_CONTROL);
 	KUNIT_EXPECT_EQ(test, r->msg[10], 0xa3);
+
+	/* A mask of 0 changes nothing and sends nothing */
+	i = READ_ONCE(f->sends);
+	KUNIT_EXPECT_EQ(test, obmf_ch_control_update(fdev, 0, 0xff), 0);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), i);
+	KUNIT_EXPECT_EQ(test, h[OBMF_CH_REG_SPECIFIC_CONTROL], 0xa3);
 }
 
 /*
@@ -3495,6 +4628,49 @@ static void obmf_test_discover_unusable(struct kunit *test)
 }
 
 /*
+ * A device that lists 30 unusable channels gets OBMF_BIND_WARN_MAX of
+ * their warnings and one line for the rest, at every bind; a second
+ * device bound at once gets its own
+ */
+static void obmf_test_discover_unusable_many(struct kunit *test)
+{
+	static const char more[] = " 20 more configuration warnings not logged";
+	const int n = 30;
+	struct obmf_fake *f;
+	struct test_log *log;
+	struct test_chan *c;
+	int i, dev;
+
+	c = kunit_kcalloc(test, n + 1, sizeof(*c), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, c);
+	for (i = 0; i <= n; i++)
+		c[i] = (struct test_chan){ OBMF_TYPE_SERIAL,
+					   OBMF_ROLE_PRODUCER,
+					   "off",
+					   516,
+					   FAKE_OFF_ENABLE,
+					   0 };
+	c[n].name = "uart";
+	c[n].off = 0;
+	c[n].config_len = 64;
+	for (dev = 0; dev < 2; dev++) {
+		f = fake_create(test, FAKE_MAX_MSG, 0);
+		log = test_log_start(test, f->tp.dev);
+		fake_layout(f, c, n + 1);
+		KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+		for (i = 1; i <= n; i++)
+			KUNIT_EXPECT_NULL_MSG(test, f->core->chans[i],
+					      "channel %d", i);
+		KUNIT_EXPECT_NOT_NULL(test, chan(f, n + 1)->fdev);
+		KUNIT_EXPECT_EQ(test,
+				test_log_lines(test, log, ": not enabled"),
+				OBMF_BIND_WARN_MAX);
+		KUNIT_EXPECT_EQ(test, test_log_lines(test, log, more), 1);
+		KUNIT_EXPECT_EQ(test, f->core->bind_warns, n);
+	}
+}
+
+/*
  * A fatal error after discovery's last read fails the bind at the INIT to
  * LIVE edge, with no function device; one while that read is armed fails the
  * read
@@ -3574,7 +4750,9 @@ static void obmf_test_discover_enodev(struct kunit *test)
 	f->read_ret = -ENODEV;
 	KUNIT_EXPECT_EQ(test, fake_bind(f), -ENODEV);
 	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, 0, 0), 1);
-	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_INIT);
+	/* Probe has returned: a failed discovery leaves the core failed */
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_FAILED);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
 }
 
 /* a read timing out in the first pass only */
@@ -3592,16 +4770,311 @@ static void obmf_test_discover_timeout_once(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_LIVE);
 }
 
-/* timing out in every pass: three passes, then -ETIMEDOUT */
-static void obmf_test_discover_timeout_always(struct kunit *test)
+/*
+ * a read the device answers with its timeout status in the first pass
+ * only: that pass is run again, and no timeout is counted
+ */
+static void obmf_test_discover_status_once(struct kunit *test)
 {
 	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
 
 	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+	f->status_read = 2;
+	KUNIT_EXPECT_EQ(test, fake_bind(f), 0);
+	KUNIT_EXPECT_EQ(test, f->hdr_reads, 3);
+	KUNIT_EXPECT_EQ(test, ch_cnt(f->core->ch0, OBMF_CH_STATUS_ERRORS), 1);
+	KUNIT_EXPECT_EQ(test, ch_cnt(f->core->ch0, OBMF_CH_TIMEOUTS), 0);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_LIVE);
+}
+
+/*
+ * A device that never answers: probe returns before the first wait could
+ * end, then three passes time out and leave the core failed
+ */
+static void obmf_test_discover_timeout_always(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	ktime_t t;
+
+	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
 	f->drop_hdr = true;
-	KUNIT_EXPECT_EQ(test, fake_bind(f), -ETIMEDOUT);
+	t = ktime_get();
+	KUNIT_ASSERT_EQ(test, fake_probe(f), 0);
+	KUNIT_EXPECT_LT(test, ktime_ms_delta(ktime_get(), t),
+			OBMF_DEFAULT_TIMEOUT_MS / 2);
+	flush_work(&f->core->bind_work);
+	KUNIT_EXPECT_EQ(test, f->core->bind_err, -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_FAILED);
 	KUNIT_EXPECT_EQ(test, f->hdr_reads, 3);
 	KUNIT_EXPECT_EQ(test, ch_cnt(f->core->ch0, OBMF_CH_TIMEOUTS), 3);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+}
+
+/*
+ * An unbind during discovery ends it at its pending read: no pass
+ * again, no wait for the reply timeout, nothing sent after it
+ */
+static void obmf_test_discover_unbind(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	ktime_t t;
+
+	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+	f->drop_hdr = true;
+	KUNIT_ASSERT_EQ(test, fake_probe(f), 0);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, 1));
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_INIT);
+	t = ktime_get();
+	fake_unbind(f);
+	KUNIT_EXPECT_LT(test, ktime_ms_delta(ktime_get(), t),
+			OBMF_DEFAULT_TIMEOUT_MS / 2);
+	KUNIT_EXPECT_EQ(test, f->hdr_reads, 1);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), 1);
+}
+
+/*
+ * A suspend during discovery ends it at its pending read; resume runs it
+ * again, and the function devices come then
+ */
+static void obmf_test_discover_suspend(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	ktime_t t;
+
+	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+	f->drop_hdr = true;
+	KUNIT_ASSERT_EQ(test, fake_probe(f), 0);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, 1));
+	t = ktime_get();
+	KUNIT_EXPECT_EQ(test, obmf_core_quiesce(f->core), 0);
+	KUNIT_EXPECT_LT(test, ktime_ms_delta(ktime_get(), t),
+			OBMF_DEFAULT_TIMEOUT_MS / 2);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_QUIESCED);
+	KUNIT_EXPECT_EQ(test, f->core->bind_err, -EAGAIN);
+	KUNIT_EXPECT_FALSE(test, f->core->table);
+	KUNIT_EXPECT_EQ(test, f->hdr_reads, 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 0);
+
+	WRITE_ONCE(f->drop_hdr, false);
+	KUNIT_ASSERT_EQ(test, obmf_core_resume(f->core), 0);
+	flush_work(&f->core->bind_work);
+	KUNIT_EXPECT_EQ(test, f->core->bind_err, 0);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_LIVE);
+	KUNIT_EXPECT_EQ(test, f->hdr_reads, 3);
+	KUNIT_EXPECT_NOT_NULL(test, chan(f, 1)->fdev);
+	KUNIT_EXPECT_NOT_NULL(test, chan(f, 2)->fdev);
+}
+
+/*
+ * An unbind or a suspend while discovery waits between two passes ends
+ * the wait at once: no second pass, no wait for the rest of it
+ */
+static void obmf_test_discover_settle_ends(struct kunit *test)
+{
+	struct obmf_fake *f;
+	ktime_t t;
+	int how;
+
+	for (how = 0; how < 2; how++) {
+		f = fake_create(test, FAKE_MAX_MSG, 0);
+		fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+		/* the first read gets the timeout status: the pass is retried */
+		f->status_read = 1;
+		KUNIT_ASSERT_EQ(test, fake_probe(f), 0);
+		KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, 1));
+		msleep(OBMF_DEFAULT_TIMEOUT_MS / 10);
+		t = ktime_get();
+		if (how) {
+			KUNIT_EXPECT_EQ(test, obmf_core_quiesce(f->core), 0);
+			KUNIT_EXPECT_EQ(test, f->core->bind_err, -EAGAIN);
+		} else {
+			fake_unbind(f);
+		}
+		KUNIT_EXPECT_LT_MSG(test, ktime_ms_delta(ktime_get(), t),
+				    OBMF_DEFAULT_TIMEOUT_MS / 2, "how %d", how);
+		KUNIT_EXPECT_EQ_MSG(test, READ_ONCE(f->sends), 1, "how %d",
+				    how);
+	}
+}
+
+static int fake_count_child(struct device *dev, void *data)
+{
+	(*(int *)data)++;
+	return 0;
+}
+
+/* The devices below the transport's: the function devices */
+static int fake_children(struct obmf_fake *f)
+{
+	int n = 0;
+
+	device_for_each_child(f->tp.dev, &n, fake_count_child);
+	return n;
+}
+
+static bool fake_wait_done(struct completion *done)
+{
+	return wait_for_completion_timeout(done,
+					   msecs_to_jiffies(FAKE_WAIT_MS));
+}
+
+/*
+ * A failed discovery gives the device up: the release is asked once, with
+ * the core failed and no function device, and the unbind it starts runs
+ * once the device lock is free
+ */
+static void obmf_test_discover_fail_release(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	bool entered;
+
+	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+	f->read_ret = -ENODEV;
+	f->release_unbinds = true;
+	f->release_hold = true;
+	/* No assertion under the lock: the cleanup would wait for it */
+	mutex_lock(&f->dev_lock);
+	KUNIT_EXPECT_EQ(test, fake_probe(f), 0);
+	entered = fake_wait_done(&f->release_entered);
+	KUNIT_EXPECT_TRUE(test, entered);
+	if (entered) {
+		KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_FAILED);
+		KUNIT_EXPECT_EQ(test, f->core->bind_err, -ENODEV);
+		KUNIT_EXPECT_EQ(test, fake_children(f), 0);
+	}
+	complete(&f->release_go);
+	mutex_unlock(&f->dev_lock);
+
+	KUNIT_ASSERT_TRUE(test, fake_wait_done(&f->release_done));
+	KUNIT_EXPECT_EQ(test, f->released, 1);
+	KUNIT_EXPECT_NULL(test, f->core);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+	KUNIT_EXPECT_EQ(test, fake_children(f), 0);
+}
+
+/*
+ * An unbind racing a failed discovery. Before the failure, it ends the
+ * discovery and no release is asked; after it, the release finds the
+ * interface unbound. The unbind holds the device lock while it waits for
+ * the bind work, so the bind work never takes that lock.
+ */
+static void obmf_test_discover_fail_unbind(struct kunit *test)
+{
+	struct obmf_fake *f;
+	bool entered;
+
+	f = fake_create(test, FAKE_MAX_MSG, 0);
+	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+	f->drop_hdr = true;
+	f->release_unbinds = true;
+	KUNIT_ASSERT_EQ(test, fake_probe(f), 0);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, 1));
+	scoped_guard(mutex, &f->dev_lock)
+		fake_unbind(f);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 0);
+
+	f = fake_create(test, FAKE_MAX_MSG, 0);
+	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+	f->read_ret = -ENODEV;
+	f->release_unbinds = true;
+	f->release_hold = true;
+	mutex_lock(&f->dev_lock);
+	KUNIT_EXPECT_EQ(test, fake_probe(f), 0);
+	entered = fake_wait_done(&f->release_entered);
+	KUNIT_EXPECT_TRUE(test, entered);
+	/* the release work is queued and waits for the lock */
+	complete(&f->release_go);
+	fake_unbind(f);
+	mutex_unlock(&f->dev_lock);
+	KUNIT_ASSERT_TRUE(test, entered);
+	KUNIT_ASSERT_TRUE(test, fake_wait_done(&f->release_done));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+	KUNIT_EXPECT_EQ(test, f->released, 0);
+}
+
+/*
+ * A discovery that fails gives the device up; a new bind runs discovery
+ * again (the first read only fails), it succeeds, and no release is asked
+ */
+static void obmf_test_discover_fail_rebind(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	unsigned int reads;
+
+	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+	f->read_ret = -ENODEV;
+	f->release_unbinds = true;
+	KUNIT_ASSERT_EQ(test, fake_probe(f), 0);
+	KUNIT_ASSERT_TRUE(test, fake_wait_done(&f->release_done));
+	KUNIT_ASSERT_NULL(test, f->core);
+	KUNIT_EXPECT_EQ(test, f->released, 1);
+	reads = f->hdr_reads;
+
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_LIVE);
+	KUNIT_EXPECT_GT(test, f->hdr_reads, reads);
+	KUNIT_EXPECT_NOT_NULL(test, chan(f, 1)->fdev);
+	KUNIT_EXPECT_GT(test, fake_children(f), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+}
+
+/*
+ * A suspend that ends discovery, then a resume that fails: the core is
+ * failed with no function device, and the resume gives the device up while
+ * it holds the device lock, as the PM core does; the unbind runs once the
+ * lock is free. A core that failed while quiesced is given up by a resume
+ * that succeeds; one whose discovery failed before the suspend was given up
+ * then, and a failed resume asks no second release.
+ */
+static void obmf_test_discover_suspend_fail(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	bool done;
+
+	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+	f->drop_hdr = true;
+	f->release_unbinds = true;
+	KUNIT_ASSERT_EQ(test, fake_probe(f), 0);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, 1));
+	KUNIT_EXPECT_EQ(test, obmf_core_quiesce(f->core), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 0);
+	f->resume_ret = -EPROTO;
+	/* No assertion under the lock: the cleanup would wait for it */
+	mutex_lock(&f->dev_lock);
+	KUNIT_EXPECT_EQ(test, obmf_core_resume(f->core), -EPROTO);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_FAILED);
+	KUNIT_EXPECT_EQ(test, fake_children(f), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+	done = completion_done(&f->release_done);
+	mutex_unlock(&f->dev_lock);
+	KUNIT_EXPECT_FALSE(test, done);
+	KUNIT_ASSERT_TRUE(test, fake_wait_done(&f->release_done));
+	KUNIT_EXPECT_EQ(test, f->released, 1);
+	KUNIT_EXPECT_NULL(test, f->core);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+	KUNIT_EXPECT_EQ(test, fake_children(f), 0);
+
+	f = fake_create(test, FAKE_MAX_MSG, 0);
+	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+	f->drop_hdr = true;
+	KUNIT_ASSERT_EQ(test, fake_probe(f), 0);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, 1));
+	KUNIT_EXPECT_EQ(test, obmf_core_quiesce(f->core), 0);
+	obmf_core_fatal(f->core, -EIO);
+	KUNIT_EXPECT_EQ(test, obmf_core_resume(f->core), 0);
+	KUNIT_EXPECT_EQ(test, obmf_core_state(f->core), OBMF_FAILED);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+
+	f = fake_create(test, FAKE_MAX_MSG, 0);
+	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+	f->read_ret = -ENODEV;
+	KUNIT_ASSERT_EQ(test, fake_probe(f), 0);
+	flush_work(&f->core->bind_work);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+	KUNIT_EXPECT_EQ(test, obmf_core_quiesce(f->core), 0);
+	f->resume_ret = -EPROTO;
+	KUNIT_EXPECT_EQ(test, obmf_core_resume(f->core), -EPROTO);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
 }
 
 /* a device header that differs on every pass, and on one */
@@ -3614,8 +5087,10 @@ static void obmf_test_discover_header_changes(struct kunit *test)
 	f->bump_to = UINT_MAX;
 	KUNIT_EXPECT_EQ(test, fake_bind(f), -EIO);
 	KUNIT_EXPECT_EQ(test, f->hdr_reads, 6);
-	KUNIT_EXPECT_GE(test, disc_gap(f, 1, 2), OBMF_DEFAULT_TIMEOUT_MS);
-	KUNIT_EXPECT_GE(test, disc_gap(f, 3, 4), OBMF_DEFAULT_TIMEOUT_MS);
+	KUNIT_EXPECT_GE(test, disc_gap(f, 1, 2),
+			OBMF_DEFAULT_TIMEOUT_MS - jiffies_to_msecs(1));
+	KUNIT_EXPECT_GE(test, disc_gap(f, 3, 4),
+			OBMF_DEFAULT_TIMEOUT_MS - jiffies_to_msecs(1));
 	KUNIT_EXPECT_NULL(test, f->core->chans[1]);
 
 	f = fake_create(test, FAKE_MAX_MSG, 0);
@@ -3640,7 +5115,8 @@ static void obmf_test_discover_stale_reply(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->hdr_reads, 3);
 	KUNIT_EXPECT_EQ(test, ch_cnt(ch0, OBMF_CH_PROTOCOL_ERRORS), 1);
 	KUNIT_EXPECT_EQ(test, ch_cnt(ch0, OBMF_CH_RX_LATE), 1);
-	KUNIT_EXPECT_GE(test, disc_gap(f, 0, 1), OBMF_DEFAULT_TIMEOUT_MS);
+	KUNIT_EXPECT_GE(test, disc_gap(f, 0, 1),
+			OBMF_DEFAULT_TIMEOUT_MS - jiffies_to_msecs(1));
 
 	f = fake_create(test, FAKE_MAX_MSG, 0);
 	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
@@ -3799,7 +5275,7 @@ static void obmf_test_info_many(struct kunit *test)
 	struct test_chan c[20];
 	char buf[OBMF_INFO_LEN];
 	struct obmf_fake *f;
-	int i, k;
+	int i, k, n = 0;
 
 	for (i = 0; i < ARRAY_SIZE(c); i++)
 		c[i] = (struct test_chan){ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER,
@@ -3813,6 +5289,9 @@ static void obmf_test_info_many(struct kunit *test)
 		obmf_core_info(f->core, buf);
 		KUNIT_EXPECT_STREQ(test, buf, want[k]);
 	}
+	for (i = 1; i < OBMF_NR_CHANNELS; i++)
+		n += !!f->core->chans[i];
+	KUNIT_EXPECT_EQ(test, n, ARRAY_SIZE(c));
 }
 
 /*
@@ -3827,7 +5306,7 @@ static void obmf_test_info_kinds(struct kunit *test)
 		{ OBMF_TYPE_I2C_TARGET, OBMF_ROLE_PRODUCER, NULL, 516 },
 		{ OBMF_TYPE_I3C, OBMF_ROLE_PRODUCER, NULL, 516 },
 		{ OBMF_TYPE_IPMI, OBMF_ROLE_PRODUCER, NULL, 516 },
-		{ OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, NULL, 516 },
+		{ OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, NULL, 516, 0, 20 },
 		{ OBMF_TYPE_IO, OBMF_ROLE_PRODUCER, NULL, 516 },
 	};
 	static const struct test_chan two[] = {
@@ -3845,7 +5324,7 @@ static void obmf_test_info_kinds(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
 	obmf_core_info(f->core, buf);
 	KUNIT_EXPECT_STREQ(test, buf,
-			   "OBMF-ICP 1.0 device '': type 0x00 ch1 '' (no driver), MMIO ch2 '' (no driver), I2C-target ch3 '' (no driver), I3C ch4 '' (no driver), IPMI ch5 '' (no driver), SPI ch6 '' (no driver), IO ch7 '' (no driver)");
+			   "OBMF-ICP 1.0 device '': type 0x00 ch1 '' (no driver), MMIO ch2 '' (no driver), I2C-target ch3 '' (no driver), I3C ch4 '' (no driver), IPMI ch5 '' (no driver), SPI ch6 '', IO ch7 '' (no driver)");
 
 	f = fake_create(test, FAKE_MAX_MSG, 0);
 	fake_layout(f, two, ARRAY_SIZE(two));
@@ -3872,10 +5351,18 @@ static struct kunit_case obmf_ctrl_cases[] = {
 	KUNIT_CASE(obmf_test_info_many),
 	KUNIT_CASE(obmf_test_info_kinds),
 	KUNIT_CASE_SLOW(obmf_test_discover_timeout_once),
+	KUNIT_CASE(obmf_test_discover_status_once),
 	KUNIT_CASE_SLOW(obmf_test_discover_timeout_always),
 	KUNIT_CASE_SLOW(obmf_test_discover_header_changes),
 	KUNIT_CASE_SLOW(obmf_test_discover_stale_reply),
 	KUNIT_CASE_SLOW(obmf_test_discover_budget),
+	KUNIT_CASE(obmf_test_discover_unbind),
+	KUNIT_CASE(obmf_test_discover_suspend),
+	KUNIT_CASE(obmf_test_discover_settle_ends),
+	KUNIT_CASE(obmf_test_discover_fail_release),
+	KUNIT_CASE(obmf_test_discover_fail_unbind),
+	KUNIT_CASE(obmf_test_discover_fail_rebind),
+	KUNIT_CASE(obmf_test_discover_suspend_fail),
 	{}
 };
 
@@ -4100,12 +5587,14 @@ static void obmf_test_devres_order(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
 	fdev = chan(f, 1)->fdev;
 	KUNIT_ASSERT_NOT_NULL(test, fdev);
-	/* A built-in i2c-obmf holds the device */
-	device_release_driver(&fdev->adev.dev);
+	KUNIT_ASSERT_NULL(test, fdev->adev.dev.driver);
 
-	KUNIT_EXPECT_EQ(test, devm_obmf_enable(fdev), -EINVAL);
-	KUNIT_EXPECT_EQ(test, devm_obmf_publish(fdev, &test_devres_ops),
-			-EINVAL);
+	obmf_test_warns(test)
+	{
+		KUNIT_EXPECT_EQ(test, devm_obmf_enable(fdev), -EINVAL);
+		KUNIT_EXPECT_EQ(test, devm_obmf_publish(fdev, &test_devres_ops),
+				-EINVAL);
+	}
 	KUNIT_EXPECT_FALSE(test, chan(f, 1)->bound);
 
 	test_devres_seen = t;
@@ -4130,6 +5619,40 @@ static void obmf_test_devres_order(struct kunit *test)
 	KUNIT_EXPECT_GE(test, req, 0);
 	KUNIT_EXPECT_GT(test, stop, req);
 	KUNIT_EXPECT_EQ(test, ch0_writes(f), 0);
+}
+
+/*
+ * A fake transport's function devices have the test names, which neither
+ * a function driver nor a case's driver matches unless it registers
+ */
+static void obmf_test_fake_names(struct kunit *test)
+{
+	static const char *const names[] = {
+		[CH_I2C] = "obmf.test-i2c.",
+		[CH_GPIO] = "obmf.test-gpio.",
+		[CH_SERIAL] = "obmf.test-serial.",
+		[CH_SPI] = "obmf.test-spi.",
+	};
+	struct obmf_fake *f = core_setup(test, 0);
+	struct obmf_channel *ch;
+	const char *name;
+	int nr, n = 0;
+
+	for (nr = 1; nr < OBMF_NR_CHANNELS; nr++) {
+		ch = f->core->chans[nr];
+		if (!ch || !ch->fdev)
+			continue;
+		n++;
+		KUNIT_ASSERT_LT_MSG(test, nr, ARRAY_SIZE(names), "channel %d",
+				    nr);
+		KUNIT_ASSERT_NOT_NULL_MSG(test, names[nr], "channel %d", nr);
+		name = dev_name(&ch->fdev->adev.dev);
+		KUNIT_EXPECT_TRUE_MSG(test, str_has_prefix(name, names[nr]),
+				      "%s", name);
+		KUNIT_EXPECT_NULL_MSG(test, ch->fdev->adev.dev.driver, "%s",
+				      name);
+	}
+	KUNIT_EXPECT_EQ(test, n, 4);
 }
 
 /* disc_chans bound on an interface whose firmware node is set */
@@ -4397,15 +5920,152 @@ static void obmf_test_swnode_misnamed(struct kunit *test)
 	node_check(sw_bind(test, &sw_name), NULL, NULL);
 }
 
+/* What sysfs reads from attribute @name of @groups on @dev */
+static void sysfs_check(struct kunit *test, struct device *dev,
+			const struct attribute_group **groups, const char *name,
+			const char *want)
+{
+	struct device_attribute *da = NULL;
+	struct attribute **a;
+	char *buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_NOT_NULL(test, groups);
+	for (a = groups[0]->attrs; *a; a++)
+		if (!strcmp((*a)->name, name))
+			da = container_of(*a, struct device_attribute, attr);
+	KUNIT_ASSERT_NOT_NULL_MSG(test, da, "%s", name);
+	KUNIT_EXPECT_EQ_MSG(test, da->show(dev, da, buf), strlen(want), "%s",
+			    name);
+	KUNIT_EXPECT_STREQ_MSG(test, buf, want, "%s", name);
+}
+
+/*
+ * A function device's name and channel, and the interface's obmf/name,
+ * read back the channel name, the channel number and the device name
+ */
+static void obmf_test_sysfs_names(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	struct obmf_fdev *fdev;
+	struct device *dev;
+
+	fake_layout(f, core_chans, ARRAY_SIZE(core_chans));
+	memset(f->mem + 6, 0, 32);
+	memcpy(f->mem + 6, "bmc-card", 8);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	fdev = chan(f, CH_SERIAL)->fdev;
+	KUNIT_ASSERT_NOT_NULL(test, fdev);
+	sysfs_check(test, &fdev->adev.dev, fdev->adev.dev.groups, "name",
+		    "uart\n");
+	sysfs_check(test, &fdev->adev.dev, fdev->adev.dev.groups, "channel",
+		    "5\n");
+
+	dev = kunit_device_register(test, "obmf-intf");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(dev));
+	dev_set_drvdata(dev, &f->tp);
+	KUNIT_EXPECT_STREQ(test, obmf_intf_groups[0]->name, "obmf");
+	sysfs_check(test, dev, obmf_intf_groups, "name", "bmc-card\n");
+}
+
+/*
+ * The interface's obmf/name reads empty while discovery runs, whatever
+ * the name field holds, and the device name once the table is set
+ */
+static void obmf_test_sysfs_name_early(struct kunit *test)
+{
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	struct device *dev;
+
+	fake_layout(f, disc_chans, ARRAY_SIZE(disc_chans));
+	f->drop_hdr = true;
+	dev = kunit_device_register(test, "obmf-intf");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(dev));
+	dev_set_drvdata(dev, &f->tp);
+	KUNIT_ASSERT_EQ(test, fake_probe(f), 0);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, 1));
+	/* as a pass that has copied the name and not set the table yet */
+	strscpy(f->core->device_name, "half");
+	sysfs_check(test, dev, obmf_intf_groups, "name", "\n");
+
+	WRITE_ONCE(f->drop_hdr, false);
+	flush_work(&f->core->bind_work);
+	KUNIT_ASSERT_EQ(test, f->core->bind_err, 0);
+	sysfs_check(test, dev, obmf_intf_groups, "name", "obmf-test\n");
+}
+
+/*
+ * Only a GPIO, an I2C controller, a serial or an SPI controller channel
+ * the device serves gets a function device; every other type, and those
+ * with another role, is discovered and left without one
+ */
+static void obmf_test_no_fdev(struct kunit *test)
+{
+	static const struct test_chan c[] = {
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c", 516, 0,
+		  2 },
+		{ OBMF_TYPE_MMIO, OBMF_ROLE_PRODUCER, "mmio", 516 },
+		{ OBMF_TYPE_I2C_TARGET, OBMF_ROLE_PRODUCER, "i2ct", 516 },
+		{ OBMF_TYPE_I3C, OBMF_ROLE_PRODUCER, "i3c", 516 },
+		{ OBMF_TYPE_IPMI, OBMF_ROLE_PRODUCER, "ipmi", 516 },
+		{ OBMF_TYPE_SPI, OBMF_ROLE_CONSUMER, "spic", 516 },
+		{ OBMF_TYPE_IO, OBMF_ROLE_PRODUCER, "io", 516 },
+		{ OBMF_TYPE_MEMDEV, OBMF_ROLE_PRODUCER, "memdev", 516 },
+		{ OBMF_TYPE_TPM, OBMF_ROLE_PRODUCER, "tpm", 516 },
+		{ OBMF_TYPE_RTC, OBMF_ROLE_PRODUCER, "rtc", 516 },
+		{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_CONSUMER, "i2cc", 516, 0,
+		  2 },
+		{ OBMF_TYPE_GPIO, OBMF_ROLE_CONSUMER, "gpioc", 516 },
+		{ OBMF_TYPE_SERIAL, OBMF_ROLE_CONSUMER, "uartc", 516 },
+	};
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	int i;
+
+	fake_layout(f, c, ARRAY_SIZE(c));
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	KUNIT_EXPECT_NOT_NULL(test, chan(f, 1)->fdev);
+	for (i = 1; i < ARRAY_SIZE(c); i++)
+		KUNIT_EXPECT_NULL_MSG(test, chan(f, i + 1)->fdev, "%s",
+				      c[i].name);
+}
+
+/* Each SPI controller channel gets its own obmf.spi device */
+static void obmf_test_spi_fdev(struct kunit *test)
+{
+	static const struct test_chan c[] = {
+		{ OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, "spi0", 516, 0, 20 },
+		{ OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, "spi1", 516, 0, 20 },
+	};
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	struct obmf_fdev *a, *b;
+
+	fake_layout(f, c, ARRAY_SIZE(c));
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	a = chan(f, 1)->fdev;
+	b = chan(f, 2)->fdev;
+	KUNIT_ASSERT_NOT_NULL(test, a);
+	KUNIT_ASSERT_NOT_NULL(test, b);
+	KUNIT_EXPECT_STREQ(test, a->adev.name, "test-spi");
+	KUNIT_EXPECT_STREQ(test, b->adev.name, "test-spi");
+	KUNIT_EXPECT_NE(test, a->adev.id, b->adev.id);
+	KUNIT_EXPECT_PTR_EQ(test, a->info, &chan(f, 1)->info);
+	KUNIT_EXPECT_PTR_EQ(test, b->info, &chan(f, 2)->info);
+}
+
 static struct kunit_case obmf_bus_cases[] = {
 	KUNIT_CASE(obmf_test_debugfs),
 	KUNIT_CASE(obmf_test_labels),
+	KUNIT_CASE(obmf_test_sysfs_names),
+	KUNIT_CASE(obmf_test_sysfs_name_early),
+	KUNIT_CASE(obmf_test_no_fdev),
+	KUNIT_CASE(obmf_test_spi_fdev),
 	KUNIT_CASE(obmf_test_devres_order),
 	KUNIT_CASE(obmf_test_of_nodes),
 	KUNIT_CASE(obmf_test_of_misnamed),
 	KUNIT_CASE(obmf_test_of_disabled),
 	KUNIT_CASE(obmf_test_swnodes),
 	KUNIT_CASE(obmf_test_swnode_misnamed),
+	KUNIT_CASE(obmf_test_fake_names),
 	{}
 };
 
@@ -4719,7 +6379,7 @@ static void obmf_test_report_status(struct kunit *test)
 		{ CH_GPIO, OBMF_STATUS_UNKNOWN_CHANNEL, -ECHRNG, true },
 		{ CH_GPIO, 0x3f, -EIO, true },
 		{ CH_SPI, 0x40, -EIO, true },
-		{ CH_GPIO, OBMF_STATUS_TIMEOUT, -ETIMEDOUT, false },
+		{ CH_GPIO, OBMF_STATUS_TIMEOUT, -ETIME, false },
 		{ CH_GPIO, OBMF_STATUS_BUSY, -EBUSY, false },
 		{ CH_GPIO, OBMF_STATUS_SIZE_UNSUPPORTED, -EMSGSIZE, false },
 		{ CH_I2C, OBMF_STATUS_I2C_NACK, -ENXIO, false },
@@ -4812,7 +6472,7 @@ static void obmf_test_report_malformed(struct kunit *test)
 
 	s = (struct fake_step){ .channel = -1, .echo = false, .plen = 2 };
 	fake_push(f, &s);
-	KUNIT_EXPECT_EQ(test, er_req(chan(f, CH_SPI), 0), -EPROTO);
+	KUNIT_EXPECT_EQ(test, er_req(chan(f, CH_IPMI), 0), -EPROTO);
 	KUNIT_EXPECT_EQ(test, ev_cnt(core, OBMF_EV_BAD_RESPONSE), 2);
 	KUNIT_EXPECT_EQ(test, er_seen(x, OBMF_EV_BAD_RESPONSE), 1);
 
@@ -4971,7 +6631,7 @@ static void obmf_test_report_sites(struct kunit *test)
 static void obmf_test_report_rebind(struct kunit *test)
 {
 	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
-	struct er_ctx *x = er_start(test);
+	struct test_log *log = test_log_start(test, f->tp.dev);
 
 	fake_layout(f, core_chans, ARRAY_SIZE(core_chans));
 	f->stale_first = true;
@@ -4979,7 +6639,10 @@ static void obmf_test_report_rebind(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ch_cnt(f->core->ch0, OBMF_CH_PROTOCOL_ERRORS), 1);
 	KUNIT_EXPECT_EQ(test, ch_cnt(f->core->ch0, OBMF_CH_RX_LATE), 1);
 	KUNIT_EXPECT_EQ(test, er_total(f->core, OBMF_EV_NR), 0);
-	KUNIT_EXPECT_EQ(test, x->n, 0);
+	/* Discovery runs in the bind work: only the bound line is logged */
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, ": "), 1);
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "device 'obmf-test'"),
+			1);
 }
 
 /*
@@ -5016,8 +6679,14 @@ static void er_set_health(struct obmf_fake *f, int nr, u8 health)
  */
 static void obmf_test_report_health(struct kunit *test)
 {
+	static const char *const lines[] = {
+		"channel 2: health 15, error indicator 0",
+		"channel 3: health 1, error indicator 1",
+		"channel 4: health 3, error indicator 0",
+	};
 	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
-	struct er_ctx *x = er_start(test);
+	struct test_log *log = test_log_start(test, f->tp.dev);
+	unsigned int i;
 	u8 *h;
 
 	fake_layout(f, core_chans, ARRAY_SIZE(core_chans));
@@ -5037,17 +6706,11 @@ static void obmf_test_report_health(struct kunit *test)
 	KUNIT_EXPECT_NOT_NULL(test, f->core->chans[CH_SPI]);
 	KUNIT_EXPECT_EQ(test, ev_cnt(f->core, OBMF_EV_CH_HEALTH), 3);
 	KUNIT_EXPECT_EQ(test, er_total(f->core, OBMF_EV_CH_HEALTH), 0);
-	KUNIT_ASSERT_EQ(test, x->n, 3);
-	KUNIT_EXPECT_EQ(test, x->rec[0].ch, CH_GPIO);
-	KUNIT_EXPECT_EQ(test, x->rec[0].a, 15);
-	KUNIT_EXPECT_EQ(test, x->rec[0].b, 0);
-	KUNIT_EXPECT_NULL(test, x->rec[0].rs);
-	KUNIT_EXPECT_EQ(test, x->rec[1].ch, CH_IPMI);
-	KUNIT_EXPECT_EQ(test, x->rec[1].a, 1);
-	KUNIT_EXPECT_EQ(test, x->rec[1].b, 1);
-	KUNIT_EXPECT_EQ(test, x->rec[2].ch, CH_SPI);
-	KUNIT_EXPECT_EQ(test, x->rec[2].a, 3);
-	KUNIT_EXPECT_EQ(test, x->rec[2].b, 0);
+	/* Discovery runs in the bind work: its lines, not the case's stub */
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, ": health "), 3);
+	for (i = 0; i < ARRAY_SIZE(lines); i++)
+		KUNIT_EXPECT_EQ_MSG(test, test_log_lines(test, log, lines[i]),
+				    1, "%s", lines[i]);
 }
 
 static struct kunit_case obmf_report_cases[] = {
@@ -5061,6 +6724,7 @@ static struct kunit_case obmf_report_cases[] = {
 	KUNIT_CASE(obmf_test_report_rebind),
 	KUNIT_CASE(obmf_test_report_datagram),
 	KUNIT_CASE(obmf_test_report_health),
+	KUNIT_CASE(obmf_test_discover_unusable_many),
 	KUNIT_CASE(obmf_test_report_failed_op),
 	KUNIT_CASE(obmf_test_report_failed_unpublished),
 	KUNIT_CASE(obmf_test_report_fatal),
@@ -5664,6 +7328,183 @@ static void obmf_test_i2c_name(struct kunit *test)
 			   "0123456789abcdef0123456789abcdef_i2c");
 }
 
+/*
+ * The adapter's retries and timeout; a lost arbitration (status 0x41,
+ * -EAGAIN) is sent once and then once per retry
+ */
+static void i2c_tries_check(struct obmf_fake *f, int retries)
+{
+	struct kunit *test = f->test;
+	struct i2c_adapter *adap = i2c_adapter(f);
+	struct fake_step s = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.echo = true,
+		.status = OBMF_STATUS_I2C_ARB_LOST,
+	};
+	union i2c_smbus_data data;
+	int i, sends = fake_count(f, FAKE_SEND, CH_I2C, 0);
+
+	KUNIT_EXPECT_EQ(test, adap->retries, retries);
+	KUNIT_EXPECT_EQ(test, adap->timeout, (retries + 1) * HZ);
+	for (i = 0; i <= retries; i++)
+		fake_push(f, &s);
+	KUNIT_EXPECT_EQ(test, i2c_read_byte(adap, &data), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0),
+			sends + retries + 1);
+	/* i2c_del_adapter() waits for this reference */
+	kunit_release_action(test, test_put_device, &adap->dev);
+}
+
+/*
+ * The I2C core tries a transfer three more times after a lost
+ * arbitration, unless the device retries it itself: then once
+ */
+static void obmf_test_i2c_retries(struct kunit *test)
+{
+	struct obmf_fake *f = i2c_setup(test);
+	struct obmf_channel *ch = chan(f, CH_I2C);
+	struct device *dev = &ch->fdev->adev.dev;
+
+	i2c_tries_check(f, 3);
+	device_release_driver(dev);
+	KUNIT_ASSERT_NULL(test, dev->driver);
+	ch->info.quirks.i2c_dev_retries = true;
+	KUNIT_ASSERT_EQ(test, device_attach(dev), 1);
+	i2c_tries_check(f, 0);
+}
+
+/* A client's transfers from another thread while the adapter goes */
+struct i2c_ub {
+	struct work_struct work;
+	struct kunit *test;
+	struct i2c_adapter *adap;
+	int ret[2];
+	s64 ms[2];
+	struct completion done;
+};
+
+static void i2c_ub_work(struct work_struct *w)
+{
+	struct i2c_ub *x = container_of(w, struct i2c_ub, work);
+	union i2c_smbus_data data;
+	ktime_t start;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(x->ret); i++) {
+		start = ktime_get();
+		x->ret[i] = i2c_read_byte(x->adap, &data);
+		x->ms[i] = ktime_ms_delta(ktime_get(), start);
+	}
+	/* i2c_del_adapter() waits for this reference */
+	kunit_release_action(x->test, test_put_device, &x->adap->dev);
+	complete(&x->done);
+}
+
+/*
+ * The driver unbound while the device has stopped answering, a client's
+ * transfer waiting: it times out, and the client's next transfer is sent
+ * after the hold for the late reply and times out on its own wait, so the
+ * adapter goes after two bounded waits. The next binding's transfers are
+ * answered.
+ */
+static void obmf_test_i2c_unbind_silent(struct kunit *test)
+{
+	struct obmf_fake *f = i2c_setup(test);
+	struct obmf_channel *ch = chan(f, CH_I2C);
+	struct device *dev = &ch->fdev->adev.dev;
+	struct fake_step s = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.echo = true,
+		.plen = 4,
+		.payload = { 1, 0, 0, 0xa5 },
+	};
+	union i2c_smbus_data data = {};
+	struct i2c_ub *x;
+	unsigned int sends;
+
+	x = kunit_kzalloc(test, sizeof(*x), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, x);
+	x->test = test;
+	x->adap = i2c_adapter(f);
+	init_completion(&x->done);
+	INIT_WORK(&x->work, i2c_ub_work);
+	WRITE_ONCE(f->silent_ch, CH_I2C);
+	sends = f->sends;
+	queue_work(f->callwq, &x->work);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
+	device_release_driver(dev);
+	KUNIT_ASSERT_TRUE(test, test_wait(&x->done));
+	KUNIT_EXPECT_NULL(test, dev->driver);
+	KUNIT_EXPECT_EQ(test, x->ret[0], -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, x->ret[1], -ETIMEDOUT);
+	KUNIT_EXPECT_GT(test, x->ms[1], OBMF_DEFAULT_TIMEOUT_MS);
+	KUNIT_EXPECT_LT(test, x->ms[1], 2 * OBMF_DEFAULT_TIMEOUT_MS + 300);
+	KUNIT_EXPECT_EQ(test, f->sends, sends + 2);
+
+	WRITE_ONCE(f->silent_ch, 0);
+	KUNIT_ASSERT_EQ(test, device_attach(dev), 1);
+	fake_push(f, &s);
+	KUNIT_EXPECT_EQ(test, i2c_read_byte(i2c_adapter(f), &data), 0);
+	KUNIT_EXPECT_EQ(test, data.byte, 0xa5);
+}
+
+/*
+ * A transfer while the adapter is suspended is -ESHUTDOWN from the I2C
+ * core with nothing sent; after resume it goes out
+ */
+static void obmf_test_i2c_suspended(struct kunit *test)
+{
+	struct obmf_fake *f = i2c_setup(test);
+	struct i2c_adapter *adap = i2c_adapter(f);
+	struct device *dev = &chan(f, CH_I2C)->fdev->adev.dev;
+	const struct dev_pm_ops *pm = dev->driver->pm;
+	struct fake_step s = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.echo = true,
+		.plen = 4,
+		.payload = { 1, 0, 0, 0x5a },
+	};
+	union i2c_smbus_data data;
+
+	if (!pm || !pm->suspend)
+		kunit_skip(test, "no system sleep");
+	KUNIT_ASSERT_EQ(test, pm->suspend(dev), 0);
+	kunit_warning_suppress(test) {
+		KUNIT_EXPECT_EQ(test, i2c_read_byte(adap, &data), -ESHUTDOWN);
+		KUNIT_EXPECT_EQ(test, i2c_read_byte(adap, &data), -ESHUTDOWN);
+	}
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0), 0);
+	KUNIT_ASSERT_EQ(test, pm->resume(dev), 0);
+	fake_push(f, &s);
+	KUNIT_EXPECT_EQ(test, i2c_read_byte(adap, &data), 0);
+	KUNIT_EXPECT_EQ(test, data.byte, 0x5a);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0), 1);
+}
+
+/*
+ * A zero-length message, a write alone, a write before a read or a read,
+ * is refused by the I2C core (I2C_AQ_NO_ZERO_LEN) with nothing sent
+ */
+static void obmf_test_i2c_zero_len(struct kunit *test)
+{
+	struct obmf_fake *f = i2c_setup(test);
+	struct i2c_adapter *adap = i2c_adapter(f);
+	u8 r1[1] = {};
+	struct i2c_msg m[2] = {
+		{ .addr = I2C_ADDR, .len = 0, .buf = r1 },
+		{ .addr = I2C_ADDR, .flags = I2C_M_RD, .len = 1, .buf = r1 },
+	};
+
+	KUNIT_EXPECT_EQ(test, i2c_transfer(adap, m, 1), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, i2c_transfer(adap, m, 2), -EOPNOTSUPP);
+	m[1].len = 0;
+	KUNIT_EXPECT_EQ(test, i2c_transfer(adap, &m[1], 1), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, CH_I2C, 0), 0);
+}
+
 static struct kunit_case obmf_i2c_cases[] = {
 	KUNIT_CASE(obmf_test_i2c_pec),
 	KUNIT_CASE(obmf_test_i2c_flags),
@@ -5675,17 +7516,1197 @@ static struct kunit_case obmf_i2c_cases[] = {
 	KUNIT_CASE(obmf_test_i2c_xfer),
 	KUNIT_CASE(obmf_test_i2c_response),
 	KUNIT_CASE(obmf_test_i2c_name),
+	KUNIT_CASE(obmf_test_i2c_retries),
+	KUNIT_CASE_SLOW(obmf_test_i2c_unbind_silent),
+	KUNIT_CASE(obmf_test_i2c_suspended),
+	KUNIT_CASE(obmf_test_i2c_zero_len),
 	{}
 };
 
 static struct kunit_suite obmf_i2c_suite = {
 	.name = "obmf-i2c",
+	.suite_init = obmf_test_fn_suite_init,
+	.suite_exit = obmf_test_fn_suite_exit,
 	.test_cases = obmf_i2c_cases,
 };
 
 kunit_test_suite(obmf_i2c_suite);
 
 #endif /* IS_BUILTIN(CONFIG_I2C_OBMF) */
+
+/* The SPI controller driver; only when built in */
+#if IS_BUILTIN(CONFIG_SPI_OBMF)
+
+#define SPI_CH 1
+
+/* Table 84 flags: read and write words of 16 bits */
+#define SPI_CFG_BPW16 (16 << 18 | 16 << 24)
+
+/* The channels at most after the SPI one, of a type no driver takes */
+#define SPI_EXTRA 6
+
+/*
+ * Channel 1: an SPI controller channel with request limit @limit and
+ * response limit @rlimit, @devices chip selects and @flags, at @rd and
+ * @wr Hz, then @extra IPMI channels. Bound; the driver's probe result is
+ * the case's to check.
+ */
+static struct obmf_fake *spi_fake_n(struct kunit *test,
+				    const struct software_node *node, u16 limit,
+				    u16 rlimit, u32 flags, u8 devices, u32 rd,
+				    u32 wr, int extra)
+{
+	struct test_chan c[1 + SPI_EXTRA] = {
+		{ OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, "spi", limit, 0, 20 },
+	};
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	struct fake_step s = {
+		.how = FAKE_INLINE,
+		.channel = -1,
+		.echo = true,
+		.spi_read = true,
+	};
+	u8 *h;
+	int i;
+
+	KUNIT_ASSERT_LE(test, extra, SPI_EXTRA);
+	for (i = 1; i <= extra; i++)
+		c[i] = (struct test_chan){ OBMF_TYPE_IPMI, OBMF_ROLE_PRODUCER,
+					   "ipmi", 516 };
+	if (node)
+		KUNIT_ASSERT_EQ(test,
+				kunit_device_add_software_node(test, f->tp.dev,
+							       node),
+				0);
+	fake_layout(f, c, 1 + extra);
+	h = f->mem + fake_ch_off(f, SPI_CH);
+	fake_spi_cfg(h + FAKE_CH_HDR_LEN, flags, devices, rd);
+	put_unaligned_le32(wr, h + FAKE_CH_HDR_LEN + 16);
+	put_unaligned_le16(rlimit, h + 0x19);
+	f->dflt = s;
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	return f;
+}
+
+static struct obmf_fake *spi_fake_lim(struct kunit *test,
+				      const struct software_node *node,
+				      u16 limit, u16 rlimit, u32 flags,
+				      u8 devices, u32 rd, u32 wr)
+{
+	return spi_fake_n(test, node, limit, rlimit, flags, devices, rd, wr, 0);
+}
+
+static struct obmf_fake *spi_fake(struct kunit *test, u16 limit, u32 flags,
+				  u8 devices, u32 rd, u32 wr)
+{
+	return spi_fake_lim(test, NULL, limit, limit, flags, devices, rd, wr);
+}
+
+/* The controller spi-obmf registered on channel 1, or NULL */
+static struct spi_controller *spi_ctlr(struct obmf_fake *f)
+{
+	struct kunit *test = f->test;
+	struct obmf_channel *ch = chan(f, SPI_CH);
+	struct device *dev;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, ch->fdev);
+	dev = device_find_any_child(&ch->fdev->adev.dev);
+	if (!dev)
+		return NULL;
+	ret = kunit_add_action_or_reset(test, test_put_device, dev);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	return container_of(dev, struct spi_controller, dev);
+}
+
+static void spi_dev_remove(void *data)
+{
+	struct spi_device *spi = data;
+
+	if (device_is_registered(&spi->dev))
+		spi_unregister_device(spi);
+	spi_dev_put(spi);
+}
+
+/*
+ * A client on @cs, added as a board's description adds it; NULL if
+ * refused. spi_new_device() marks the other chip select slots unused,
+ * which some kernels need to add a client at all.
+ */
+static struct spi_device *spi_client(struct obmf_fake *f, u8 cs, u32 mode,
+				     u32 hz)
+{
+	struct spi_board_info info = {
+		.modalias = "obmf-kunit-spi",
+		.max_speed_hz = hz,
+		.chip_select = cs,
+		.mode = mode,
+	};
+	struct kunit *test = f->test;
+	struct spi_controller *ctlr = spi_ctlr(f);
+	struct spi_device *spi;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctlr);
+	spi = spi_new_device(ctlr, &info);
+	if (!spi)
+		return NULL;
+	spi_dev_get(spi);
+	ret = kunit_add_action_or_reset(test, spi_dev_remove, spi);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	return spi;
+}
+
+/* Request @n on channel 1 since @from: command byte, sizes, data */
+static const u8 *spi_sent(struct obmf_fake *f, unsigned int from, int n,
+			  size_t *len)
+{
+	int i = from - 1;
+
+	while (n-- >= 0) {
+		i = fake_find(f, i + 1, FAKE_SEND, SPI_CH, 0);
+		KUNIT_ASSERT_GE(f->test, i, 0);
+	}
+	*len = f->log[i].len - OBMF_HDR_LEN;
+	return f->log[i].msg + OBMF_HDR_LEN;
+}
+
+/*
+ * Configurations the driver cannot serve leave the channel without a
+ * controller, and nothing registered; 4 devices at 20 Hz (one byte a
+ * transfer) and limits one byte above the heads are served
+ */
+static void obmf_test_spi_probe(struct kunit *test)
+{
+	static const struct {
+		const char *what;
+		u16 limit;
+		u32 flags;
+		u8 devices;
+		u32 rd;
+		u32 wr;
+		bool ok;
+	} c[] = {
+		{ "0 devices", 516, 0, 0, 1000000, 1000000 },
+		{ "5 devices", 516, 0, 5, 1000000, 1000000 },
+		{ "no read clock", 516, 0, 1, 0, 1000000 },
+		{ "no write clock", 516, 0, 1, 1000000, 0 },
+		{ "19 Hz", 516, 0, 1, 19, 1000000 },
+		{ "NO_CS", 516, SPI_NO_CS, 1, 1000000, 1000000 },
+		{ "READY", 516, SPI_READY, 1, 1000000, 1000000 },
+		{ "CS_WORD", 516, SPI_CS_WORD, 1, 1000000, 1000000 },
+		{ "TX_QUAD", 516, SPI_TX_QUAD, 1, 1000000, 1000000 },
+		{ "RX_OCTAL", 516, SPI_RX_OCTAL, 1, 1000000, 1000000 },
+		{ "16-bit words", 516, SPI_CFG_BPW16, 1, 1000000, 1000000 },
+		{ "limits 5", 9, 0, 1, 1000000, 1000000 },
+		{ "4 devices, 20 Hz", 516, 0, 4, 20, 20, true },
+		{ "limits 6, mode 3", 10, SPI_MODE_3, 1, 1000000, 1000000,
+		  true },
+		{ "8-bit words", 516, 8 << 18 | 8 << 24, 1, 1000000, 1000000,
+		  true },
+	};
+	struct spi_controller *ctlr;
+	struct device_driver *drv;
+	struct obmf_fake *f;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(c); i++) {
+		f = spi_fake(test, c[i].limit, c[i].flags, c[i].devices,
+			     c[i].rd, c[i].wr);
+		ctlr = spi_ctlr(f);
+		KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, SPI_CH, -1), 0);
+		if (!c[i].ok) {
+			KUNIT_EXPECT_NULL_MSG(test, ctlr, "%s", c[i].what);
+			drv = chan(f, SPI_CH)->fdev->adev.dev.driver;
+			KUNIT_EXPECT_NULL_MSG(test, drv, "%s", c[i].what);
+			continue;
+		}
+		KUNIT_ASSERT_NOT_NULL_MSG(test, ctlr, "%s", c[i].what);
+		KUNIT_EXPECT_EQ(test, ctlr->num_chipselect, c[i].devices);
+		KUNIT_EXPECT_EQ(test, ctlr->max_speed_hz, c[i].rd);
+		KUNIT_EXPECT_EQ(test, ctlr->min_speed_hz, c[i].rd);
+		KUNIT_EXPECT_EQ(test, ctlr->mode_bits, c[i].flags & SPI_MODE_3);
+		KUNIT_EXPECT_EQ(test, ctlr->bits_per_word_mask,
+				SPI_BPW_MASK(8));
+	}
+}
+
+/*
+ * A client must use the channel's mode on the wire and its clock; the
+ * SPI core passes CS_WORD, NO_TX and NO_RX and drops a quad mode. The
+ * same refusals reach a bound client that calls spi_setup() again,
+ * which returns their errno, and so do chip select setup and hold times.
+ * User space can ask for another mode or clock at will, so the driver
+ * logs those two at debug level only.
+ */
+static void obmf_test_spi_setup(struct kunit *test)
+{
+	struct obmf_fake *f =
+		spi_fake(test, 516, SPI_MODE_3, 2, 2000000, 1000000);
+	struct test_log *log;
+	struct spi_device *spi;
+	u32 mode;
+
+	/* skips without printk before the case acts; the client's comes later */
+	log = test_log_start(test, &chan(f, SPI_CH)->fdev->adev.dev);
+	KUNIT_EXPECT_NULL(test, spi_client(f, 0, SPI_MODE_0, 0));
+	KUNIT_EXPECT_NULL(test, spi_client(f, 0, SPI_MODE_3 | SPI_CS_HIGH, 0));
+	KUNIT_EXPECT_NULL(test, spi_client(f, 0, SPI_MODE_3 | SPI_NO_CS, 0));
+	/* rated below the higher of the two clocks */
+	KUNIT_EXPECT_NULL(test, spi_client(f, 0, SPI_MODE_3, 1999999));
+
+	spi = spi_client(f, 0, SPI_MODE_3 | SPI_CS_WORD | SPI_NO_TX, 0);
+	KUNIT_EXPECT_NOT_NULL(test, spi);
+	if (spi)
+		KUNIT_EXPECT_EQ(test, spi->max_speed_hz, 2000000);
+	spi = spi_client(f, 1, SPI_MODE_3 | SPI_TX_QUAD | SPI_NO_RX, 4000000);
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	KUNIT_EXPECT_EQ(test, spi->mode & SPI_TX_QUAD, 0);
+	KUNIT_EXPECT_EQ(test, spi->max_speed_hz, 2000000);
+
+	mode = spi->mode;
+	log = test_log_start(test, &spi->dev);
+	spi->mode = SPI_MODE_0;
+	KUNIT_EXPECT_EQ(test, spi_setup(spi), -EINVAL);
+	spi->mode = mode | SPI_CS_HIGH;
+	KUNIT_EXPECT_EQ(test, spi_setup(spi), -EINVAL);
+	spi->mode = mode | SPI_NO_CS;
+	KUNIT_EXPECT_EQ(test, spi_setup(spi), -EINVAL);
+	spi->mode = mode;
+	spi->max_speed_hz = 1999999;
+	KUNIT_EXPECT_EQ(test, spi_setup(spi), -EINVAL);
+	spi->max_speed_hz = 2000000;
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "channel runs"), 0);
+	/* the device times its chip select; a client cannot ask for more */
+	spi->cs_setup.value = 10;
+	spi->cs_setup.unit = SPI_DELAY_UNIT_NSECS;
+	KUNIT_EXPECT_EQ(test, spi_setup(spi), -EINVAL);
+	spi->cs_setup.value = 0;
+	spi->cs_hold.value = 1;
+	spi->cs_hold.unit = SPI_DELAY_UNIT_USECS;
+	KUNIT_EXPECT_EQ(test, spi_setup(spi), -EINVAL);
+	spi->cs_hold.value = 0;
+	KUNIT_EXPECT_EQ(test, spi_setup(spi), 0);
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "hold times"), 2);
+	KUNIT_EXPECT_EQ(test, fake_count(f, FAKE_SEND, SPI_CH, -1), 0);
+}
+
+/* Request @n since log index @mark is @want */
+#define SPI_EXPECT_SENT(f, mark, n, ...)                                 \
+	do {                                                             \
+		static const u8 _w[] = { __VA_ARGS__ };                  \
+		struct obmf_fake *_f = (f);                              \
+		int _n = (n);                                            \
+		size_t _len;                                             \
+		const u8 *_p = spi_sent(_f, mark, _n, &_len);            \
+		KUNIT_EXPECT_EQ_MSG(_f->test, _len, sizeof(_w),          \
+				    "request %d", _n);                   \
+		KUNIT_EXPECT_MEMEQ_MSG(_f->test, _p, _w,                 \
+				       min(_len, sizeof(_w)),            \
+				       "request %d", _n);                \
+	} while (0)
+
+static int spi_sends(struct obmf_fake *f)
+{
+	return fake_count(f, FAKE_SEND, SPI_CH, -1);
+}
+
+/*
+ * Each transfer is one request with its bytes; a message is one chip
+ * select window on the client's chip select: the first request asserts,
+ * the last releases, a cs_change in between releases and the next
+ * asserts again, and the last transfer's cs_change is ignored
+ */
+static void obmf_test_spi_xfer(struct kunit *test)
+{
+	struct obmf_fake *f = spi_fake(test, 516, 0, 2, 1000000, 1000000);
+	struct spi_device *spi = spi_client(f, 1, 0, 0);
+	u8 tx[4] = { 0x9f, 1, 2, 3 }, rx[4], want[4];
+	struct spi_transfer t[3] = {};
+	unsigned int mark;
+	int i, n;
+
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	for (i = 0; i < ARRAY_SIZE(want); i++)
+		want[i] = i ^ 0x5a;
+
+	t[0].tx_buf = tx;
+	t[0].rx_buf = rx;
+	t[0].len = 4;
+	mark = f->nlog;
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, t, 1), 0);
+	SPI_EXPECT_SENT(f, mark, 0, 0x73, 4, 0, 4, 0, 0x9f, 1, 2, 3);
+	KUNIT_EXPECT_MEMEQ(test, rx, want, 4);
+
+	memset(t, 0, sizeof(t));
+	t[0].tx_buf = tx;
+	t[0].len = 1;
+	t[1].rx_buf = rx;
+	t[1].len = 3;
+	t[2].tx_buf = tx + 1;
+	t[2].len = 2;
+	memset(rx, 0, sizeof(rx));
+	mark = f->nlog;
+	n = spi_sends(f);
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, t, 3), 0);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 3);
+	SPI_EXPECT_SENT(f, mark, 0, 0x62, 1, 0, 0, 0, 0x9f);
+	SPI_EXPECT_SENT(f, mark, 1, 0x41, 0, 0, 3, 0);
+	SPI_EXPECT_SENT(f, mark, 2, 0x52, 2, 0, 0, 0, 1, 2);
+	KUNIT_EXPECT_MEMEQ(test, rx, want, 3);
+
+	t[1].cs_change = 1;
+	t[2].cs_change = 1;
+	mark = f->nlog;
+	n = spi_sends(f);
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, t, 3), 0);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 3);
+	SPI_EXPECT_SENT(f, mark, 0, 0x62, 1, 0, 0, 0, 0x9f);
+	SPI_EXPECT_SENT(f, mark, 1, 0x51, 0, 0, 3, 0);
+	SPI_EXPECT_SENT(f, mark, 2, 0x72, 2, 0, 0, 0, 1, 2);
+
+	/* the next message asserts afresh */
+	mark = f->nlog;
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, t, 1), 0);
+	SPI_EXPECT_SENT(f, mark, 0, 0x72, 1, 0, 0, 0, 0x9f);
+}
+
+/*
+ * Messages whose chip select moves or delays the channel cannot follow
+ * are -EINVAL with nothing sent, and no line logged (user space can send
+ * them at will); a transfer without data in the middle, with only a
+ * delay, is kept
+ */
+static void obmf_test_spi_refused(struct kunit *test)
+{
+	static const char *const what[] = {
+		"cs_off",
+		"word delay",
+		"delay on the last",
+		"delay on cs_change",
+		"first without data",
+		"last without data",
+		"cs_change without data",
+		"delay after cs_change",
+	};
+	struct obmf_fake *f = spi_fake(test, 516, 0, 1, 1000000, 1000000);
+	struct spi_device *spi = spi_client(f, 0, 0, 0);
+	struct spi_transfer t[3];
+	struct test_log *log;
+	u8 buf[1] = { 0x05 };
+	int i, n;
+
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	log = test_log_start(test, &spi->dev);
+	for (i = 0; i <= ARRAY_SIZE(what); i++) {
+		memset(t, 0, sizeof(t));
+		for (n = 0; n < 3; n++) {
+			t[n].tx_buf = buf;
+			t[n].len = 1;
+		}
+		switch (i) {
+		case 0:
+			t[1].cs_off = 1;
+			break;
+		case 1:
+			t[0].word_delay.value = 1;
+			break;
+		case 2:
+			t[2].delay.value = 1;
+			break;
+		case 3:
+			t[1].cs_change = 1;
+			t[1].delay.value = 1;
+			break;
+		case 4:
+			t[0].tx_buf = NULL;
+			t[0].len = 0;
+			break;
+		case 5:
+			t[2].tx_buf = NULL;
+			break;
+		case 6:
+			t[1].tx_buf = NULL;
+			t[1].len = 0;
+			t[1].cs_change = 1;
+			break;
+		case 7:
+			t[0].cs_change = 1;
+			t[1].tx_buf = NULL;
+			t[1].len = 0;
+			t[1].delay.value = 1;
+			break;
+		default:
+			t[1].tx_buf = NULL;
+			t[1].len = 0;
+			t[1].delay.value = 1;
+		}
+		n = spi_sends(f);
+		if (i < ARRAY_SIZE(what)) {
+			KUNIT_EXPECT_EQ_MSG(test, spi_sync_transfer(spi, t, 3),
+					    -EINVAL, "%s", what[i]);
+			KUNIT_EXPECT_EQ_MSG(test, spi_sends(f), n, "%s",
+					    what[i]);
+		} else {
+			KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, t, 3), 0);
+			KUNIT_EXPECT_EQ(test, spi_sends(f), n + 2);
+		}
+	}
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "refused"), 0);
+}
+
+/*
+ * A transfer is at most the request limit less 5, the response limit
+ * less 3 (here 37, the lower: the limits count the header) and 1/20 of
+ * the clock in bytes; the SPI core cuts a longer one with the chip
+ * select held
+ */
+static void obmf_test_spi_limits(struct kunit *test)
+{
+	struct obmf_fake *f =
+		spi_fake_lim(test, NULL, 64, 44, 0, 1, 1000000, 1000000);
+	struct spi_device *spi = spi_client(f, 0, 0, 0);
+	struct spi_transfer t = {};
+	unsigned int mark;
+	size_t len;
+	u8 *buf;
+	int n;
+
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	buf = kunit_kzalloc(test, 64, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_EXPECT_EQ(test, spi_max_transfer_size(spi), 37);
+
+	t.tx_buf = buf;
+	t.len = 37;
+	n = spi_sends(f);
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, &t, 1), 0);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 1);
+	t.len = 38;
+	mark = f->nlog;
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, &t, 1), 0);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 3);
+	KUNIT_EXPECT_EQ(test, spi_sent(f, mark, 0, &len)[0], 0x22);
+	KUNIT_EXPECT_EQ(test, spi_sent(f, mark, 1, &len)[0], 0x12);
+
+	t.tx_buf = NULL;
+	t.rx_buf = buf;
+	t.len = 38;
+	mark = f->nlog;
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, &t, 1), 0);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 5);
+	SPI_EXPECT_SENT(f, mark, 0, 0x21, 0, 0, 37, 0);
+	SPI_EXPECT_SENT(f, mark, 1, 0x11, 0, 0, 1, 0);
+	KUNIT_EXPECT_EQ(test, buf[36], 36 ^ 0x5a);
+	KUNIT_EXPECT_EQ(test, buf[37], 0x5a);
+
+	/* 200 Hz: 10 bytes a transfer */
+	f = spi_fake(test, 516, 0, 1, 200, 400);
+	spi = spi_client(f, 0, 0, 0);
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	KUNIT_EXPECT_EQ(test, spi_max_transfer_size(spi), 10);
+	t.tx_buf = buf;
+	t.rx_buf = NULL;
+	t.len = 25;
+	t.speed_hz = 0;
+	mark = f->nlog;
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, &t, 1), 0);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), 3);
+	KUNIT_EXPECT_EQ(test, spi_sent(f, mark, 2, &len)[1], 5);
+}
+
+/*
+ * A failed transfer ends the message with its errno; then one write
+ * without data releases the chip select, and the failed command is not
+ * sent again. A reply of the wrong size is -EPROTO, counted.
+ */
+static void obmf_test_spi_errors(struct kunit *test)
+{
+	static const struct {
+		u8 status;
+		int err;
+	} st[] = {
+		{ OBMF_STATUS_INVALID, -EIO },
+		{ OBMF_STATUS_TIMEOUT, -ETIMEDOUT },
+		{ OBMF_STATUS_BUSY, -EBUSY },
+		{ OBMF_STATUS_PERMANENT_ERROR, -EIO },
+		{ OBMF_STATUS_UNKNOWN_CHANNEL, -EIO },
+		{ OBMF_STATUS_SIZE_UNSUPPORTED, -EMSGSIZE },
+		{ 0x40, -EIO },
+		{ 0x7f, -EIO },
+	};
+	struct obmf_fake *f = spi_fake(test, 516, 0, 2, 1000000, 1000000);
+	struct spi_device *spi = spi_client(f, 1, 0, 0);
+	struct fake_step s = { .how = FAKE_INLINE,
+			       .channel = -1,
+			       .echo = true };
+	u8 buf[2] = { 0x03, 0x00 };
+	struct spi_transfer t[2] = {
+		{ .tx_buf = buf, .len = 2 },
+		{ .rx_buf = buf, .len = 2 },
+	};
+	unsigned int mark;
+	int i, n;
+
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	for (i = 0; i < ARRAY_SIZE(st); i++) {
+		s.status = st[i].status;
+		fake_push(f, &s);
+		mark = f->nlog;
+		n = spi_sends(f);
+		KUNIT_EXPECT_EQ_MSG(test, spi_sync_transfer(spi, t, 2),
+				    st[i].err, "status %#x", st[i].status);
+		KUNIT_EXPECT_EQ_MSG(test, spi_sends(f), n + 2, "status %#x",
+				    st[i].status);
+		SPI_EXPECT_SENT(f, mark, 1, 0x52, 0, 0, 0, 0);
+	}
+
+	/* a write answered with a read size */
+	s.status = 0;
+	s.plen = 2;
+	s.payload[0] = 2;
+	fake_push(f, &s);
+	mark = f->nlog;
+	n = spi_sends(f);
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, t, 2), -EPROTO);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 2);
+	SPI_EXPECT_SENT(f, mark, 1, 0x52, 0, 0, 0, 0);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, SPI_CH), OBMF_CH_PROTOCOL_ERRORS),
+			1);
+
+	/* a read answered short, and one whose size is not the read's */
+	s.plen = 3;
+	s.payload[0] = 2;
+	fake_push(f, &s);
+	n = spi_sends(f);
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, &t[1], 1), -EPROTO);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 2);
+	s.plen = 4;
+	s.payload[0] = 1;
+	fake_push(f, &s);
+	n = spi_sends(f);
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, &t[1], 1), -EPROTO);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 2);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, SPI_CH), OBMF_CH_PROTOCOL_ERRORS),
+			3);
+
+	/* a failed release is logged; the next message asserts again */
+	s.status = OBMF_STATUS_INVALID;
+	s.plen = 0;
+	fake_push(f, &s);
+	fake_push(f, &s);
+	n = spi_sends(f);
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, t, 2), -EIO);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 2);
+	mark = f->nlog;
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, t, 2), 0);
+	SPI_EXPECT_SENT(f, mark, 0, 0x62, 2, 0, 0, 0, 0x03, 0x00);
+}
+
+/*
+ * No answer: -ETIMEDOUT, and the release goes out after the core's hold
+ * for the late answer
+ */
+static void obmf_test_spi_timeout(struct kunit *test)
+{
+	struct obmf_fake *f = spi_fake(test, 516, 0, 1, 1000000, 1000000);
+	struct spi_device *spi = spi_client(f, 0, 0, 0);
+	struct fake_step s = { .how = FAKE_NEVER, .channel = -1 };
+	u8 buf[1] = { 0x05 };
+	struct spi_transfer t = { .tx_buf = buf, .rx_buf = buf, .len = 1 };
+	unsigned int mark;
+	int n;
+
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	fake_push(f, &s);
+	mark = f->nlog;
+	n = spi_sends(f);
+	KUNIT_EXPECT_EQ(test, spi_sync_transfer(spi, &t, 1), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 2);
+	SPI_EXPECT_SENT(f, mark, 0, 0x33, 1, 0, 1, 0, 0x05);
+	SPI_EXPECT_SENT(f, mark, 1, 0x12, 0, 0, 0, 0);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, SPI_CH), OBMF_CH_TIMEOUTS), 1);
+}
+
+static int spi_one(struct spi_device *spi)
+{
+	u8 buf[1] = { 0x05 };
+	struct spi_transfer t = { .tx_buf = buf, .len = 1 };
+
+	return spi_sync_transfer(spi, &t, 1);
+}
+
+/*
+ * Unbinding the driver from the channel, with a client and the device
+ * answering, removes the client and sends nothing; bound again, the
+ * channel serves a new client
+ */
+static void obmf_test_spi_unbind(struct kunit *test)
+{
+	struct obmf_fake *f = spi_fake(test, 516, 0, 1, 1000000, 1000000);
+	struct spi_device *spi = spi_client(f, 0, 0, 0);
+	struct device *dev = &chan(f, SPI_CH)->fdev->adev.dev;
+	int n;
+
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	KUNIT_EXPECT_EQ(test, spi_one(spi), 0);
+	n = spi_sends(f);
+	device_release_driver(dev);
+	KUNIT_EXPECT_FALSE(test, device_is_registered(&spi->dev));
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n);
+	KUNIT_ASSERT_EQ(test, device_attach(dev), 1);
+	spi = spi_client(f, 0, 0, 0);
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	KUNIT_EXPECT_EQ(test, spi_one(spi), 0);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 1);
+}
+
+struct spi_queued {
+	struct spi_message m;
+	struct spi_transfer t;
+	u8 buf[1];
+	struct completion done;
+};
+
+static void spi_queued_done(void *data)
+{
+	complete(data);
+}
+
+/*
+ * Unbinding the driver while the device has stopped answering, with two
+ * messages an in-kernel client queued: the one waiting for its answer
+ * ends -ETIMEDOUT at its timeout, the release after it is sent after the
+ * hold and fails on its own wait, with one line, and the next message,
+ * whose client has gone, ends -ESHUTDOWN at once; the unbind ends inside
+ * the SPI core's 5 s wait for an idle queue
+ */
+static void spi_unbind_silent(struct kunit *test, struct obmf_fake *f)
+{
+	static const int want[2] = { -ETIMEDOUT, -ESHUTDOWN };
+	struct spi_device *spi = spi_client(f, 0, 0, 0);
+	struct spi_controller *ctlr = spi_ctlr(f);
+	struct device *dev = &chan(f, SPI_CH)->fdev->adev.dev;
+	struct fake_step s = { .how = FAKE_NEVER, .channel = -1 };
+	unsigned int mark = f->nlog;
+	struct test_log *log;
+	struct spi_queued *q;
+	ktime_t start;
+	s64 ms;
+	int i, n;
+
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	log = test_log_start(test, &spi->dev);
+	test_log_also(log, &ctlr->dev);
+	/*
+	 * Not freed by KUnit: a case that stops while the SPI core still
+	 * holds a message leaks it rather than freeing it under the core
+	 */
+	q = kzalloc_objs(*q, 2, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	for (i = 0; i < 4; i++)
+		fake_push(f, &s);
+	n = spi_sends(f);
+	for (i = 0; i < 2; i++) {
+		q[i].t.tx_buf = q[i].buf;
+		q[i].t.len = 1;
+		init_completion(&q[i].done);
+		spi_message_init_with_transfers(&q[i].m, &q[i].t, 1);
+		q[i].m.complete = spi_queued_done;
+		q[i].m.context = &q[i].done;
+		KUNIT_ASSERT_EQ(test, spi_async(spi, &q[i].m), 0);
+	}
+	/* the first request is out, waiting for its answer */
+	for (i = 0; i < 50 && spi_sends(f) == n; i++)
+		msleep(20);
+	KUNIT_ASSERT_EQ(test, spi_sends(f), n + 1);
+
+	start = ktime_get();
+	device_release_driver(dev);
+	ms = ktime_ms_delta(ktime_get(), start);
+	KUNIT_EXPECT_LT(test, ms, 4500);
+	for (i = 0; i < 2; i++) {
+		KUNIT_EXPECT_TRUE(test, completion_done(&q[i].done));
+		/* the messages' memory must outlive a failed check */
+		if (!wait_for_completion_timeout(&q[i].done, 10 * HZ))
+			KUNIT_FAIL_AND_ABORT(test, "message %d never ended", i);
+		KUNIT_EXPECT_EQ(test, q[i].m.status, want[i]);
+	}
+	kfree(q);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 2);
+	SPI_EXPECT_SENT(f, mark, 1, 0x12, 0, 0, 0, 0);
+	KUNIT_EXPECT_FALSE(test, device_is_registered(&spi->dev));
+	KUNIT_EXPECT_EQ(test, test_log_wait(test, log, "not released", 1, 1000),
+			1);
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "destroying queue"), 0);
+}
+
+static void obmf_test_spi_unbind_silent(struct kunit *test)
+{
+	spi_unbind_silent(test, spi_fake(test, 516, 0, 1, 1000000, 1000000));
+}
+
+/*
+ * The same with a device that takes no data: every send takes its whole
+ * timeout and fails, the SPI channel's too, while @n other channels send
+ * requests that wait @wait_ms in a loop. The two messages end as above,
+ * within the same bound, however long the other channels' sends take.
+ */
+static void spi_unbind_busy(struct kunit *test, int n, unsigned int wait_ms)
+{
+	static const int chs[SPI_EXTRA] = { 2, 3, 4, 5, 6, 7 };
+	struct obmf_fake *f;
+	struct test_busy *b;
+
+	f = spi_fake_n(test, NULL, 516, 516, 0, 1, 1000000, 1000000, n);
+	WRITE_ONCE(f->send_sleep_ret, -ETIMEDOUT);
+	WRITE_ONCE(f->send_sleep_ms, OBMF_MAX_TIMEOUT_MS);
+	b = test_busy_start(f, chs, n, wait_ms);
+	spi_unbind_silent(test, f);
+	test_busy_end(f, b, n);
+	WRITE_ONCE(f->send_sleep_ms, 0);
+	WRITE_ONCE(f->send_sleep_ret, 0);
+}
+
+/* Five other channels at the default wait */
+static void obmf_test_spi_unbind_busy(struct kunit *test)
+{
+	spi_unbind_busy(test, 5, 0);
+}
+
+/* One other channel at the longest wait, as a serial port after timeouts */
+static void obmf_test_spi_unbind_long_send(struct kunit *test)
+{
+	spi_unbind_busy(test, 1, OBMF_MAX_TIMEOUT_MS);
+}
+
+#define SPI_SLOW_N 8
+
+/* A message of up to SPI_SLOW_N one-byte writes */
+struct spi_slow_msg {
+	struct spi_message m;
+	struct spi_transfer t[SPI_SLOW_N];
+	u8 buf[SPI_SLOW_N];
+	struct completion done;
+};
+
+/* Every answer from an hrtimer, 100 ms inside the request's wait */
+static void spi_slow(struct obmf_fake *f, bool slow)
+{
+	guard(spinlock_irqsave)
+		(&f->lock);
+	f->dflt.how = slow ? FAKE_TIMER : FAKE_INLINE;
+	f->dflt.delay_ms = slow ? OBMF_DEFAULT_TIMEOUT_MS - 100 : 0;
+}
+
+/*
+ * @nmsg messages of @nxfer transfers queued on @spi. Not freed by KUnit:
+ * a case that stops while the SPI core still holds a message leaks it
+ * rather than freeing it under the core.
+ */
+static struct spi_slow_msg *
+spi_slow_queue(struct kunit *test, struct spi_device *spi, int nmsg, int nxfer)
+{
+	struct spi_slow_msg *q = kzalloc_objs(*q, nmsg, GFP_KERNEL);
+	int i, j;
+
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	for (i = 0; i < nmsg; i++) {
+		for (j = 0; j < nxfer; j++) {
+			q[i].buf[j] = j;
+			q[i].t[j].tx_buf = &q[i].buf[j];
+			q[i].t[j].len = 1;
+		}
+		init_completion(&q[i].done);
+		spi_message_init_with_transfers(&q[i].m, q[i].t, nxfer);
+		q[i].m.complete = spi_queued_done;
+		q[i].m.context = &q[i].done;
+		KUNIT_ASSERT_EQ(test, spi_async(spi, &q[i].m), 0);
+	}
+	return q;
+}
+
+/* Every message ended; a case aborts, leaking them, if one never does */
+static void spi_slow_wait(struct kunit *test, struct spi_slow_msg *q, int nmsg)
+{
+	int i;
+
+	for (i = 0; i < nmsg; i++)
+		if (!wait_for_completion_timeout(&q[i].done, 10 * HZ))
+			KUNIT_FAIL_AND_ABORT(test, "message %d never ended", i);
+}
+
+/* Waits for the first request of the channel after @n */
+static void spi_wait_out(struct obmf_fake *f, int n)
+{
+	int i;
+
+	for (i = 0; i < 50 && spi_sends(f) == n; i++)
+		msleep(20);
+	KUNIT_ASSERT_EQ(f->test, spi_sends(f), n + 1);
+}
+
+/*
+ * Unbinding with a device that answers each request just inside its
+ * wait and @nmsg messages of @nxfer transfers an in-kernel client queued,
+ * the first request out: once the SPI core has removed the client, what
+ * is left fails at once without being sent, so the queue drains well
+ * inside the core's wait, with no timeout and no core line. @iface
+ * unbinds the interface with the device present instead of the driver.
+ * The messages are checked by the caller.
+ */
+static struct spi_slow_msg *spi_unbind_slow(struct kunit *test,
+					    struct obmf_fake *f, bool iface,
+					    int nmsg, int nxfer, int *sends)
+{
+	struct spi_device *spi = spi_client(f, 0, 0, 0);
+	struct spi_controller *ctlr = spi_ctlr(f);
+	struct obmf_channel *ch = chan(f, SPI_CH);
+	struct device *dev = &ch->fdev->adev.dev;
+	long timeouts = ch_cnt(ch, OBMF_CH_TIMEOUTS);
+	struct spi_slow_msg *q;
+	struct test_log *log;
+	ktime_t start;
+	int n, failed;
+	s64 ms;
+
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	log = test_log_start(test, iface ? f->tp.dev : &spi->dev);
+	test_log_also(log, &ctlr->dev);
+	n = spi_sends(f);
+	spi_slow(f, true);
+	q = spi_slow_queue(test, spi, nmsg, nxfer);
+	spi_wait_out(f, n);
+
+	start = ktime_get();
+	if (iface)
+		fake_unbind(f);
+	else
+		device_release_driver(dev);
+	ms = ktime_ms_delta(ktime_get(), start);
+	KUNIT_EXPECT_LT(test, ms, 2500);
+	KUNIT_EXPECT_TRUE(test, completion_done(&q[nmsg - 1].done));
+	spi_slow_wait(test, q, nmsg);
+	KUNIT_EXPECT_FALSE(test, device_is_registered(&spi->dev));
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "destroying queue"), 0);
+	if (iface) {
+		KUNIT_EXPECT_EQ(test,
+				test_log_lines(test, log, "device stopped"), 0);
+	} else {
+		KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_TIMEOUTS), timeouts);
+		KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "not released"),
+				0);
+		/* the SPI core's line for each message that failed */
+		failed = test_log_lines(test, log, "SPI transfer failed");
+		KUNIT_EXPECT_EQ(test, failed, nmsg == 1 ? 1 : nmsg - 1);
+	}
+	*sends = spi_sends(f) - n;
+	return q;
+}
+
+/* Eight messages of one transfer: the first answered, seven -ESHUTDOWN */
+static void spi_unbind_slow_msgs(struct kunit *test, bool iface)
+{
+	struct obmf_fake *f = spi_fake(test, 516, 0, 1, 1000000, 1000000);
+	struct spi_slow_msg *q;
+	int i, sends;
+
+	q = spi_unbind_slow(test, f, iface, SPI_SLOW_N, 1, &sends);
+	KUNIT_EXPECT_EQ(test, sends, 1);
+	KUNIT_EXPECT_EQ(test, q[0].m.status, 0);
+	for (i = 1; i < SPI_SLOW_N; i++)
+		KUNIT_EXPECT_EQ_MSG(test, q[i].m.status, -ESHUTDOWN,
+				    "message %d", i);
+	kfree(q);
+}
+
+static void obmf_test_spi_unbind_slow(struct kunit *test)
+{
+	spi_unbind_slow_msgs(test, false);
+}
+
+/* The same through the interface's unbind, which stops no timeout here */
+static void obmf_test_spi_iface_unbind_slow(struct kunit *test)
+{
+	spi_unbind_slow_msgs(test, true);
+}
+
+/*
+ * One message of eight transfers, one chip select window: the first is
+ * answered and keeps the chip select, so the next sends only the release
+ * that de-asserts it; the message ends -ESHUTDOWN after one transfer
+ */
+static void obmf_test_spi_unbind_slow_long(struct kunit *test)
+{
+	struct obmf_fake *f = spi_fake(test, 516, 0, 1, 1000000, 1000000);
+	unsigned int mark = f->nlog;
+	struct spi_slow_msg *q;
+	int sends;
+
+	q = spi_unbind_slow(test, f, false, 1, SPI_SLOW_N, &sends);
+	KUNIT_EXPECT_EQ(test, sends, 2);
+	KUNIT_EXPECT_EQ(test, q[0].m.status, -ESHUTDOWN);
+	KUNIT_EXPECT_EQ(test, q[0].m.actual_length, 1);
+	kfree(q);
+	SPI_EXPECT_SENT(f, mark, 0, 0x22, 1, 0, 0, 0, 0);
+	SPI_EXPECT_SENT(f, mark, 1, 0x12, 0, 0, 0, 0);
+}
+
+/*
+ * One of two clients removed while its messages wait behind one in
+ * flight, the device answering slowly: its leftovers fail -ESHUTDOWN
+ * with nothing sent, the other client's message goes out, and a new
+ * client on the removed one's chip select is served
+ */
+static void obmf_test_spi_client_removed(struct kunit *test)
+{
+	struct obmf_fake *f = spi_fake(test, 516, 0, 2, 1000000, 1000000);
+	struct spi_device *spi0 = spi_client(f, 0, 0, 0);
+	struct spi_device *spi1 = spi_client(f, 1, 0, 0);
+	unsigned int mark = f->nlog;
+	struct spi_slow_msg *q0, *q1;
+	int n;
+
+	KUNIT_ASSERT_NOT_NULL(test, spi0);
+	KUNIT_ASSERT_NOT_NULL(test, spi1);
+	n = spi_sends(f);
+	spi_slow(f, true);
+	q0 = spi_slow_queue(test, spi0, 3, 1);
+	q1 = spi_slow_queue(test, spi1, 1, 1);
+	spi_wait_out(f, n);
+	spi_unregister_device(spi0);
+	spi_slow_wait(test, q0, 3);
+	spi_slow_wait(test, q1, 1);
+	KUNIT_EXPECT_EQ(test, q0[0].m.status, 0);
+	KUNIT_EXPECT_EQ(test, q0[1].m.status, -ESHUTDOWN);
+	KUNIT_EXPECT_EQ(test, q0[2].m.status, -ESHUTDOWN);
+	KUNIT_EXPECT_EQ(test, q1[0].m.status, 0);
+	kfree(q0);
+	kfree(q1);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 2);
+	/* chip select 0, then 1 */
+	SPI_EXPECT_SENT(f, mark, 0, 0x32, 1, 0, 0, 0, 0);
+	SPI_EXPECT_SENT(f, mark, 1, 0x72, 1, 0, 0, 0, 0);
+
+	spi_slow(f, false);
+	spi0 = spi_client(f, 0, 0, 0);
+	KUNIT_ASSERT_NOT_NULL(test, spi0);
+	KUNIT_EXPECT_EQ(test, spi_one(spi0), 0);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 3);
+}
+
+struct spi_call {
+	struct work_struct work;
+	struct spi_device *spi;
+	int ret;
+	struct completion done;
+};
+
+static void spi_call_work(struct work_struct *w)
+{
+	struct spi_call *c = container_of(w, struct spi_call, work);
+
+	c->ret = spi_one(c->spi);
+	complete(&c->done);
+}
+
+/*
+ * Unplug with a client bound and its transfer waiting: the transfer ends
+ * -ENODEV at once, no release is sent, and the client is removed
+ */
+static void obmf_test_spi_unplug(struct kunit *test)
+{
+	struct obmf_fake *f = spi_fake(test, 516, 0, 1, 1000000, 1000000);
+	struct spi_device *spi = spi_client(f, 0, 0, 0);
+	struct fake_step s = { .how = FAKE_NEVER, .channel = -1 };
+	struct spi_call *c;
+	unsigned int sends;
+	int n;
+
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	c = kunit_kzalloc(test, sizeof(*c), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, c);
+	c->spi = spi;
+	init_completion(&c->done);
+	INIT_WORK(&c->work, spi_call_work);
+	fake_push(f, &s);
+	n = spi_sends(f);
+	sends = f->sends;
+	queue_work(f->callwq, &c->work);
+	KUNIT_ASSERT_TRUE(test, fake_wait_sends(f, sends + 1));
+	f->attached = false;
+	fake_unbind(f);
+	KUNIT_ASSERT_TRUE(test, test_wait(&c->done));
+	flush_work(&c->work);
+	KUNIT_EXPECT_EQ(test, c->ret, -ENODEV);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 1);
+	KUNIT_EXPECT_FALSE(test, device_is_registered(&spi->dev));
+}
+
+/*
+ * While suspended a message is -ESHUTDOWN from the SPI core with nothing
+ * sent; after resume it goes out
+ */
+static void obmf_test_spi_suspend(struct kunit *test)
+{
+	struct obmf_fake *f = spi_fake(test, 516, 0, 1, 1000000, 1000000);
+	struct spi_device *spi = spi_client(f, 0, 0, 0);
+	struct device *dev = &chan(f, SPI_CH)->fdev->adev.dev;
+	const struct dev_pm_ops *pm = dev->driver->pm;
+	int n;
+
+	KUNIT_ASSERT_NOT_NULL(test, spi);
+	if (!pm || !pm->suspend)
+		kunit_skip(test, "no system sleep");
+	n = spi_sends(f);
+	KUNIT_ASSERT_EQ(test, pm->suspend(dev), 0);
+	KUNIT_EXPECT_EQ(test, spi_one(spi), -ESHUTDOWN);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n);
+	KUNIT_ASSERT_EQ(test, pm->resume(dev), 0);
+	KUNIT_EXPECT_EQ(test, spi_one(spi), 0);
+	KUNIT_EXPECT_EQ(test, spi_sends(f), n + 1);
+}
+
+#if IS_ENABLED(CONFIG_SPI_OBMF_SPIDEV)
+static const struct software_node sw_spidev = { .name = "obmf-test-spidev" };
+
+static const struct software_node sw_spidev_spi = {
+	.name = "spi@1",
+	.parent = &sw_spidev,
+	.properties = sw_reg1,
+};
+
+static const struct software_node sw_spidev_flash = {
+	.name = "flash@0",
+	.parent = &sw_spidev_spi,
+};
+
+static const struct software_node *const sw_spidev_nodes[] = {
+	&sw_spidev,
+	&sw_spidev_spi,
+	&sw_spidev_flash,
+	NULL,
+};
+
+static int spi_count_spidev(struct device *dev, void *data)
+{
+	struct spi_device *spi = to_spi_device(dev);
+
+	if (!strcmp(spi->modalias, "spidev") && dev->driver &&
+	    !strcmp(dev->driver->name, "spidev"))
+		(*(int *)data)++;
+	return 0;
+}
+
+static int spi_spidevs(struct spi_controller *ctlr)
+{
+	int n = 0;
+
+	device_for_each_child(&ctlr->dev, &n, spi_count_spidev);
+	return n;
+}
+
+/*
+ * Whether the kernel command line sets spi_obmf.auto_bind_spidev, the
+ * only way to set it for the built-in driver these cases run against
+ */
+static bool spi_auto_bind_set(struct kunit *test)
+{
+	char *args, *param, *val;
+	bool on = false, b;
+
+	args = kunit_kstrdup(test, saved_command_line, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	while (*args) {
+		args = next_arg(args, &param, &val);
+		if (!parameq(param, "spi_obmf.auto_bind_spidev"))
+			continue;
+		on = !val || (!kstrtobool(val, &b) && b);
+	}
+	return on;
+}
+
+/*
+ * With auto_bind_spidev set: spidev bound on each chip select of a
+ * channel the firmware describes no client for, gone at unbind; none on
+ * a channel whose firmware node has a client. Skipped only when spidev
+ * is not registered or the parameter is off: with both, a binding that
+ * adds no spidev fails.
+ */
+static void obmf_test_spi_spidev(struct kunit *test)
+{
+	struct obmf_fake *f;
+	struct spi_controller *ctlr;
+	int ret;
+
+	if (!driver_find("spidev", &spi_bus_type) || !spi_auto_bind_set(test))
+		kunit_skip(test,
+			   "needs spidev and spi_obmf.auto_bind_spidev=1");
+	f = spi_fake(test, 516, 0, 3, 1000000, 1000000);
+	ctlr = spi_ctlr(f);
+	KUNIT_ASSERT_NOT_NULL(test, ctlr);
+	KUNIT_EXPECT_EQ(test, spi_spidevs(ctlr), 3);
+	device_release_driver(&chan(f, SPI_CH)->fdev->adev.dev);
+	KUNIT_EXPECT_EQ(test, spi_spidevs(ctlr), 0);
+
+	ret = kunit_software_node_register_node_group(test, sw_spidev_nodes);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	f = spi_fake_lim(test, &sw_spidev, 516, 516, 0, 2, 1000000, 1000000);
+	ctlr = spi_ctlr(f);
+	KUNIT_ASSERT_NOT_NULL(test, ctlr);
+	KUNIT_EXPECT_PTR_EQ(test, dev_fwnode(&ctlr->dev),
+			    software_node_fwnode(&sw_spidev_spi));
+	KUNIT_EXPECT_EQ(test, spi_spidevs(ctlr), 0);
+}
+#endif
+
+static struct kunit_case obmf_spi_cases[] = {
+	KUNIT_CASE(obmf_test_spi_probe),
+	KUNIT_CASE(obmf_test_spi_setup),
+	KUNIT_CASE(obmf_test_spi_xfer),
+	KUNIT_CASE(obmf_test_spi_refused),
+	KUNIT_CASE(obmf_test_spi_limits),
+	KUNIT_CASE(obmf_test_spi_errors),
+	KUNIT_CASE_SLOW(obmf_test_spi_timeout),
+	KUNIT_CASE(obmf_test_spi_unbind),
+	KUNIT_CASE_SLOW(obmf_test_spi_unbind_silent),
+	KUNIT_CASE_SLOW(obmf_test_spi_unbind_busy),
+	KUNIT_CASE_SLOW(obmf_test_spi_unbind_long_send),
+	KUNIT_CASE_SLOW(obmf_test_spi_unbind_slow),
+	KUNIT_CASE_SLOW(obmf_test_spi_unbind_slow_long),
+	KUNIT_CASE_SLOW(obmf_test_spi_iface_unbind_slow),
+	KUNIT_CASE_SLOW(obmf_test_spi_client_removed),
+	KUNIT_CASE(obmf_test_spi_unplug),
+	KUNIT_CASE(obmf_test_spi_suspend),
+#if IS_ENABLED(CONFIG_SPI_OBMF_SPIDEV)
+	KUNIT_CASE(obmf_test_spi_spidev),
+#endif
+	{}
+};
+
+/* test->priv: the log of the cases that count lines */
+static int obmf_spi_test_init(struct kunit *test)
+{
+	struct test_log *log = kunit_kzalloc(test, sizeof(*log), GFP_KERNEL);
+
+	if (!log)
+		return -ENOMEM;
+	test_log_init(test, log);
+	return 0;
+}
+
+static struct kunit_suite obmf_spi_suite = {
+	.name = "obmf-spi",
+	.suite_init = obmf_test_fn_suite_init,
+	.suite_exit = obmf_test_fn_suite_exit,
+	.init = obmf_spi_test_init,
+	.exit = test_log_exit,
+	.test_cases = obmf_spi_cases,
+};
+
+kunit_test_suite(obmf_spi_suite);
+
+#endif /* IS_BUILTIN(CONFIG_SPI_OBMF) */
 
 /* The serial driver on the fake transport; only when built in */
 #if IS_BUILTIN(CONFIG_OBMF_TTY)
@@ -6350,6 +9371,36 @@ static void obmf_test_tty_break(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends + TTY_BREAK_TRIES);
 }
 
+/*
+ * A break the device answers with a timeout status, Table 4 0x02 or the
+ * line timeout 0x40, fails -ETIMEDOUT, as one the transport times out
+ * does, and is not sent again. TCSBRK returns what break_ctl() returns
+ * (send_break() in drivers/tty/tty_io.c).
+ */
+static void obmf_test_tty_break_timeout(struct kunit *test)
+{
+	static const u8 status[] = { OBMF_STATUS_TIMEOUT,
+				     OBMF_STATUS_SERIAL_LINE_TIMEOUT };
+	struct obmf_fake *f = tty_setup(test);
+	struct tty_k *k = tty_k_get(f, 1);
+	struct fake_step s = { .how = FAKE_INLINE, .channel = -1 };
+	unsigned int sends;
+	int i;
+
+	tty_k_open(test, k);
+	for (i = 0; i < ARRAY_SIZE(status); i++) {
+		s.status = status[i];
+		fake_push(f, &s);
+		sends = READ_ONCE(f->sends);
+		KUNIT_EXPECT_EQ_MSG(test, k->tty->ops->break_ctl(k->tty, -1),
+				    -ETIMEDOUT, "status %#x", status[i]);
+		KUNIT_EXPECT_EQ_MSG(test, READ_ONCE(f->sends), sends + 1,
+				    "status %#x", status[i]);
+	}
+	fake_push(f, &(struct fake_step){ .send_ret = -ETIMEDOUT });
+	KUNIT_EXPECT_EQ(test, k->tty->ops->break_ctl(k->tty, -1), -ETIMEDOUT);
+}
+
 #define TTY_SLOW_HZ 300
 /*
  * Characters at TTY_SLOW_HZ whose time on the wire, twice over, fits the
@@ -6523,13 +9574,23 @@ static const struct test_chan tty_tx_chans[] = {
 	  OBMF_HDR_LEN + 3 + TTY_TX_MAX, 0, TTY_CFG_LEN },
 };
 
-/* Channel 1 of tty_tx_chans, its tty open */
-static struct tty_k *tty_tx_setup(struct kunit *test, struct obmf_fake **fp)
+/* The channels at most after the serial one, of a type no driver takes */
+#define TTY_EXTRA 5
+
+/* Channel 1 of tty_tx_chans, its tty open, then @extra IPMI channels */
+static struct tty_k *tty_tx_setup_n(struct kunit *test, struct obmf_fake **fp,
+				    int extra)
 {
 	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	struct test_chan c[1 + TTY_EXTRA] = { tty_tx_chans[0] };
 	struct tty_k *k;
+	int i;
 
-	fake_layout(f, tty_tx_chans, ARRAY_SIZE(tty_tx_chans));
+	KUNIT_ASSERT_LE(test, extra, TTY_EXTRA);
+	for (i = 1; i <= extra; i++)
+		c[i] = (struct test_chan){ OBMF_TYPE_IPMI, OBMF_ROLE_PRODUCER,
+					   "ipmi", 516 };
+	fake_layout(f, c, 1 + extra);
 	tty_cfg(f, 1, TTY_HZ, 8, 1, 0);
 	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
 	KUNIT_ASSERT_TRUE(test, tty_bound(f, 1));
@@ -6537,6 +9598,11 @@ static struct tty_k *tty_tx_setup(struct kunit *test, struct obmf_fake **fp)
 	tty_k_open(test, k);
 	*fp = f;
 	return k;
+}
+
+static struct tty_k *tty_tx_setup(struct kunit *test, struct obmf_fake **fp)
+{
+	return tty_tx_setup_n(test, fp, 0);
 }
 
 /* Waits up to @ms for @tx characters sent in all and none left */
@@ -7384,11 +10450,11 @@ static void obmf_test_tty_close_try(struct kunit *test)
  * they have waited TTY_STALL_MS, within a second, naming why and how
  * many wait, and none after while the refusal goes on, also when its
  * reason changes; none for a shorter refusal. Once the device takes
- * them, the next stall gets its own warning: busy, then no answer, for
- * which it comes with the first timeout after TTY_STALL_MS, later as
- * each timeout doubles the next wait. Each warning counts
- * one stall; nothing counts as dropped. The same text logged by another
- * device is not counted.
+ * them, the next stall gets its own warning: busy, then a timeout
+ * status, then no answer, for which it comes with the first timeout
+ * after TTY_STALL_MS, later as each timeout doubles the next wait. Each
+ * warning counts one stall; nothing counts as dropped. The same text
+ * logged by another device is not counted.
  */
 static void obmf_test_tty_stall(struct kunit *test)
 {
@@ -7396,8 +10462,10 @@ static void obmf_test_tty_stall(struct kunit *test)
 		"transmit stalled: refused, 4 characters waiting";
 	static const char busy[] =
 		"transmit stalled: busy, 4 characters waiting";
+	static const char status[] =
+		"transmit stalled: timeout status, 4 characters waiting";
 	static const char quiet[] =
-		"transmit stalled: timed out, 4 characters waiting";
+		"transmit stalled: no answer, 4 characters waiting";
 	unsigned int wait = TTY_STALL_MS + 3 * OBMF_DEFAULT_TIMEOUT_MS;
 	struct fake_step s = tty_ack;
 	struct obmf_fake *f;
@@ -7436,6 +10504,14 @@ static void obmf_test_tty_stall(struct kunit *test)
 	tty_dflt(f, &tty_ack);
 	tty_tx_wait(test, k, 8);
 
+	s.status = OBMF_STATUS_TIMEOUT;
+	tty_dflt(f, &s);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, 4), 4);
+	KUNIT_EXPECT_EQ(test, test_log_wait(test, log, status, 1, wait), 1);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 3);
+	tty_dflt(f, &tty_ack);
+	tty_tx_wait(test, k, 12);
+
 	s = tty_ack;
 	s.how = FAKE_NEVER;
 	tty_dflt(f, &s);
@@ -7444,9 +10520,9 @@ static void obmf_test_tty_stall(struct kunit *test)
 	wait = TTY_STALL_MS + 6 * OBMF_DEFAULT_TIMEOUT_MS;
 	KUNIT_EXPECT_EQ(test, test_log_wait(test, log, quiet, 1, wait), 1);
 	tty_dflt(f, &tty_ack);
-	tty_tx_wait_ms(test, k, 12, 3 * OBMF_DEFAULT_TIMEOUT_MS);
-	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "transmit stalled"), 3);
-	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 3);
+	tty_tx_wait_ms(test, k, 16, 3 * OBMF_DEFAULT_TIMEOUT_MS);
+	KUNIT_EXPECT_EQ(test, test_log_lines(test, log, "transmit stalled"), 4);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).stalls, 4);
 	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
 }
 
@@ -7605,7 +10681,7 @@ static void obmf_test_tty_suspend(struct kunit *test)
  */
 static void obmf_test_tty_unbind_backoff(struct kunit *test)
 {
-	unsigned int sends;
+	unsigned int sends, late = 0;
 	struct obmf_fake *f;
 	struct tty_k *k;
 	u8 buf[4];
@@ -7626,8 +10702,9 @@ static void obmf_test_tty_unbind_backoff(struct kunit *test)
 		tty_k_close(k);
 		sends = READ_ONCE(f->sends);
 		msleep(3 * TTY_RETRY_MS);
-		KUNIT_EXPECT_EQ(test, READ_ONCE(f->sends), sends);
+		late += READ_ONCE(f->sends) - sends;
 	}
+	KUNIT_EXPECT_EQ(test, late, 0);
 }
 
 /*
@@ -7745,6 +10822,48 @@ static void obmf_test_tty_wait_double(struct kunit *test)
 			2 * OBMF_DEFAULT_TIMEOUT_MS);
 	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_TIMEOUTS), to + 1);
 	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+}
+
+/*
+ * Five other channels whose sends each take their whole timeout and
+ * fail, as on a device that takes no data for them: the port's writes
+ * go out and are answered, and only its own timeouts would double its
+ * wait, so the wait stays the default one
+ */
+static void obmf_test_tty_wait_busy(struct kunit *test)
+{
+	static const int chs[] = { 2, 3, 4, 5, 6 };
+	static const u8 buf[] = "abcdefgh";
+	int n = ARRAY_SIZE(chs);
+	struct obmf_fake *f;
+	struct test_busy *b;
+	struct tty_k *k;
+	long to;
+	int i, j;
+
+	k = tty_tx_setup_n(test, &f, n);
+	tty_dflt(f, &tty_ack);
+	to = ch_cnt(chan(f, 1), OBMF_CH_TIMEOUTS);
+	WRITE_ONCE(f->send_sleep_chans, GENMASK(6, 2));
+	WRITE_ONCE(f->send_sleep_ret, -ETIMEDOUT);
+	WRITE_ONCE(f->send_sleep_ms, OBMF_MAX_TIMEOUT_MS);
+	b = test_busy_start(f, chs, n, 0);
+	for (j = 0; j < 2; j++) {
+		i = fake_nlog(f) - 1;
+		KUNIT_ASSERT_EQ(test,
+				k->tty->ops->write(k->tty, buf + 4 * j, 4), 4);
+		tty_tx_wait(test, k, 4 * (j + 1));
+		i = fake_find(f, i + 1, FAKE_SEND, 1, 0);
+		KUNIT_ASSERT_GE(test, i, 0);
+		KUNIT_EXPECT_EQ(test, f->log[i].timeout_ms,
+				OBMF_DEFAULT_TIMEOUT_MS + TTY_WIRE4_MS);
+	}
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_TIMEOUTS), to);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+	test_busy_end(f, b, n);
+	WRITE_ONCE(f->send_sleep_ms, 0);
+	WRITE_ONCE(f->send_sleep_ret, 0);
+	WRITE_ONCE(f->send_sleep_chans, 0);
 }
 
 /*
@@ -7882,6 +11001,87 @@ static void obmf_test_tty_wait_cap(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
 }
 
+/* A slow line, and a write that spends 2 s on it */
+#define TTY_CAP_HZ 1200
+#define TTY_CAP_CHARS 240
+#define TTY_CAP_WIRE_MS \
+	(2 * DIV_ROUND_UP(TTY_CAP_CHARS * 10 * MSEC_PER_SEC, TTY_CAP_HZ))
+/*
+ * Timeouts in a row: the wait doubles from OBMF_DEFAULT_TIMEOUT_MS, so
+ * an unsigned int that is not held at the limit is 0 after 29 of them
+ */
+#define TTY_CAP_TIMEOUTS 30
+
+static const struct test_chan tty_cap_chans[] = {
+	{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "uart",
+	  OBMF_HDR_LEN + 3 + TTY_CAP_CHARS, 0, TTY_CFG_LEN },
+};
+
+/*
+ * On a slow line the wait of a long write passes OBMF_MAX_TIMEOUT_MS
+ * before the doubled wait does. The transport times out the first
+ * TTY_CAP_TIMEOUTS tries or more at once; each doubles the wait, which
+ * the core caps for the long write from the fourth on, and which stays
+ * at the limit, which a break then waits.
+ */
+static void obmf_test_tty_wait_slow(struct kunit *test)
+{
+	static const unsigned int want[] = { 5000, 6000, 8000 };
+	struct fake_step out = { .send_ret = -ETIMEDOUT };
+	struct obmf_fake *f = fake_create(test, FAKE_MAX_MSG, 0);
+	unsigned int sends, n;
+	u8 buf[TTY_CAP_CHARS];
+	struct tty_k *k;
+	long to, txe;
+	int i;
+
+	BUILD_BUG_ON(TTY_CAP_WIRE_MS != 4000);
+	BUILD_BUG_ON(OBMF_DEFAULT_TIMEOUT_MS != 1000 ||
+		     OBMF_MAX_TIMEOUT_MS != 10000);
+	fake_layout(f, tty_cap_chans, ARRAY_SIZE(tty_cap_chans));
+	tty_cfg(f, 1, TTY_CAP_HZ, 8, 1, 0);
+	KUNIT_ASSERT_EQ(test, fake_bind(f), 0);
+	KUNIT_ASSERT_TRUE(test, tty_bound(f, 1));
+	k = tty_k_get(f, 1);
+	tty_k_open(test, k);
+	/* More steps than the fake queues: the default times out instead */
+	tty_dflt(f, &out);
+	memset(buf, 'a', sizeof(buf));
+	to = ch_cnt(chan(f, 1), OBMF_CH_TIMEOUTS);
+	txe = ch_cnt(chan(f, 1), OBMF_CH_TX_ERRORS);
+	i = fake_nlog(f) - 1;
+	sends = READ_ONCE(f->sends);
+	KUNIT_ASSERT_EQ(test, k->tty->ops->write(k->tty, buf, sizeof(buf)),
+			sizeof(buf));
+	for (n = 0; n < 250; n++) {
+		if (READ_ONCE(f->sends) >= sends + TTY_CAP_TIMEOUTS)
+			break;
+		msleep(20);
+	}
+	tty_dflt(f, &tty_ack);
+	tty_tx_wait(test, k, sizeof(buf));
+	sends = READ_ONCE(f->sends) - sends;
+	KUNIT_ASSERT_GT(test, sends, TTY_CAP_TIMEOUTS);
+	for (n = 0; n < sends; n++) {
+		i = fake_find(f, i + 1, FAKE_SEND, 1, 0);
+		KUNIT_ASSERT_GE(test, i, 0);
+		KUNIT_EXPECT_EQ_MSG(test, f->log[i].timeout_ms,
+				    n < ARRAY_SIZE(want) ? want[n] :
+							   OBMF_MAX_TIMEOUT_MS,
+				    "try %u", n);
+	}
+	KUNIT_EXPECT_LT(test, fake_find(f, i + 1, FAKE_SEND, 1, 0), 0);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_TX_ERRORS),
+			txe + sends - 1);
+	KUNIT_EXPECT_EQ(test, ch_cnt(chan(f, 1), OBMF_CH_TIMEOUTS), to);
+	KUNIT_EXPECT_EQ(test, tty_k_cnt(k).dropped, 0);
+
+	KUNIT_EXPECT_EQ(test, k->tty->ops->break_ctl(k->tty, 1), 0);
+	i = fake_find(f, i + 1, FAKE_SEND, 1, 0);
+	KUNIT_ASSERT_GE(test, i, 0);
+	KUNIT_EXPECT_EQ(test, f->log[i].timeout_ms, OBMF_MAX_TIMEOUT_MS);
+}
+
 /*
  * A device write with the overrun event counts overrun and
  * pushes a 0x00 with TTY_OVERRUN before its character, with no event and
@@ -7968,6 +11168,7 @@ static struct kunit_case obmf_tty_cases[] = {
 	KUNIT_CASE(obmf_test_tty_failed),
 	KUNIT_CASE(obmf_test_tty_closed),
 	KUNIT_CASE(obmf_test_tty_break),
+	KUNIT_CASE(obmf_test_tty_break_timeout),
 	KUNIT_CASE(obmf_test_tty_slow),
 	KUNIT_CASE(obmf_test_tty_node),
 	KUNIT_CASE(obmf_test_tty_tx),
@@ -7991,9 +11192,11 @@ static struct kunit_case obmf_tty_cases[] = {
 	KUNIT_CASE(obmf_test_tty_unbind_backoff),
 	KUNIT_CASE_SLOW(obmf_test_tty_shift),
 	KUNIT_CASE_SLOW(obmf_test_tty_wait_double),
+	KUNIT_CASE_SLOW(obmf_test_tty_wait_busy),
 	KUNIT_CASE_SLOW(obmf_test_tty_wait_reopen),
 	KUNIT_CASE_SLOW(obmf_test_tty_wait_cap),
 	KUNIT_CASE(obmf_test_tty_wait_status),
+	KUNIT_CASE(obmf_test_tty_wait_slow),
 	KUNIT_CASE(obmf_test_tty_overrun),
 	KUNIT_CASE(obmf_test_tty_closed_quiet),
 	KUNIT_CASE(obmf_test_tty_limit),
@@ -8002,6 +11205,8 @@ static struct kunit_case obmf_tty_cases[] = {
 
 static struct kunit_suite obmf_tty_suite = {
 	.name = "obmf-tty",
+	.suite_init = obmf_test_fn_suite_init,
+	.suite_exit = obmf_test_fn_suite_exit,
 	.init = obmf_tty_test_init,
 	.exit = test_log_exit,
 	.test_cases = obmf_tty_cases,
@@ -8144,6 +11349,43 @@ static int gt_sends(struct obmf_fake *f)
 	return fake_count(f, FAKE_SEND, CH_GPIO_ONLY, 0);
 }
 
+/*
+ * gpiod_set_value_cansleep() and the chip's set() and set_multiple()
+ * with their result. Before v6.17 they return void, and a case that
+ * checks the result is skipped.
+ */
+static int gt_set_value(struct kunit *test, struct gpio_desc *desc, int value)
+{
+#ifdef OBMF_COMPAT_GPIO_SET_VOID
+	kunit_skip(test, "gpiod_set_value() returns void on this kernel");
+	return 0;
+#else
+	return gpiod_set_value_cansleep(desc, value);
+#endif
+}
+
+static int gt_set(struct kunit *test, struct gpio_chip *gc, unsigned int hw,
+		  int value)
+{
+#ifdef OBMF_COMPAT_GPIO_SET_VOID
+	kunit_skip(test, "set() returns void on this kernel");
+	return 0;
+#else
+	return gc->set(gc, hw, value);
+#endif
+}
+
+static int gt_set_multiple(struct kunit *test, struct gpio_chip *gc,
+			   unsigned long *mask, unsigned long *bits)
+{
+#ifdef OBMF_COMPAT_GPIO_SET_VOID
+	kunit_skip(test, "set_multiple() returns void on this kernel");
+	return 0;
+#else
+	return gc->set_multiple(gc, mask, bits);
+#endif
+}
+
 #define GT_FULL_NAME "line-name-of-thirty-two-bytes-xx"
 
 /*
@@ -8230,13 +11472,13 @@ static void obmf_test_gpio_get_set(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(out), 1);
 	KUNIT_EXPECT_EQ(test, gt_sends(f), 2);
 	gt_reply(f, 0, NULL, 0);
-	KUNIT_EXPECT_EQ(test, gpiod_set_value_cansleep(out, 0), 0);
+	KUNIT_EXPECT_EQ(test, gt_set_value(test, out, 0), 0);
 	p = gt_sent(f, 2, &len);
 	KUNIT_ASSERT_EQ(test, len, sizeof(set));
 	KUNIT_EXPECT_MEMEQ(test, p, set, sizeof(set));
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(out), 0);
 
-	KUNIT_EXPECT_EQ(test, gc->set(gc, 0, 1), -EPERM);
+	KUNIT_EXPECT_EQ(test, gt_set(test, gc, 0, 1), -EPERM);
 	KUNIT_EXPECT_EQ(test, gt_sends(f), 3);
 }
 
@@ -8261,10 +11503,10 @@ static void obmf_test_gpio_refused(struct kunit *test)
 	KUNIT_ASSERT_FALSE(test, IS_ERR(out));
 
 	gt_reply(f, OBMF_STATUS_GPIO_INVALID_OPERATION, NULL, 0);
-	KUNIT_EXPECT_EQ(test, gpiod_set_value_cansleep(out, 0), -EPERM);
+	KUNIT_EXPECT_EQ(test, gt_set_value(test, out, 0), -EPERM);
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(out), 1);
 	gt_reply(f, OBMF_STATUS_GPIO_INDEX_UNSUPPORTED, NULL, 0);
-	KUNIT_EXPECT_EQ(test, gpiod_set_value_cansleep(out, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, gt_set_value(test, out, 0), -EINVAL);
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(out), 1);
 	gt_reply(f, OBMF_STATUS_GPIO_INDEX_UNSUPPORTED, NULL, 0);
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(in), -EINVAL);
@@ -8272,9 +11514,86 @@ static void obmf_test_gpio_refused(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(in), -EOPNOTSUPP);
 
 	fake_push(f, &(struct fake_step){ .how = FAKE_NEVER, .channel = -1 });
-	KUNIT_EXPECT_EQ(test, gpiod_set_value_cansleep(out, 0), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, gt_set_value(test, out, 0), -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(out), 1);
 	KUNIT_EXPECT_EQ(test, gt_sends(f), 5);
+}
+
+/*
+ * A timeout status (Table 4 0x02) on a Get, a change of direction or a
+ * Set reaches gpiolib's users as -ETIMEDOUT, as no answer does, and the
+ * output keeps the value last set. Set returns void before v6.17, so
+ * there only the change of direction checks a Set.
+ */
+static void obmf_test_gpio_timeout_status(struct kunit *test)
+{
+	static const struct gt_line l[] = {
+		{ 0, "in", 1 },
+		{ 1, "out", 0, 1 },
+	};
+	struct obmf_fake *f = gt_create(test, 516, l, ARRAY_SIZE(l));
+	struct gpio_chip *gc = gt_bind(f);
+	unsigned long mask = BIT(0), bits = 0;
+	struct gpio_desc *in, *out;
+	int sends = 3;
+
+	KUNIT_ASSERT_NOT_NULL(test, gc);
+	in = gt_desc(test, gc, 0, GPIOD_ASIS);
+	out = gt_desc(test, gc, 1, GPIOD_ASIS);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(in));
+	KUNIT_ASSERT_FALSE(test, IS_ERR(out));
+
+	gt_reply(f, OBMF_STATUS_TIMEOUT, NULL, 0);
+	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(in), -ETIMEDOUT);
+	gt_reply(f, OBMF_STATUS_TIMEOUT, NULL, 0);
+	KUNIT_EXPECT_EQ(test, gc->get_multiple(gc, &mask, &bits), -ETIMEDOUT);
+	gt_reply(f, OBMF_STATUS_TIMEOUT, NULL, 0);
+	KUNIT_EXPECT_EQ(test, gpiod_direction_output(out, 0), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(out), 1);
+#ifndef OBMF_COMPAT_GPIO_SET_VOID
+	mask = BIT(1);
+	gt_reply(f, OBMF_STATUS_TIMEOUT, NULL, 0);
+	KUNIT_EXPECT_EQ(test, gpiod_set_value_cansleep(out, 0), -ETIMEDOUT);
+	gt_reply(f, OBMF_STATUS_TIMEOUT, NULL, 0);
+	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(out), 1);
+	sends += 2;
+#endif
+	KUNIT_EXPECT_EQ(test, gt_sends(f), sends);
+}
+
+/*
+ * Inside the driver a timeout status stays -ETIME: the core returns it,
+ * and the failed Set's report carries it, while the GPIO user gets
+ * -ETIMEDOUT
+ */
+static void obmf_test_gpio_timeout_report(struct kunit *test)
+{
+	static const struct gt_line l[] = { { 0, "out", 0, 1 } };
+	struct obmf_fake *f = gt_create(test, 516, l, ARRAY_SIZE(l));
+	struct gpio_chip *gc = gt_bind(f);
+	struct gpio_desc *out;
+	struct er_ctx *x;
+
+	KUNIT_ASSERT_NOT_NULL(test, gc);
+	test->priv = kunit_kzalloc(test, sizeof(*x), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, test->priv);
+	x = er_start(test);
+	out = gt_desc(test, gc, 0, GPIOD_ASIS);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(out));
+
+	gt_reply(f, OBMF_STATUS_TIMEOUT, NULL, 0);
+	KUNIT_EXPECT_EQ(test, er_req(chan(f, CH_GPIO_ONLY), 0), -ETIME);
+	KUNIT_EXPECT_EQ(test, x->n, 0);
+
+	gt_reply(f, OBMF_STATUS_TIMEOUT, NULL, 0);
+	KUNIT_EXPECT_EQ(test, gpiod_direction_output(out, 0), -ETIMEDOUT);
+	KUNIT_ASSERT_EQ(test, x->n, 1);
+	KUNIT_EXPECT_EQ(test, x->rec[0].ev, OBMF_EV_GPIO_SET);
+	KUNIT_EXPECT_EQ(test, x->rec[0].ch, CH_GPIO_ONLY);
+	KUNIT_EXPECT_EQ(test, x->rec[0].a, 0);
+	KUNIT_EXPECT_EQ(test, x->rec[0].b, -ETIME);
+	KUNIT_EXPECT_EQ(test, ev_cnt(f->core, OBMF_EV_GPIO_SET), 1);
 }
 
 /*
@@ -8301,16 +11620,16 @@ static void obmf_test_gpio_set_report(struct kunit *test)
 	x = er_start(test);
 
 	gt_reply(f, 0, NULL, 0);
-	KUNIT_EXPECT_EQ(test, gc->set(gc, 1, 1), 0);
+	KUNIT_EXPECT_EQ(test, gt_set(test, gc, 1, 1), 0);
 	gt_reply(f, 0, NULL, 0);
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), 0);
+	KUNIT_EXPECT_EQ(test, gt_set_multiple(test, gc, &mask, &bits), 0);
 	KUNIT_EXPECT_EQ(test, x->n, 0);
 	KUNIT_EXPECT_EQ(test, ev_cnt(f->core, OBMF_EV_GPIO_SET), 0);
 
 	gt_reply(f, OBMF_STATUS_BUSY, NULL, 0);
-	KUNIT_EXPECT_EQ(test, gc->set(gc, 1, 0), -EBUSY);
+	KUNIT_EXPECT_EQ(test, gt_set(test, gc, 1, 0), -EBUSY);
 	gt_reply(f, OBMF_STATUS_BUSY, NULL, 0);
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), -EBUSY);
+	KUNIT_EXPECT_EQ(test, gt_set_multiple(test, gc, &mask, &bits), -EBUSY);
 	KUNIT_ASSERT_EQ(test, x->n, 2);
 	KUNIT_EXPECT_EQ(test, x->rec[0].ev, OBMF_EV_GPIO_SET);
 	KUNIT_EXPECT_EQ(test, x->rec[0].ch, CH_GPIO_ONLY);
@@ -8321,18 +11640,18 @@ static void obmf_test_gpio_set_report(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, x->rec[1].b, -EBUSY);
 	KUNIT_EXPECT_EQ(test, ev_cnt(f->core, OBMF_EV_GPIO_SET), 2);
 
-	KUNIT_EXPECT_EQ(test, gc->set(gc, 0, 1), -EPERM);
+	KUNIT_EXPECT_EQ(test, gt_set(test, gc, 0, 1), -EPERM);
 	mask = BIT(0) | BIT(1);
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), -EPERM);
+	KUNIT_EXPECT_EQ(test, gt_set_multiple(test, gc, &mask, &bits), -EPERM);
 	mask = BIT(1);
 	gt_reply(f, OBMF_STATUS_GPIO_INVALID_OPERATION, NULL, 0);
-	KUNIT_EXPECT_EQ(test, gc->set(gc, 1, 0), -EPERM);
+	KUNIT_EXPECT_EQ(test, gt_set(test, gc, 1, 0), -EPERM);
 	gt_reply(f, OBMF_STATUS_GPIO_INVALID_OPERATION, NULL, 0);
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), -EPERM);
+	KUNIT_EXPECT_EQ(test, gt_set_multiple(test, gc, &mask, &bits), -EPERM);
 	fake_push(f, &gone);
-	KUNIT_EXPECT_EQ(test, gc->set(gc, 1, 0), -ENODEV);
+	KUNIT_EXPECT_EQ(test, gt_set(test, gc, 1, 0), -ENODEV);
 	fake_push(f, &gone);
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), -ENODEV);
+	KUNIT_EXPECT_EQ(test, gt_set_multiple(test, gc, &mask, &bits), -ENODEV);
 	KUNIT_EXPECT_EQ(test, x->n, 2);
 	KUNIT_EXPECT_EQ(test, ev_cnt(f->core, OBMF_EV_GPIO_SET), 2);
 	KUNIT_EXPECT_EQ(test, gt_sends(f), 8);
@@ -8416,7 +11735,7 @@ static void obmf_test_gpio_bad_reply(struct kunit *test)
 	fake_push(f, &s);
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(in), -EPROTO);
 	gt_reply(f, 0, (const u16[]){ 0x0001 }, 1);
-	KUNIT_EXPECT_EQ(test, gpiod_set_value_cansleep(out, 0), -EPROTO);
+	KUNIT_EXPECT_EQ(test, gt_set_value(test, out, 0), -EPROTO);
 	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(out), 1);
 	KUNIT_EXPECT_EQ(test, ch_cnt(ch, OBMF_CH_PROTOCOL_ERRORS), 8);
 	gt_reply(f, 0, (const u16[]){ 0x1000 }, 1);
@@ -8511,7 +11830,7 @@ static void obmf_test_gpio_multiple(struct kunit *test)
 	gt_reply(f, 0, NULL, 0);
 	mask = 0x1e0;
 	bits = BIT(8) | BIT(6);
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), 0);
+	KUNIT_EXPECT_EQ(test, gt_set_multiple(test, gc, &mask, &bits), 0);
 	KUNIT_ASSERT_EQ(test, gt_sends(f), 4);
 	p = gt_sent(f, 2, &len);
 	KUNIT_ASSERT_EQ(test, len, sizeof(set0));
@@ -8523,7 +11842,7 @@ static void obmf_test_gpio_multiple(struct kunit *test)
 	gt_reply(f, 0, NULL, 0);
 	mask = BIT(7) | BIT(5);
 	bits = BIT(7) | BIT(5);
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), 0);
+	KUNIT_EXPECT_EQ(test, gt_set_multiple(test, gc, &mask, &bits), 0);
 	KUNIT_ASSERT_EQ(test, gt_sends(f), 5);
 	p = gt_sent(f, 4, &len);
 	KUNIT_ASSERT_EQ(test, len, sizeof(set2));
@@ -8533,14 +11852,14 @@ static void obmf_test_gpio_multiple(struct kunit *test)
 	gt_reply(f, OBMF_STATUS_GPIO_INVALID_OPERATION, NULL, 0);
 	mask = 0x1e0;
 	bits = 0;
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), -EPERM);
+	KUNIT_EXPECT_EQ(test, gt_set_multiple(test, gc, &mask, &bits), -EPERM);
 	KUNIT_EXPECT_EQ(test, gt_sends(f), 7);
 	bits = 0;
 	KUNIT_EXPECT_EQ(test, gc->get_multiple(gc, &mask, &bits), 0);
 	KUNIT_EXPECT_EQ(test, bits, BIT(8));
 
 	mask = BIT(5) | BIT(0);
-	KUNIT_EXPECT_EQ(test, gc->set_multiple(gc, &mask, &bits), -EPERM);
+	KUNIT_EXPECT_EQ(test, gt_set_multiple(test, gc, &mask, &bits), -EPERM);
 	KUNIT_EXPECT_EQ(test, gt_sends(f), 7);
 
 	mask = 0x3;
@@ -9072,10 +12391,70 @@ static void obmf_test_gpio_irq_unbind(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&a->calls), 1);
 }
 
+/*
+ * A USB reset or a reset-resume unbinds the interface and binds it again,
+ * here with the device gone for the disable sent as the chip goes. The
+ * new chip has nothing armed: an edge is counted unused until the
+ * consumer requests the line again, which sends Set Interrupt Config with
+ * the trigger again; a Notify then runs the new handler only.
+ */
+static void obmf_test_gpio_irq_rebind(struct kunit *test)
+{
+	static const struct gt_line l[] = { { 0, "in0", 1 } };
+	static const u8 rising[] = { OBMF_GPIO_SET_INTERRUPT_CONFIG, 0x00,
+				     0x30 };
+	struct obmf_fake *f = gt_create(test, 516, l, ARRAY_SIZE(l));
+	struct gpio_chip *gc = gt_bind(f);
+	struct gpio_desc *in0;
+	struct gt_irq *a, *b;
+	const u8 *p;
+	size_t len;
+	int sends;
+
+	KUNIT_ASSERT_NOT_NULL(test, gc);
+	f->dflt.plen = 0;
+	in0 = gt_desc(test, gc, 0, GPIOD_IN);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(in0));
+	KUNIT_ASSERT_EQ(test,
+			gt_irq_request(test, in0, IRQF_TRIGGER_RISING, &a), 0);
+	KUNIT_ASSERT_EQ(test, gt_sends(f), 1);
+	gt_dreq(f, OBMF_GPIO_INTERRUPT_NOTIFY, (const u16[]){ 0x0000 }, 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&a->calls), 1);
+
+	f->dflt.send_ret = -ENODEV;
+	fake_unbind(f);
+	f->dflt.send_ret = 0;
+	kunit_release_action(test, gt_free_irq, a);
+	kunit_release_action(test, gt_free_desc, in0);
+
+	gc = gt_bind(f);
+	KUNIT_ASSERT_NOT_NULL(test, gc);
+	sends = gt_sends(f);
+	gt_dreq(f, OBMF_GPIO_INTERRUPT_NOTIFY, (const u16[]){ 0x0000 }, 1);
+	gt_answer(f, OBMF_STATUS_SUCCESS, OBMF_GPIO_INTERRUPT_NOTIFY,
+		  "not armed");
+	KUNIT_EXPECT_EQ(test, ev_cnt(f->core, OBMF_EV_GPIO_IRQ_UNUSED), 1);
+
+	in0 = gt_desc(test, gc, 0, GPIOD_IN);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(in0));
+	KUNIT_ASSERT_EQ(test,
+			gt_irq_request(test, in0, IRQF_TRIGGER_RISING, &b), 0);
+	KUNIT_ASSERT_EQ(test, gt_sends(f), sends + 1);
+	p = gt_sent(f, sends, &len);
+	KUNIT_ASSERT_EQ(test, len, sizeof(rising));
+	KUNIT_EXPECT_MEMEQ(test, p, rising, sizeof(rising));
+	gt_dreq(f, OBMF_GPIO_INTERRUPT_NOTIFY, (const u16[]){ 0x0000 }, 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&b->calls), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&a->calls), 1);
+	KUNIT_EXPECT_EQ(test, ev_cnt(f->core, OBMF_EV_GPIO_IRQ_UNUSED), 1);
+}
+
 static struct kunit_case obmf_gpio_cases[] = {
 	KUNIT_CASE(obmf_test_gpio_lines),
 	KUNIT_CASE(obmf_test_gpio_get_set),
 	KUNIT_CASE(obmf_test_gpio_refused),
+	KUNIT_CASE(obmf_test_gpio_timeout_status),
+	KUNIT_CASE(obmf_test_gpio_timeout_report),
 	KUNIT_CASE(obmf_test_gpio_set_report),
 	KUNIT_CASE(obmf_test_gpio_failed_get),
 	KUNIT_CASE(obmf_test_gpio_bad_reply),
@@ -9088,11 +12467,14 @@ static struct kunit_case obmf_gpio_cases[] = {
 	KUNIT_CASE(obmf_test_gpio_irq_notify),
 	KUNIT_CASE(obmf_test_gpio_irq_failed),
 	KUNIT_CASE(obmf_test_gpio_irq_unbind),
+	KUNIT_CASE(obmf_test_gpio_irq_rebind),
 	{}
 };
 
 static struct kunit_suite obmf_gpio_suite = {
 	.name = "obmf-gpio",
+	.suite_init = obmf_test_fn_suite_init,
+	.suite_exit = obmf_test_fn_suite_exit,
 	.test_cases = obmf_gpio_cases,
 };
 

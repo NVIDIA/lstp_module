@@ -26,13 +26,18 @@ struct obmf_fdev_type {
 	u8 role;
 	const char *name;
 	const char *node;
+	const char *test_name;
 };
 
 static const struct obmf_fdev_type obmf_fdev_types[] = {
-	{ OBMF_TYPE_GPIO, OBMF_ROLE_PRODUCER, "gpio", "gpio" },
-	{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c", "i2c" },
-	{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "serial", "serial" },
-	{ OBMF_TYPE_SERIAL, OBMF_ROLE_SYMMETRIC, "serial", "serial" },
+	{ OBMF_TYPE_GPIO, OBMF_ROLE_PRODUCER, "gpio", "gpio", "test-gpio" },
+	{ OBMF_TYPE_I2C_CONTROLLER, OBMF_ROLE_PRODUCER, "i2c", "i2c",
+	  "test-i2c" },
+	{ OBMF_TYPE_SERIAL, OBMF_ROLE_PRODUCER, "serial", "serial",
+	  "test-serial" },
+	{ OBMF_TYPE_SERIAL, OBMF_ROLE_SYMMETRIC, "serial", "serial",
+	  "test-serial" },
+	{ OBMF_TYPE_SPI, OBMF_ROLE_PRODUCER, "spi", "spi", "test-spi" },
 };
 
 static DEFINE_IDA(obmf_ida);
@@ -75,8 +80,12 @@ static ssize_t intf_name_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)
 {
 	struct obmf_transport *tp = dev_get_drvdata(dev);
+	struct obmf_core *core = tp->core;
 
-	return sysfs_emit(buf, "%s\n", tp->core->device_name);
+	/* Probe returns before discovery: empty until the table is set */
+	if (!smp_load_acquire(&core->table))
+		return sysfs_emit(buf, "\n");
+	return sysfs_emit(buf, "%s\n", core->device_name);
 }
 
 static struct device_attribute dev_attr_intf_name =
@@ -139,8 +148,8 @@ static bool obmf_node_fits(struct obmf_core *core, struct obmf_channel *ch,
 		return false;
 	if (fwnode_name_eq(node, class))
 		return true;
-	dev_warn(core->dev, "channel %u: node %pfwP ignored\n", ch->info.number,
-		 node);
+	obmf_bind_warn(core, "channel %u: node %pfwP ignored\n",
+		       ch->info.number, node);
 	return false;
 }
 
@@ -216,7 +225,7 @@ static int obmf_fdev_add(struct obmf_core *core, struct obmf_channel *ch,
 	struct obmf_fdev *fdev;
 	int ret;
 
-	fdev = kzalloc_obj(*fdev);
+	fdev = kzalloc_obj(*fdev, GFP_KERNEL);
 	if (!fdev)
 		return -ENOMEM;
 	ret = ida_alloc(&obmf_ida, GFP_KERNEL);
@@ -228,7 +237,7 @@ static int obmf_fdev_add(struct obmf_core *core, struct obmf_channel *ch,
 	fdev->info = &ch->info;
 	fdev->ch = ch;
 	adev = &fdev->adev;
-	adev->name = t->name;
+	adev->name = obmf_test_names(core->tp) ? t->test_name : t->name;
 	adev->id = ret;
 	adev->dev.parent = core->dev;
 	adev->dev.release = obmf_fdev_release;
@@ -269,8 +278,8 @@ void obmf_bus_add(struct obmf_core *core)
 			continue;
 		ret = obmf_fdev_add(core, ch, t);
 		if (ret)
-			dev_warn(core->dev, "channel %d: no device: %pe\n", i,
-				 ERR_PTR(ret));
+			obmf_bind_warn(core, "channel %d: no device: %pe\n", i,
+				       ERR_PTR(ret));
 		else
 			obmf_debugfs_ch(core, ch);
 	}
@@ -361,6 +370,11 @@ static void obmf_fdev_unpublish(void *data)
  *
  * From here on device requests go to @ops; before, they get the default
  * answer. Needs devm_obmf_enable() first.
+ *
+ * Its undo is the first step of the unbind, after the driver's remove
+ * callback. Requests of the teardown after it go out over the live
+ * transport, each ending on its own timeout (obmf_request()), and
+ * answers still go out.
  *
  * Return: 0 or a negative errno, -ENODEV once the device has stopped or
  * failed, -EINVAL before devm_obmf_enable().

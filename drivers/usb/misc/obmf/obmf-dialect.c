@@ -92,16 +92,16 @@ int obmf_dialect_encode_request(struct obmf_channel *ch, size_t *len)
 {
 	const struct obmf_dialect *dialect = obmf_dialect(ch->core);
 	struct obmf_core *core = ch->core;
+	size_t cap = min(ch->tx_cap, core->tp->max_tx_msg);
 	ssize_t n;
 
 	if (!dialect || !dialect->encode)
 		return 0;
-	n = dialect->encode(ch, ch->tx_buf, *len,
-			    min(ch->tx_cap, core->tp->max_tx_msg));
+	n = dialect->encode(ch, ch->tx_buf, *len, cap);
 	if (n < 0)
 		return n;
-	/* Only an answer may be dropped */
-	if (WARN_ON_ONCE(!n))
+	/* Only an answer may be dropped; a result past @cap is a bug */
+	if (WARN_ON_ONCE(!n || n > (ssize_t)cap))
 		return -EINVAL;
 	*len = n;
 	return 0;
@@ -115,13 +115,16 @@ int obmf_dialect_encode_answer(struct obmf_channel *ch, u8 *msg, size_t *len)
 {
 	const struct obmf_dialect *dialect = obmf_dialect(ch->core);
 	struct obmf_core *core = ch->core;
+	size_t cap = min(*len, core->tp->max_tx_msg);
 	ssize_t n;
 
 	if (!dialect || !dialect->encode)
 		return 0;
-	n = dialect->encode(ch, msg, *len, min(*len, core->tp->max_tx_msg));
+	n = dialect->encode(ch, msg, *len, cap);
 	if (n < 0)
 		return n;
+	if (WARN_ON_ONCE(n > (ssize_t)cap))
+		return -EINVAL;
 	if (!n)
 		obmf_ch_count(ch, OBMF_CH_RX_DROPPED);
 	*len = n;
@@ -198,7 +201,8 @@ static void obmf_rx_wire_response(struct obmf_channel *ch, const u8 *msg,
 	if (!slot->wire) {
 		n = dialect->decode(ch, msg, len, ch->rx_dec, ch->dec_cap,
 				    slot->cmd, NULL);
-		if (n >= 0 && n < (ssize_t)OBMF_HDR_LEN)
+		if (WARN_ON_ONCE(n > (ssize_t)ch->dec_cap) ||
+		    (n >= 0 && n < (ssize_t)OBMF_HDR_LEN))
 			n = -EPROTO;
 		if (n >= 0) {
 			slot->status = ch->rx_dec[1] & OBMF_HDR_STATUS;
@@ -240,6 +244,7 @@ static void obmf_rx_wire_dreq(struct obmf_channel *ch, const u8 *msg,
 		n = dialect->decode(ch, msg, len, ch->dreq_dec, ch->dec_cap, 0,
 				    NULL);
 		if (n < (ssize_t)OBMF_HDR_LEN ||
+		    WARN_ON_ONCE(n > (ssize_t)ch->dec_cap) ||
 		    !obmf_dreq_len_ok(ch, ch->dreq_dec + OBMF_HDR_LEN,
 				      n - OBMF_HDR_LEN)) {
 			bad = true;
@@ -282,12 +287,13 @@ int obmf_dialect_discover(struct obmf_core *core, struct obmf_channel **found,
 int obmf_dialect_control_update(struct obmf_channel *ch, u8 specific_mask,
 				u8 specific_val)
 {
+	lockdep_assert_held(&ch->core->ch0_lock);
 	return obmf_dialect(ch->core)->ch_reg(ch, OBMF_CH_REG_SPECIFIC_CONTROL,
 					      specific_mask, specific_val,
 					      NULL);
 }
 
-/* Takes ch0_lock */
+/* Takes ch0_lock: every call of the ch_reg op runs under it, reads too */
 int obmf_dialect_status_read(struct obmf_channel *ch, u8 *status, u8 *specific)
 {
 	const struct obmf_dialect *dialect = obmf_dialect(ch->core);
@@ -306,11 +312,17 @@ int obmf_dialect_status_read(struct obmf_channel *ch, u8 *status, u8 *specific)
 #include <kunit/test.h>
 #include <linux/unaligned.h>
 
+#include "obmf-kunit.h"
+
 /*
  * Each member of struct obmf_dialect alone, and the encode/decode pair
  * alone: one run of the same steps on an OBMF-ICP core gives the native
  * values, and on a core with the table only the member's site may
  * differ from them.
+ *
+ * Some cases drive a check the core marks with WARN_ON_ONCE(); each says
+ * how many WARN splats it expects in its comment. Those splats are in
+ * the log of every run of this suite and are not failures.
  */
 
 #define DT_MSG 516
@@ -353,6 +365,8 @@ struct dt_fake {
 	u8 mem[DT_MEM];
 	u8 regs[OBMF_CH_REG_SPECIFIC_CONTROL + 1];
 	u8 status;
+	/* encode or decode reports one byte past its buffer */
+	unsigned int over;
 	int ch0_msgs;
 	u8 req[16];
 	size_t req_len;
@@ -481,34 +495,44 @@ static void dt_stop(struct obmf_transport *tp)
 {
 }
 
+/* The case unbinds a failed core itself */
+static void dt_release(struct obmf_transport *tp)
+{
+}
+
 static const struct obmf_transport_ops dt_ops = {
 	.start = dt_start,
 	.stop = dt_stop,
 	.quiesce = dt_stop,
 	.resume = dt_start,
 	.send = dt_send,
+	.release = dt_release,
 };
 
 static ssize_t dt_encode(struct obmf_channel *ch, u8 *buf, size_t len,
 			 size_t cap)
 {
-	dt_of(ch->core)->encodes++;
+	struct dt_fake *f = dt_of(ch->core);
+
+	f->encodes++;
 	if (len > cap)
 		return -EMSGSIZE;
 	dt_xor(buf, len);
-	return len;
+	return f->over & DT_ENCODE ? cap + 1 : len;
 }
 
 static ssize_t dt_decode(struct obmf_channel *ch, const u8 *in, size_t len,
 			 u8 *out, size_t cap, u8 pending_cmd,
 			 unsigned long *levels)
 {
-	dt_of(ch->core)->decodes++;
+	struct dt_fake *f = dt_of(ch->core);
+
+	f->decodes++;
 	if (len > cap)
 		return -EMSGSIZE;
 	memcpy(out, in, len);
 	dt_xor(out, len);
-	return len;
+	return f->over & DT_DECODE ? cap + 1 : len;
 }
 
 /* The channel the native pass finds, without reading channel 0 */
@@ -630,6 +654,8 @@ static struct dt_fake *dt_bind(struct kunit *test,
 	f->tp.dev = kunit_device_register(test, name);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, f->tp.dev);
 	f->tp.ops = &dt_ops;
+	/* no function driver binds the fake's devices */
+	f->tp.test_names = true;
 	f->tp.max_tx_msg = DT_MSG;
 	f->tp.max_rx_msg = DT_MSG;
 	f->proto.dialect = dialect;
@@ -642,6 +668,8 @@ static struct dt_fake *dt_bind(struct kunit *test,
 			kunit_add_action_or_reset(test, dt_unbind_action, core),
 			0);
 	KUNIT_ASSERT_EQ(test, obmf_core_bind(core), 0);
+	flush_work(&core->bind_work);
+	KUNIT_ASSERT_EQ(test, core->bind_err, 0);
 	return f;
 }
 
@@ -829,8 +857,8 @@ static void dt_keep_ch_limits_with_pair(struct kunit *test)
  * A table with one of encode and decode, with keep_ch_limits but no
  * encode, or with nothing but a name set, is refused and leaves the
  * transport without a dialect; every table of this suite and no table
- * at all are taken. Expected: one WARN for each of the three checks,
- * unless an earlier test has already hit it.
+ * at all are taken. Each of the three checks warns once, inside
+ * obmf_test_warns().
  */
 static void dt_attach(struct kunit *test)
 {
@@ -865,12 +893,16 @@ static void dt_attach(struct kunit *test)
 				    "table %d", i);
 		KUNIT_EXPECT_PTR_EQ(test, tp.dialect, good[i]);
 	}
-	for (i = 0; i < ARRAY_SIZE(bad); i++) {
-		proto.dialect = bad[i];
-		tp.dialect = NULL;
-		KUNIT_EXPECT_EQ_MSG(test, obmf_dialect_attach(&tp, &proto),
-				    -EINVAL, "table %d", i);
-		KUNIT_EXPECT_NULL(test, tp.dialect);
+	obmf_test_warns(test)
+	{
+		for (i = 0; i < ARRAY_SIZE(bad); i++) {
+			proto.dialect = bad[i];
+			tp.dialect = NULL;
+			KUNIT_EXPECT_EQ_MSG(test,
+					    obmf_dialect_attach(&tp, &proto),
+					    -EINVAL, "table %d", i);
+			KUNIT_EXPECT_NULL(test, tp.dialect);
+		}
 	}
 	proto.dialect = NULL;
 	tp.dialect = &dt_pair;
@@ -878,7 +910,7 @@ static void dt_attach(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, tp.dialect);
 }
 
-/* A wire transfer needs the translated receive path; one WARN expected */
+/* A wire transfer needs the translated receive path; it warns */
 static void dt_wire_needs_decode(struct kunit *test)
 {
 	struct dt_fake *f = dt_bind(test, &dt_status_to_errno_only);
@@ -887,11 +919,15 @@ static void dt_wire_needs_decode(struct kunit *test)
 	size_t len = 0;
 
 	dt_hdr(msg, 0, 0, 1);
-	KUNIT_EXPECT_EQ(test,
-			obmf_ch_xfer_wire(f->tp.core->ch0, msg, sizeof(msg),
-					  reply, sizeof(reply), &len,
-					  OBMF_DEFAULT_TIMEOUT_MS),
-			-EINVAL);
+	obmf_test_warns(test)
+	{
+		KUNIT_EXPECT_EQ(test,
+				obmf_ch_xfer_wire(f->tp.core->ch0, msg,
+						  sizeof(msg), reply,
+						  sizeof(reply), &len,
+						  OBMF_DEFAULT_TIMEOUT_MS),
+				-EINVAL);
+	}
 	KUNIT_EXPECT_EQ(test, f->ch0_msgs, sent);
 }
 
@@ -916,6 +952,75 @@ static void dt_info_line(struct kunit *test)
 			   "OBMF-ICP 1.0 device 'dt': I2C ch1 'i2c'");
 }
 
+/*
+ * A dialect result past its buffer is the dialect's bug: the core warns
+ * and uses none of it. A request fails, a response is a protocol error,
+ * a device request is malformed, an answer is not sent. Each of the four
+ * checks warns, in the case's own thread: the answer is encoded here,
+ * not by the work that sends the default answer.
+ */
+static void dt_overrun(struct kunit *test)
+{
+	static const u8 dreq[] = { 0x01, 0x00 };
+	struct dt_fake *f = dt_bind(test, &dt_pair);
+	struct obmf_core *core = f->tp.core;
+	struct obmf_channel *ch = core->chans[1];
+	u8 msg[OBMF_HDR_LEN + sizeof(dreq)];
+	long malformed, answers;
+	size_t len;
+
+	malformed = atomic_long_read(&core->cnt[OBMF_IF_RX_MALFORMED]);
+	obmf_test_warns(test)
+	{
+		f->over = DT_ENCODE;
+		KUNIT_EXPECT_EQ(test,
+				obmf_ch_request(ch, 0x01, NULL, 0, msg,
+						sizeof(msg), &len,
+						OBMF_DEFAULT_TIMEOUT_MS),
+				-EINVAL);
+		f->over = DT_DECODE;
+		KUNIT_EXPECT_EQ(test,
+				obmf_ch_request(ch, 0x01, NULL, 0, msg,
+						sizeof(msg), &len,
+						OBMF_DEFAULT_TIMEOUT_MS),
+				-EPROTO);
+		memcpy(msg + OBMF_HDR_LEN, dreq, sizeof(dreq));
+		dt_deliver(f, msg, dt_hdr(msg, 1, 0, sizeof(dreq)));
+		f->over = 0;
+	}
+	flush_workqueue(core->wq);
+	KUNIT_EXPECT_EQ(test,
+			atomic_long_read(&core->cnt[OBMF_IF_RX_MALFORMED]),
+			malformed + 1);
+
+	/* an answer the dialect overruns is refused, its length kept */
+	memcpy(msg + OBMF_HDR_LEN, dreq, sizeof(dreq));
+	len = dt_hdr(msg, 1, OBMF_HDR_RQRESP, sizeof(dreq));
+	f->over = DT_ENCODE;
+	obmf_test_warns(test)
+	{
+		KUNIT_EXPECT_EQ(test, obmf_dialect_encode_answer(ch, msg, &len),
+				-EINVAL);
+	}
+	f->over = 0;
+	KUNIT_EXPECT_EQ(test, len, OBMF_HDR_LEN + sizeof(dreq));
+
+	/* decoded as it should be; no driver takes it, so the core answers */
+	answers = atomic_long_read(&ch->cnt[OBMF_CH_TX_ANSWERS]);
+	f->ans_len = 0;
+	memcpy(msg + OBMF_HDR_LEN, dreq, sizeof(dreq));
+	dt_deliver(f, msg, dt_hdr(msg, 1, 0, sizeof(dreq)));
+	flush_workqueue(core->wq);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&ch->cnt[OBMF_CH_TX_ANSWERS]),
+			answers + 1);
+	KUNIT_EXPECT_NE(test, f->ans_len, (size_t)0);
+
+	KUNIT_EXPECT_EQ(test,
+			obmf_ch_request(ch, 0x01, NULL, 0, msg, sizeof(msg),
+					&len, OBMF_DEFAULT_TIMEOUT_MS),
+			0);
+}
+
 static struct kunit_case obmf_dialect_cases[] = {
 	KUNIT_CASE(dt_encode_decode),
 	KUNIT_CASE(dt_discover_alone),
@@ -926,6 +1031,7 @@ static struct kunit_case obmf_dialect_cases[] = {
 	KUNIT_CASE(dt_attach),
 	KUNIT_CASE(dt_wire_needs_decode),
 	KUNIT_CASE(dt_info_line),
+	KUNIT_CASE(dt_overrun),
 	{}
 };
 

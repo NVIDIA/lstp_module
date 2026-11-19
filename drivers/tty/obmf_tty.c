@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Serial port on an OBMF-ICP serial channel
  */
@@ -82,8 +82,7 @@ struct obmf_tty_cfg {
  * @tx_since: jiffies of the first try that kept the head
  * @tx_wait: how long a request waits for its answer beyond twice its
  *	time on the wire: OBMF_DEFAULT_TIMEOUT_MS at each open, doubled
- *	after each request that waited that long with no answer, up to
- *	OBMF_MAX_TIMEOUT_MS
+ *	after each request that got no answer, up to OBMF_MAX_TIMEOUT_MS
  * @icount: line counters for TIOCGICOUNT
  * @tx_dropped: bytes dropped after an error or at close
  * @tx_stalls: stalls reported
@@ -134,6 +133,15 @@ static void obmf_tty_put(struct obmf_tty *p)
 DEFINE_FREE(obmf_tty, struct obmf_tty *, obmf_tty_put(_T))
 
 /*
+ * User space gets no -ETIME: a timeout the device reports is -ETIMEDOUT
+ * to it, as no answer is
+ */
+static int obmf_tty_errno(int err)
+{
+	return err == -ETIME ? -ETIMEDOUT : err;
+}
+
+/*
  * Send Operation/Event @ev with the first @n bytes of @req; *@done gets
  * the count the device accepted and *@nack its NACK bit.
  */
@@ -141,7 +149,6 @@ static int obmf_tty_send(struct obmf_tty *p, u8 ev, size_t n, size_t *done,
 			 bool *nack)
 {
 	u8 resp[OBMF_TTY_RESP_LEN];
-	unsigned long start;
 	unsigned int ms;
 	size_t len;
 	u16 acc;
@@ -151,14 +158,11 @@ static int obmf_tty_send(struct obmf_tty *p, u8 ev, size_t n, size_t *done,
 		ms = p->tx_wait;
 	/* Twice the time on the wire, ten bits a character */
 	ms += 2 * DIV_ROUND_UP(n * 10 * MSEC_PER_SEC, p->speed);
-	ms = min(ms, OBMF_MAX_TIMEOUT_MS);
 	put_unaligned_le16(n, p->req);
-	start = jiffies;
 	ret = obmf_request(p->fdev, ev, p->req, 2 + n, resp, sizeof(resp), &len,
 			   ms);
-	/* Only a wait that ran out: a timeout status is an answer in time */
-	if (ret == -ETIMEDOUT &&
-	    time_after_eq(jiffies, start + msecs_to_jiffies(ms))) {
+	/* No answer: a timeout status (-ETIME) is an answer in time */
+	if (ret == -ETIMEDOUT) {
 		guard(spinlock_irqsave)
 			(&p->lock);
 		p->tx_wait = min(2 * p->tx_wait, OBMF_MAX_TIMEOUT_MS);
@@ -211,8 +215,10 @@ static void obmf_tty_warn_stall(struct obmf_tty *p, int ret,
 
 	if (ret == -EBUSY)
 		why = "busy";
+	else if (ret == -ETIME)
+		why = "timeout status";
 	else if (ret)
-		why = "timed out";
+		why = "no answer";
 	dev_warn_ratelimited(&p->fdev->adev.dev,
 			     "transmit stalled: %s, %u characters waiting\n",
 			     why, waiting);
@@ -245,7 +251,7 @@ static int obmf_tty_tx_one(struct obmf_tty *p)
 {
 	bool drop = false, stall, wake, nack;
 	int next = OBMF_TTY_TX_MORE;
-	size_t n, done = 0, closed;
+	size_t n, taken = 0, closed;
 	unsigned int waiting;
 	int ret;
 
@@ -259,35 +265,36 @@ static int obmf_tty_tx_one(struct obmf_tty *p)
 	if (!n)
 		return OBMF_TTY_TX_IDLE;
 
-	ret = obmf_tty_send(p, 0, n, &done, &nack);
+	ret = obmf_tty_send(p, 0, n, &taken, &nack);
 	if (ret == -EAGAIN) {
 		/* Quiesced core: obmf_tty_resume() sends the bytes */
 		next = OBMF_TTY_TX_IDLE;
-	} else if (ret == -ETIMEDOUT || ret == -EBUSY || (!ret && !done)) {
+	} else if (ret == -ETIMEDOUT || ret == -ETIME || ret == -EBUSY ||
+		   (!ret && !taken)) {
 		next = OBMF_TTY_TX_RETRY;
 	} else if (ret) {
 		drop = true;
-		done = n;
+		taken = n;
 	}
 
 	scoped_guard(spinlock_irqsave, &p->lock) {
 		p->tx_inflight = 0;
-		wake = done || p->tx_flush;
+		wake = taken || p->tx_flush;
 		stall = obmf_tty_stalled(p, next == OBMF_TTY_TX_RETRY);
-		closed = p->tx_flush_drop ? p->tx_flush_drop - done : 0;
+		closed = p->tx_flush_drop ? p->tx_flush_drop - taken : 0;
 		p->tx_dropped += closed;
-		kfifo_skip_count(&p->fifo, p->tx_flush ?: done);
+		kfifo_skip_count(&p->fifo, p->tx_flush ?: taken);
 		p->tx_flush = 0;
 		p->tx_flush_drop = 0;
 		if (drop)
-			p->tx_dropped += done;
+			p->tx_dropped += taken;
 		else
-			p->icount.tx += done;
+			p->icount.tx += taken;
 		waiting = kfifo_len(&p->fifo);
 	}
 	/* -ENODEV: the device is gone and every write fails */
 	if (drop && ret != -ENODEV)
-		obmf_fdev_report(p->fdev, OBMF_EV_TX_DROPPED, done, ret);
+		obmf_fdev_report(p->fdev, OBMF_EV_TX_DROPPED, taken, ret);
 	if (stall)
 		obmf_tty_warn_stall(p, ret, waiting);
 	if (closed)
@@ -386,7 +393,7 @@ static int obmf_tty_break_ctl(struct tty_struct *tty, int state)
 {
 	struct obmf_tty *p = tty->driver_data;
 	unsigned int tries;
-	size_t done;
+	size_t taken;
 	bool nack;
 	int ret;
 
@@ -399,10 +406,10 @@ static int obmf_tty_break_ctl(struct tty_struct *tty, int state)
 			if (!p->fdev)
 				return -ENODEV;
 			ret = obmf_tty_send(p, OBMF_TTY_EV_GENERATE_BREAK, 0,
-					    &done, &nack);
+					    &taken, &nack);
 		}
 		if (ret || !nack)
-			return ret;
+			return obmf_tty_errno(ret);
 	}
 	return -EIO;
 }
@@ -737,7 +744,7 @@ static int obmf_tty_probe(struct auxiliary_device *adev,
 	if (!req)
 		return -ENOMEM;
 
-	struct obmf_tty *p __free(obmf_tty) = kzalloc_obj(*p);
+	struct obmf_tty *p __free(obmf_tty) = kzalloc_obj(*p, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
 	tty_port_init(&p->port);

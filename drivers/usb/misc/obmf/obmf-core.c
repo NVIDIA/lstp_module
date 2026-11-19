@@ -25,14 +25,18 @@
 #include "obmf-core.h"
 #include "obmf-dialect.h"
 
-/* OBMF-ICP 1.0.0, 5.2, Table 4 and the channel-specific tables */
+/*
+ * OBMF-ICP 1.0.0, 5.2, Table 4 and the channel-specific tables. A timeout
+ * the device reports is -ETIME, so that it differs from -ETIMEDOUT, the
+ * host's wait for the answer running out.
+ */
 static int obmf_status_errno(u8 type, u8 status)
 {
 	switch (status) {
 	case OBMF_STATUS_SUCCESS:
 		return 0;
 	case OBMF_STATUS_TIMEOUT:
-		return -ETIMEDOUT;
+		return -ETIME;
 	case OBMF_STATUS_BUSY:
 		return -EBUSY;
 	case OBMF_STATUS_UNKNOWN_CHANNEL:
@@ -50,7 +54,7 @@ static int obmf_status_errno(u8 type, u8 status)
 	case OBMF_TYPE_I2C_CONTROLLER:
 		switch (status) {
 		case OBMF_STATUS_I2C_TIMEOUT:
-			return -ETIMEDOUT;
+			return -ETIME;
 		case OBMF_STATUS_I2C_ARB_LOST:
 			return -EAGAIN;
 		case OBMF_STATUS_I2C_BUS_BUSY:
@@ -62,7 +66,7 @@ static int obmf_status_errno(u8 type, u8 status)
 	case OBMF_TYPE_I3C:
 		switch (status) {
 		case OBMF_STATUS_I3C_TIMEOUT:
-			return -ETIMEDOUT;
+			return -ETIME;
 		case OBMF_STATUS_I3C_ARB_LOST:
 			return -EAGAIN;
 		case OBMF_STATUS_I3C_BUS_BUSY:
@@ -73,7 +77,7 @@ static int obmf_status_errno(u8 type, u8 status)
 		break;
 	case OBMF_TYPE_SERIAL:
 		if (status == OBMF_STATUS_SERIAL_LINE_TIMEOUT)
-			return -ETIMEDOUT;
+			return -ETIME;
 		break;
 	case OBMF_TYPE_GPIO:
 		switch (status) {
@@ -226,8 +230,9 @@ static void obmf_core_fail_work(struct work_struct *work)
 }
 
 /*
- * Every state edge writes the state, then takes each slot's rx_lock, so a
- * waiter that armed its slot before the edge is seen by @err. An edge to a
+ * Every state edge writes the state, wakes @state_wq, then takes each
+ * slot's rx_lock, so a waiter that armed its slot before the edge is seen
+ * by @err. An edge to a
  * state that fails requests also ends a hold of obmf_slot_wait_late().
  */
 static void obmf_core_wake(struct obmf_core *core, int err)
@@ -236,6 +241,7 @@ static void obmf_core_wake(struct obmf_core *core, int err)
 	struct obmf_channel *ch;
 	int i;
 
+	wake_up_all(&core->state_wq);
 	for (i = 0; i < OBMF_NR_CHANNELS; i++) {
 		ch = core->ch0;
 		if (i) {
@@ -430,7 +436,7 @@ struct obmf_channel *obmf_ch_alloc(struct obmf_core *core, u8 number,
 				   size_t max_req, size_t max_resp,
 				   size_t rx_cap)
 {
-	struct obmf_channel *ch __free(obmf_ch) = kzalloc_obj(*ch);
+	struct obmf_channel *ch __free(obmf_ch) = kzalloc_obj(*ch, GFP_KERNEL);
 	const struct obmf_dialect *dialect = obmf_dialect(core);
 	struct obmf_transport *tp = core->tp;
 	struct obmf_dreq_rec *rec;
@@ -585,7 +591,8 @@ proto:
 /*
  * A device that stops answering during a software unbind would hold every
  * function driver's remove for a timeout per request or answer: the first
- * timeout stops the core instead.
+ * timeout stops the core instead. One function driver's unbind leaves the
+ * core live, and each of its requests ends on its own timeout.
  */
 static void obmf_core_timed_out(struct obmf_core *core)
 {
@@ -737,14 +744,20 @@ int obmf_ch_request(struct obmf_channel *ch, u8 cmd, const void *req,
  *	after the MMIO head where the device sends one
  * @resp_cap: size of @resp; on MMIO the length of every response
  * @resp_len: length of the response, or NULL if it must be @resp_cap
- * @timeout_ms: response wait, 0 for the default
+ * @timeout_ms: response wait, 0 for the default, capped at
+ *	%OBMF_MAX_TIMEOUT_MS
  *
  * After a response timeout on the channel, the next request is sent once
  * the late response comes or %OBMF_DEFAULT_TIMEOUT_MS after the timeout,
- * so it can take longer than @timeout_ms.
+ * so it can take longer than @timeout_ms. A request also waits for the
+ * one in flight on its channel, as the channel carries one at a time.
+ * Beyond these, it waits for no other channel's request: it ends within
+ * its own wait whatever the device and the other channels do, also in
+ * its driver's unbind, and an earlier timeout fails no later request.
  *
- * Sleeps. Returns 0, the errno of a nonzero response status, -ETIMEDOUT,
- * -EMSGSIZE for a request above the channel's limit, -EPROTO for a
+ * Sleeps. Returns 0, the errno of a nonzero response status (-ETIME for
+ * a timeout the device reports), -ETIMEDOUT when no response came in
+ * time, -EMSGSIZE for a request above the channel's limit, -EPROTO for a
  * malformed response, -EAGAIN while the device is suspended, -EIO after a
  * transport error stopped it, or -ENODEV once it is gone.
  */
@@ -816,11 +829,17 @@ static int obmf_answer_xmit(struct obmf_channel *ch, u8 cmd, u8 status,
 	size_t plen = len + echo;
 	size_t mlen = OBMF_HDR_LEN + plen;
 	struct obmf_hdr *hdr;
-	int ret;
+	int state, ret;
 
 	if (plen > ch->info.max_req)
 		return -EMSGSIZE;
-	if (READ_ONCE(core->state) == OBMF_STOPPING)
+	/*
+	 * No answer starts once the core stops: the channel works run until
+	 * after the transport's stop. One that passed this check just before
+	 * reaches the transport, which refuses it.
+	 */
+	state = READ_ONCE(core->state);
+	if (state == OBMF_STOPPING || state == OBMF_STOPPED)
 		return -ENODEV;
 
 	u8 *msg __free(kfree) = kmalloc(mlen, GFP_KERNEL);
@@ -1033,7 +1052,7 @@ static void obmf_dreq_deliver(struct obmf_channel *ch,
 			      struct obmf_dreq_rec *rec)
 {
 	int ret = -ENODEV;
-	bool done;
+	bool answered;
 
 	scoped_guard(mutex, &ch->dispatch_lock) {
 		if (ch->ops && ch->ops->device_request)
@@ -1042,20 +1061,20 @@ static void obmf_dreq_deliver(struct obmf_channel *ch,
 	}
 
 	scoped_guard(spinlock_irqsave, &ch->dreq_lock) {
-		done = rec->done;
-		if (ret == -EINPROGRESS && !done) {
+		answered = rec->done;
+		if (ret == -EINPROGRESS && !answered) {
 			rec->kept = true;
 			list_add_tail(&rec->node, &ch->kept);
 			return;
 		}
 	}
-	if (!done && rec->dreq.answer_due) {
+	if (!answered && rec->dreq.answer_due) {
 		if (!ret)
 			dev_warn_once(ch->core->dev,
 				      "channel %u: request not answered\n",
 				      ch->info.number);
 		obmf_default_answer(ch, rec->dreq.cmd);
-	} else if (!done && ret) {
+	} else if (!answered && ret) {
 		/* A datagram no driver took */
 		obmf_ch_count(ch, OBMF_CH_RX_DROPPED);
 	}
@@ -1277,9 +1296,12 @@ static void obmf_core_free(struct obmf_core *core)
 
 DEFINE_FREE(obmf_core, struct obmf_core *, obmf_core_free(_T))
 
+static void obmf_core_bind_work(struct work_struct *work);
+
 struct obmf_core *obmf_core_create(struct obmf_transport *tp)
 {
-	struct obmf_core *core __free(obmf_core) = kzalloc_obj(*core);
+	struct obmf_core *core __free(obmf_core) =
+		kzalloc_obj(*core, GFP_KERNEL);
 	const struct obmf_dialect *dialect;
 	size_t resp, cap;
 
@@ -1291,6 +1313,7 @@ struct obmf_core *obmf_core_create(struct obmf_transport *tp)
 	core->state = OBMF_INIT;
 	spin_lock_init(&core->inflight_lock);
 	init_waitqueue_head(&core->inflight_wq);
+	init_waitqueue_head(&core->state_wq);
 	mutex_init(&core->ch0_lock);
 
 	/* OBMF-ICP 1.0.0, 5.15: channel 0 takes at least 64-byte payloads */
@@ -1303,6 +1326,7 @@ struct obmf_core *obmf_core_create(struct obmf_transport *tp)
 	if (!core->wq)
 		return NULL;
 	INIT_WORK(&core->fail_work, obmf_core_fail_work);
+	INIT_WORK(&core->bind_work, obmf_core_bind_work);
 	resp = core->ch0_chunk;
 	cap = core->ch0_chunk + OBMF_HDR_LEN;
 	dialect = obmf_dialect(core);
@@ -1389,24 +1413,97 @@ void obmf_core_info(struct obmf_core *core, char *buf)
 		scnprintf(buf + len, OBMF_INFO_LEN - len, " and %d more", more);
 }
 
+/**
+ * obmf_bind_warn - log a configuration anomaly found by the bind work
+ * @core: the core
+ * @fmt: printf format
+ *
+ * A device may list 255 channels, each with its anomaly: the first
+ * OBMF_BIND_WARN_MAX of a bind work run are logged, the others only
+ * counted, and the run ends with how many it left out. Only the bind
+ * work calls this, one run at a time, so the count takes no lock.
+ */
+void obmf_bind_warn(struct obmf_core *core, const char *fmt, ...)
+{
+	struct va_format vaf;
+	va_list args;
+
+	if (core->bind_warns++ >= OBMF_BIND_WARN_MAX)
+		return;
+	va_start(args, fmt);
+	vaf.fmt = fmt;
+	vaf.va = &args;
+	dev_warn(core->dev, "%pV", &vaf);
+	va_end(args);
+}
+
+/*
+ * A core that failed before its function devices were added gives the
+ * device up, once. The bind work and resume never run at once: quiesce
+ * waits for the bind work, and resume queues it only out of QUIESCED.
+ */
+static void obmf_core_release(struct obmf_core *core)
+{
+	if (core->added || core->released ||
+	    READ_ONCE(core->state) != OBMF_FAILED)
+		return;
+	core->released = true;
+	core->tp->ops->release(core->tp);
+}
+
+/*
+ * Discovery, the channel table and the function devices, out of probe: a
+ * device can take seconds to answer. Unbind and suspend end a discovery
+ * in progress by moving the core out of INIT, then wait for this work; a
+ * resume runs it again, past a table already published. A discovery that
+ * fails leaves the core failed, with no function device, and the transport
+ * gives the device up, so that a new plug or bind runs it again.
+ */
+static void obmf_core_bind_work(struct work_struct *work)
+{
+	struct obmf_core *core =
+		container_of(work, struct obmf_core, bind_work);
+	char info[OBMF_INFO_LEN];
+	int ret = 0;
+
+	core->bind_warns = 0;
+	if (!core->table) {
+		ret = obmf_ctrl_discover(core);
+		if (!ret)
+			obmf_bus_publish(core);
+	}
+	if (!ret && !obmf_core_move(core, OBMF_INIT, OBMF_LIVE, 0))
+		ret = obmf_state_errno(READ_ONCE(core->state));
+	core->bind_err = ret;
+	if (ret) {
+		obmf_core_move(core, OBMF_INIT, OBMF_FAILED, 0);
+		/*
+		 * Not when an unbind or a suspend ended discovery; nothing
+		 * leaves FAILED while this work runs
+		 */
+		obmf_core_release(core);
+	} else {
+		core->added = true;
+		obmf_debugfs_add(core);
+		obmf_bus_add(core);
+		obmf_core_info(core, info);
+		dev_info(core->dev, "%s\n", info);
+	}
+	if (core->bind_warns > OBMF_BIND_WARN_MAX)
+		dev_warn(core->dev,
+			 "%u more configuration warnings not logged\n",
+			 core->bind_warns - OBMF_BIND_WARN_MAX);
+}
+
+/* Starts the transport; the bind work does the rest, after probe */
 int obmf_core_bind(struct obmf_core *core)
 {
-	char info[OBMF_INFO_LEN];
 	int ret;
 
 	ret = core->tp->ops->start(core->tp);
 	if (ret)
 		return ret;
-	ret = obmf_ctrl_discover(core);
-	if (ret)
-		return ret;
-	obmf_bus_publish(core);
-	if (!obmf_core_move(core, OBMF_INIT, OBMF_LIVE, 0))
-		return -EIO;
-	obmf_debugfs_add(core);
-	obmf_bus_add(core);
-	obmf_core_info(core, info);
-	dev_info(core->dev, "%s\n", info);
+	queue_work(core->wq, &core->bind_work);
 	return 0;
 }
 
@@ -1444,10 +1541,13 @@ static void obmf_core_disable_works(struct obmf_core *core)
  *
  * A software unbind of a live core removes the function devices while
  * the transport still works, so their drivers can switch their channels
- * off; otherwise the transport stops first.
+ * off; otherwise the transport stops first. A discovery in progress ends
+ * at its next request, and the bind work is waited for first.
  */
 void obmf_core_unbind(struct obmf_core *core, bool attached)
 {
+	obmf_core_move(core, OBMF_INIT, OBMF_STOPPING, -ENODEV);
+	disable_work_sync(&core->bind_work);
 	if (attached && obmf_core_move(core, OBMF_LIVE, OBMF_UNBINDING, 0)) {
 		obmf_bus_del(core);
 		obmf_core_stop(core);
@@ -1495,10 +1595,14 @@ static void obmf_core_enable_works(struct obmf_core *core)
 
 /*
  * Device requests that arrive while quiesced stay queued and are
- * delivered at resume; a request from a function driver fails -EAGAIN.
+ * delivered at resume; a request from a function driver fails -EAGAIN. A
+ * discovery in progress ends at its next request and runs again at
+ * resume.
  */
 int obmf_core_quiesce(struct obmf_core *core)
 {
+	obmf_core_move(core, OBMF_INIT, OBMF_QUIESCED, -EAGAIN);
+	flush_work(&core->bind_work);
 	obmf_core_disable_works(core);
 	if (obmf_core_move(core, OBMF_LIVE, OBMF_QUIESCED, 0))
 		obmf_core_drain_slots(core);
@@ -1513,10 +1617,17 @@ int obmf_core_resume(struct obmf_core *core)
 	ret = core->tp->ops->resume(core->tp);
 	if (ret) {
 		obmf_core_fatal(core, ret);
-		return ret;
-	}
-	/* A failed core keeps its works disabled; unbind frees what is queued */
-	if (obmf_core_move(core, OBMF_QUIESCED, OBMF_LIVE, 0))
+	} else if (obmf_core_move(core, OBMF_QUIESCED,
+				  core->added ? OBMF_LIVE : OBMF_INIT, 0)) {
 		obmf_core_enable_works(core);
-	return 0;
+		if (!core->added)
+			queue_work(core->wq, &core->bind_work);
+		return 0;
+	}
+	/*
+	 * A failed core keeps its works disabled; unbind frees what is queued.
+	 * One whose discovery the suspend ended gives the device up here.
+	 */
+	obmf_core_release(core);
+	return ret;
 }

@@ -35,6 +35,52 @@ config OBMF_LSTP
 
 	  If unsure, say N.
 
+# The function drivers. Their sources keep their kernel tree places
+# (drivers/i2c/busses, drivers/tty, drivers/gpio, drivers/spi); a kernel
+# tree that takes them moves each entry to that directory's Kconfig.
+
+config I2C_OBMF
+	tristate "I2C controller on an OBMF-ICP channel"
+	depends on USB_OBMF && I2C
+	help
+	  An I2C adapter for each I2C controller channel of an OBMF-ICP
+	  device.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called i2c-obmf.
+
+config OBMF_TTY
+	tristate "Serial port on an OBMF-ICP channel"
+	depends on USB_OBMF && TTY
+	help
+	  A tty, /dev/ttyOBMF<n>, for each serial channel of an OBMF-ICP
+	  device.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called obmf_tty.
+
+config GPIO_OBMF
+	tristate "GPIO lines on an OBMF-ICP channel"
+	depends on USB_OBMF && GPIOLIB
+	select GPIOLIB_IRQCHIP
+	help
+	  A GPIO chip, with interrupts, for each GPIO channel of an
+	  OBMF-ICP device.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called gpio-obmf.
+
+config SPI_OBMF
+	tristate "SPI controller on an OBMF-ICP channel"
+	depends on USB_OBMF && SPI_MASTER
+	help
+	  An SPI controller for each SPI controller channel of an
+	  OBMF-ICP device. The board's device tree or ACPI tables
+	  describe the SPI devices on it.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called spi-obmf.
+
 config OBMF_KUNIT_TEST
 	bool "KUnit tests for OBMF-ICP over USB" if !KUNIT_ALL_TESTS
 	depends on USB_OBMF && KUNIT

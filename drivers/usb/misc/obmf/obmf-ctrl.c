@@ -215,16 +215,17 @@ static int obmf_discover_channel(struct obmf_core *core,
 	head = obmf_type_head(h.channel_type);
 
 	if (h.channel_number != nr) {
-		dev_warn(dev, "channel %d: header gives number %u, ignored\n",
-			 nr, h.channel_number);
+		obmf_bind_warn(core,
+			       "channel %d: header gives number %u, ignored\n",
+			       nr, h.channel_number);
 		return 0;
 	}
 	if (off < hdr_end || cfg > OBMF_CONFIG_MAX ||
 	    check_add_overflow(off, sizeof(h) + cfg, &end) ||
 	    *total + cfg > OBMF_CONFIG_TOTAL ||
 	    obmf_overlaps(found, nr, off, sizeof(h) + cfg)) {
-		dev_warn(dev, "channel %d: bad layout at %#x, ignored\n", nr,
-			 off);
+		obmf_bind_warn(core, "channel %d: bad layout at %#x, ignored\n",
+			       nr, off);
 		return 0;
 	}
 	/*
@@ -232,13 +233,14 @@ static int obmf_discover_channel(struct obmf_core *core,
 	 * at most the limit less a header, accept up to the limit plus one.
 	 */
 	if (max_req < OBMF_HDR_LEN + head || max_resp < OBMF_HDR_LEN + head) {
-		dev_warn(dev, "channel %d: limits %zu/%zu too small, ignored\n",
-			 nr, max_req, max_resp);
+		obmf_bind_warn(core,
+			       "channel %d: limits %zu/%zu too small, ignored\n",
+			       nr, max_req, max_resp);
 		return 0;
 	}
 	why = obmf_ch_unusable(&h);
 	if (why) {
-		dev_warn(dev, "channel %d: %s, ignored\n", nr, why);
+		obmf_bind_warn(core, "channel %d: %s, ignored\n", nr, why);
 		return 0;
 	}
 
@@ -299,7 +301,7 @@ static int obmf_discover_pass(struct obmf_core *core,
 	}
 
 	n = dh.num_of_channels;
-	__le32 *offs __free(kfree) = kzalloc_objs(*offs, n);
+	__le32 *offs __free(kfree) = kzalloc_objs(*offs, n, GFP_KERNEL);
 	if (!offs)
 		return -ENOMEM;
 	hdr_end = OBMF_CH0_OFFSETS + n * sizeof(*offs);
@@ -337,7 +339,8 @@ static int obmf_discover_pass(struct obmf_core *core,
 
 /*
  * Before another pass, wait until a response timeout passes without a
- * response arriving late or for an unknown channel.
+ * response arriving late or for an unknown channel. An unbind or a
+ * suspend ends the wait at once.
  */
 static void obmf_discover_settle(struct obmf_core *core, unsigned long deadline)
 {
@@ -347,9 +350,10 @@ static void obmf_discover_settle(struct obmf_core *core, unsigned long deadline)
 
 	do {
 		seen = atomic_long_read(late) + atomic_long_read(stray);
-		msleep(OBMF_DEFAULT_TIMEOUT_MS);
+		wait_event_timeout(core->state_wq, !obmf_core_discovering(core),
+				   msecs_to_jiffies(OBMF_DEFAULT_TIMEOUT_MS));
 	} while (seen != atomic_long_read(late) + atomic_long_read(stray) &&
-		 time_before(jiffies, deadline));
+		 obmf_core_discovering(core) && time_before(jiffies, deadline));
 }
 
 /*
@@ -382,12 +386,14 @@ static void obmf_discover_health(struct obmf_core *core)
 
 /*
  * A reply left from an earlier binding fails a read's checks or makes
- * the next read time out; a device header that changed means the
- * device was still settling. Such a pass is discarded and run again.
+ * the next read time out; a device header that changed, or a timeout
+ * the device reports, means the device was still settling. Such a pass
+ * is discarded and run again.
  */
 static bool obmf_discover_again(int ret)
 {
-	return ret == -ETIMEDOUT || ret == -EPROTO || ret == -EAGAIN;
+	return ret == -ETIMEDOUT || ret == -ETIME || ret == -EPROTO ||
+	       ret == -EAGAIN;
 }
 
 int obmf_ctrl_discover(struct obmf_core *core)
@@ -395,7 +401,7 @@ int obmf_ctrl_discover(struct obmf_core *core)
 	const struct obmf_dialect *dialect = obmf_dialect(core);
 	unsigned long deadline = jiffies + msecs_to_jiffies(OBMF_DISCOVERY_MS);
 	struct obmf_channel **found __free(kfree) =
-		kzalloc_objs(*found, OBMF_NR_CHANNELS);
+		kzalloc_objs(*found, OBMF_NR_CHANNELS, GFP_KERNEL);
 	int pass, i, ret = 0;
 
 	BUILD_BUG_ON(sizeof(struct obmf_ch0_hdr) != OBMF_CH0_OFFSETS);
@@ -433,7 +439,7 @@ int obmf_ctrl_discover(struct obmf_core *core)
 			obmf_ch_free(found[i]);
 			found[i] = NULL;
 		}
-		if (!obmf_discover_again(ret))
+		if (!obmf_discover_again(ret) || !obmf_core_discovering(core))
 			break;
 		dev_dbg(core->dev, "discovery pass %d failed: %pe, again\n",
 			pass + 1, ERR_PTR(ret));
@@ -443,7 +449,9 @@ int obmf_ctrl_discover(struct obmf_core *core)
 		}
 	}
 
-	if (ret == -EAGAIN) {
+	if (ret && !obmf_core_discovering(core)) {
+		dev_dbg(core->dev, "discovery stopped: %pe\n", ERR_PTR(ret));
+	} else if (ret == -EAGAIN) {
 		dev_err(core->dev, "channel 0 changed during discovery\n");
 		ret = -EIO;
 	} else if (ret) {
@@ -492,6 +500,8 @@ int obmf_ch_status_read(struct obmf_fdev *fdev, u8 *status, u8 *specific)
  *	the register, 0 in @specific_val for one not meant, as a device may
  *	read it back as written
  * @specific_val: their new values
+ *
+ * A @specific_mask of 0 changes nothing: nothing is read or written.
  */
 int obmf_ch_control_update(struct obmf_fdev *fdev, u8 specific_mask,
 			   u8 specific_val)
@@ -504,6 +514,8 @@ int obmf_ch_control_update(struct obmf_fdev *fdev, u8 specific_mask,
 	u8 val;
 	int ret;
 
+	if (!specific_mask)
+		return 0;
 	guard(mutex)(&core->ch0_lock);
 	if (dialect && dialect->ch_reg)
 		return obmf_dialect_control_update(ch, specific_mask,

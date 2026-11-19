@@ -3,7 +3,9 @@
  * OBMF-ICP over USB: the USB transport
  *
  * One OBMF-ICP message per bulk transfer in each direction. Two bulk IN
- * transfers are kept queued; one bulk OUT transfer is in flight at a time.
+ * transfers are kept queued. Each send submits its own bulk OUT transfer
+ * and waits for it: the channels are independent (OBMF-ICP over USB 1.0,
+ * 6), and the endpoint's queue keeps the transfers in order.
  */
 
 #include <linux/bitops.h>
@@ -15,9 +17,10 @@
 #include <linux/jiffies.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
-#include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/usb.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include "obmf-core.h"
@@ -57,6 +60,7 @@ enum {
 	OBMF_USB_STOPPED,
 	OBMF_USB_QUIESCED,
 	OBMF_USB_STALL_IN,
+	OBMF_USB_STALL_OUT,
 	OBMF_USB_FAILED,
 };
 
@@ -82,17 +86,23 @@ struct obmf_usb_fault {
  * @rx_urb: bulk IN transfers
  * @rx_len: size of each bulk IN buffer
  * @rx_idle: bit per bulk IN transfer not queued
- * @tx_urb: the bulk OUT transfer
  * @zlp: a zero-length packet ends a bulk OUT message that fills its last
  *	packet
- * @tx_lock: one bulk OUT transfer at a time
- * @tx_done: @tx_urb completed
- * @recover: resubmits bulk IN after a stall, a transient error or a failed
- *	submission
+ * @tx_anchor: the bulk OUT transfers submitted and not completed
+ * @send_lock: a send's check of @flags, its count and its submission,
+ *	against the stop, the quiesce and the end of a bulk OUT halt
+ * @tx_count: sends past that check and not returned
+ * @tx_idle: woken when @tx_count drops to 0
+ * @recover: clears a bulk OUT halt; resubmits bulk IN after a stall, a
+ *	transient error or a failed submission
  * @errors: consecutive bulk IN errors
+ * @out_errors: consecutive failed clears of a bulk OUT halt, in @recover
  * @flags: OBMF_USB_*
  * @fail_in: fault injection on bulk IN
  * @fail_out: fault injection on bulk OUT
+ * @release: the release after a failed discovery, allocated at probe so
+ *	that it cannot fail
+ * @released: @release is queued and frees itself
  */
 struct obmf_usb {
 	struct obmf_transport tp;
@@ -103,16 +113,33 @@ struct obmf_usb {
 	struct urb *rx_urb[OBMF_USB_RX_URBS];
 	size_t rx_len;
 	unsigned long rx_idle;
-	struct urb *tx_urb;
 	bool zlp;
-	struct mutex tx_lock; /* tx_urb */
-	struct completion tx_done;
+	struct usb_anchor tx_anchor;
+	spinlock_t send_lock; /* tx_count */
+	unsigned int tx_count;
+	wait_queue_head_t tx_idle;
 	struct delayed_work recover;
 	atomic_t errors;
+	unsigned int out_errors;
 	unsigned long flags;
 	struct obmf_usb_fault fail_in;
 	struct obmf_usb_fault fail_out;
+	struct obmf_usb_release *release;
+	bool released;
 };
+
+/*
+ * The release of an interface whose discovery failed. It takes the USB
+ * device's lock, which every unbind holds while it waits for the bind
+ * work, so it runs from obmf_usb_wq with its own interface reference.
+ */
+struct obmf_usb_release {
+	struct work_struct work;
+	struct usb_interface *intf;
+};
+
+static struct workqueue_struct *obmf_usb_wq;
+static struct usb_driver obmf_usb_driver;
 
 static struct obmf_usb *to_obmf_usb(struct obmf_transport *tp)
 {
@@ -168,16 +195,22 @@ static void obmf_usb_fault(struct obmf_usb_fault *f, struct urb *urb)
 }
 #endif
 
-/* Count a bulk IN error; below the bound, try again a little later */
-static void obmf_usb_retry(struct obmf_usb *u)
+/* Below the bound of @errors in a row, try again a little later */
+static void obmf_usb_retry_after(struct obmf_usb *u, unsigned int errors)
 {
-	if (atomic_inc_return(&u->errors) < OBMF_USB_MAX_ERRORS) {
+	if (errors < OBMF_USB_MAX_ERRORS) {
 		mod_delayed_work(system_dfl_wq, &u->recover,
 				 msecs_to_jiffies(OBMF_USB_RETRY_MS));
 		return;
 	}
 	if (!test_and_set_bit(OBMF_USB_FAILED, &u->flags))
 		obmf_core_fatal(u->tp.core, -EIO);
+}
+
+/* Count a bulk IN error */
+static void obmf_usb_retry(struct obmf_usb *u)
+{
+	obmf_usb_retry_after(u, atomic_inc_return(&u->errors));
 }
 
 static void obmf_usb_rx_submit(struct obmf_usb *u, int i, gfp_t gfp)
@@ -199,6 +232,7 @@ static void obmf_usb_rx_submit(struct obmf_usb *u, int i, gfp_t gfp)
 	obmf_usb_retry(u);
 }
 
+/* Every completion is one of ours: the last URB if none of the others */
 static int obmf_usb_rx_index(struct obmf_usb *u, struct urb *urb)
 {
 	int i;
@@ -248,12 +282,46 @@ static void obmf_usb_rx_complete(struct urb *urb)
 	obmf_usb_rx_submit(u, i, GFP_ATOMIC);
 }
 
+/*
+ * OBMF-ICP over USB 1.0, 8.2: clear a bulk OUT halt. Sends fail with
+ * -EPIPE from the stall until the clear succeeds, and the transfers
+ * queued behind the stalled one are cancelled first, so the endpoint is
+ * idle while its halt is cleared. A failed clear is tried again on its
+ * own count: a bulk IN that works does not reset it.
+ */
+static void obmf_usb_clear_out(struct obmf_usb *u)
+{
+	int ret;
+
+	/* Wait for a send that checked the flags before the stall */
+	spin_lock(&u->send_lock);
+	spin_unlock(&u->send_lock);
+	usb_poison_anchored_urbs(&u->tx_anchor);
+	WARN_ON_ONCE(!usb_anchor_empty(&u->tx_anchor));
+	ret = usb_clear_halt(u->udev, u->out_pipe);
+	usb_unpoison_anchored_urbs(&u->tx_anchor);
+	if (ret) {
+		if (ret != -ENODEV)
+			obmf_report(u->tp.core, &u->intf->dev,
+				    OBMF_EV_OUT_CLEAR_HALT, -1, ret, 0);
+		obmf_count(u->tp.core, OBMF_IF_TX_URB_ERRORS);
+		obmf_usb_retry_after(u, ++u->out_errors);
+		return;
+	}
+	u->out_errors = 0;
+	scoped_guard(spinlock, &u->send_lock)
+		clear_bit(OBMF_USB_STALL_OUT, &u->flags);
+}
+
 static void obmf_usb_recover(struct work_struct *work)
 {
 	struct obmf_usb *u =
 		container_of(to_delayed_work(work), struct obmf_usb, recover);
 	int i, ret;
 
+	if (test_bit(OBMF_USB_STALL_OUT, &u->flags) &&
+	    !test_bit(OBMF_USB_FAILED, &u->flags))
+		obmf_usb_clear_out(u);
 	if (test_bit(OBMF_USB_FAILED, &u->flags))
 		return;
 	if (test_and_clear_bit(OBMF_USB_STALL_IN, &u->flags)) {
@@ -275,19 +343,36 @@ static void obmf_usb_recover(struct work_struct *work)
 			obmf_usb_rx_submit(u, i, GFP_KERNEL);
 }
 
+/* One send's bulk OUT transfer, on the sender's stack */
+struct obmf_usb_tx {
+	struct obmf_usb *u;
+	struct completion done;
+};
+
 static void obmf_usb_tx_complete(struct urb *urb)
 {
-	struct obmf_usb *u = urb->context;
+	struct obmf_usb_tx *tx = urb->context;
+	struct obmf_usb *u = tx->u;
 
 	obmf_usb_fault(&u->fail_out, urb);
-	complete(&u->tx_done);
+	/* Set before the sender wakes: no later send reaches the endpoint */
+	if (urb->status == -EPIPE)
+		set_bit(OBMF_USB_STALL_OUT, &u->flags);
+	complete(&tx->done);
 }
 
-static int obmf_usb_tx_status(struct obmf_usb *u, size_t len)
+/*
+ * A transfer that another path cancelled, or refused at submission: the
+ * stop, or the clear of a bulk OUT halt
+ */
+static int obmf_usb_tx_cancelled(struct obmf_usb *u)
 {
-	struct urb *urb = u->tx_urb;
+	return test_bit(OBMF_USB_STOPPED, &u->flags) ? -ENODEV : -EPIPE;
+}
+
+static int obmf_usb_tx_status(struct obmf_usb *u, struct urb *urb, size_t len)
+{
 	struct obmf_core *core = u->tp.core;
-	int ret;
 
 	switch (urb->status) {
 	case 0:
@@ -299,15 +384,10 @@ static int obmf_usb_tx_status(struct obmf_usb *u, size_t len)
 	case -EPIPE:
 		obmf_count(core, OBMF_IF_STALLS);
 		obmf_report(core, &u->intf->dev, OBMF_EV_OUT_STALL, -1, 0, 0);
-		ret = usb_clear_halt(u->udev, u->out_pipe);
-		if (ret) {
-			if (ret != -ENODEV)
-				obmf_report(core, &u->intf->dev,
-					    OBMF_EV_OUT_CLEAR_HALT, -1, ret, 0);
-			obmf_count(core, OBMF_IF_TX_URB_ERRORS);
-		}
+		mod_delayed_work(system_dfl_wq, &u->recover, 0);
 		return -EPIPE;
 	case -ENOENT:
+		return obmf_usb_tx_cancelled(u);
 	case -ECONNRESET:
 	case -ESHUTDOWN:
 	case -ENODEV:
@@ -319,47 +399,122 @@ static int obmf_usb_tx_status(struct obmf_usb *u, size_t len)
 	return -EIO;
 }
 
-/* A message is never sent twice: a failed transfer is the caller's error */
+/*
+ * A submission the USB core refused. With the anchor poisoned, the error
+ * of the path that poisoned it; for lack of memory, -ENOMEM.
+ */
+static int obmf_usb_tx_refused(struct obmf_usb *u, int ret)
+{
+	switch (ret) {
+	case -EPERM:
+		return obmf_usb_tx_cancelled(u);
+	case -ENODEV:
+		return -ENODEV;
+	}
+	dev_dbg(&u->intf->dev, "bulk out submit failed: %pe\n", ERR_PTR(ret));
+	obmf_count(u->tp.core, OBMF_IF_TX_URB_ERRORS);
+	return ret == -ENOMEM ? -ENOMEM : -EIO;
+}
+
+/*
+ * Under @send_lock, so that the stop, the quiesce and the clear of a
+ * halt find every send that passed the check counted and its transfer
+ * submitted. GFP_ATOMIC, as the lock is held: the poison of the anchor
+ * spins while a transfer is on it and not yet submitted.
+ */
+static int obmf_usb_tx_submit(struct obmf_usb *u, struct urb *urb)
+{
+	int ret;
+
+	guard(spinlock)(&u->send_lock);
+	if (test_bit(OBMF_USB_STOPPED, &u->flags))
+		return -ENODEV;
+	if (test_bit(OBMF_USB_QUIESCED, &u->flags))
+		return -EAGAIN;
+	/* Until the recovery work has cleared the halt */
+	if (test_bit(OBMF_USB_STALL_OUT, &u->flags))
+		return -EPIPE;
+
+	usb_anchor_urb(urb, &u->tx_anchor);
+	ret = usb_submit_urb(urb, GFP_ATOMIC);
+	if (!ret) {
+		u->tx_count++;
+		return 0;
+	}
+	usb_unanchor_urb(urb);
+	return obmf_usb_tx_refused(u, ret);
+}
+
+static int obmf_usb_tx_wait(struct obmf_usb *u, struct obmf_usb_tx *tx,
+			    struct urb *urb, size_t len,
+			    unsigned int timeout_ms)
+{
+	if (wait_for_completion_timeout(&tx->done,
+					msecs_to_jiffies(timeout_ms)))
+		return obmf_usb_tx_status(u, urb, len);
+
+	usb_kill_urb(urb);
+	if (urb->status != -ENOENT)
+		return obmf_usb_tx_status(u, urb, len);
+	if (test_bit(OBMF_USB_STOPPED, &u->flags))
+		return -ENODEV;
+	dev_dbg(&u->intf->dev, "bulk out timed out after %u ms\n", timeout_ms);
+	obmf_count(u->tp.core, OBMF_IF_TX_URB_ERRORS);
+	return -ETIMEDOUT;
+}
+
+static bool obmf_usb_tx_idle(struct obmf_usb *u)
+{
+	guard(spinlock)(&u->send_lock);
+	return !u->tx_count;
+}
+
+/*
+ * Each send submits its own transfer, waits for it at most @timeout_ms
+ * and then cancels it, whatever the other senders do. Once the stop has
+ * begun it sends nothing and fails with -ENODEV, once the quiesce has
+ * with -EAGAIN, and while a bulk OUT halt is not cleared with -EPIPE. A
+ * message is never sent twice: a failed transfer is the caller's error.
+ */
 static int obmf_usb_send(struct obmf_transport *tp, const void *buf, size_t len,
 			 unsigned int timeout_ms)
 {
 	struct obmf_usb *u = to_obmf_usb(tp);
-	struct urb *urb = u->tx_urb;
+	struct obmf_usb_tx tx = { .u = u };
+	struct urb *urb;
+	void *msg;
+	bool idle;
 	int ret;
 
 	if (len > tp->max_tx_msg)
 		return -EMSGSIZE;
 
-	guard(mutex)(&u->tx_lock);
-	if (test_bit(OBMF_USB_STOPPED, &u->flags))
-		return -ENODEV;
-	if (test_bit(OBMF_USB_QUIESCED, &u->flags))
-		return -EAGAIN;
-
-	memcpy(urb->transfer_buffer, buf, len);
-	urb->transfer_buffer_length = len;
-	reinit_completion(&u->tx_done);
-	ret = usb_submit_urb(urb, GFP_KERNEL);
-	if (ret == -EPERM || ret == -ENODEV)
-		return -ENODEV;
-	if (ret) {
-		dev_dbg(&u->intf->dev, "bulk out submit failed: %pe\n",
-			ERR_PTR(ret));
-		obmf_count(tp->core, OBMF_IF_TX_URB_ERRORS);
-		return -EIO;
+	urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!urb)
+		return -ENOMEM;
+	msg = kmemdup(buf, len, GFP_KERNEL);
+	if (!msg) {
+		usb_free_urb(urb);
+		return -ENOMEM;
 	}
-	if (wait_for_completion_timeout(&u->tx_done,
-					msecs_to_jiffies(timeout_ms)))
-		return obmf_usb_tx_status(u, len);
+	init_completion(&tx.done);
+	usb_fill_bulk_urb(urb, u->udev, u->out_pipe, msg, len,
+			  obmf_usb_tx_complete, &tx);
+	urb->transfer_flags |= URB_FREE_BUFFER;
+	/* OBMF-ICP over USB 1.0, 6.1: a ZLP ends a full-packet message */
+	if (u->zlp)
+		urb->transfer_flags |= URB_ZERO_PACKET;
 
-	usb_kill_urb(urb);
-	if (urb->status != -ENOENT)
-		return obmf_usb_tx_status(u, len);
-	if (test_bit(OBMF_USB_STOPPED, &u->flags))
-		return -ENODEV;
-	dev_dbg(&u->intf->dev, "bulk out timed out after %u ms\n", timeout_ms);
-	obmf_count(tp->core, OBMF_IF_TX_URB_ERRORS);
-	return -ETIMEDOUT;
+	ret = obmf_usb_tx_submit(u, urb);
+	if (!ret) {
+		ret = obmf_usb_tx_wait(u, &tx, urb, len, timeout_ms);
+		scoped_guard(spinlock, &u->send_lock)
+			idle = !--u->tx_count;
+		if (idle)
+			wake_up(&u->tx_idle);
+	}
+	usb_free_urb(urb);
+	return ret;
 }
 
 static int obmf_usb_start(struct obmf_transport *tp)
@@ -383,11 +538,13 @@ static void obmf_usb_stop(struct obmf_transport *tp)
 	struct obmf_usb *u = to_obmf_usb(tp);
 	int i;
 
-	set_bit(OBMF_USB_STOPPED, &u->flags);
+	scoped_guard(spinlock, &u->send_lock)
+		set_bit(OBMF_USB_STOPPED, &u->flags);
+	/* A clear of a halt in progress unpoisons the anchor at its end */
 	disable_delayed_work_sync(&u->recover);
 	for (i = 0; i < OBMF_USB_RX_URBS; i++)
 		usb_poison_urb(u->rx_urb[i]);
-	usb_poison_urb(u->tx_urb);
+	usb_poison_anchored_urbs(&u->tx_anchor);
 }
 
 static void obmf_usb_quiesce(struct obmf_transport *tp)
@@ -395,18 +552,19 @@ static void obmf_usb_quiesce(struct obmf_transport *tp)
 	struct obmf_usb *u = to_obmf_usb(tp);
 	int i;
 
-	set_bit(OBMF_USB_QUIESCED, &u->flags);
+	scoped_guard(spinlock, &u->send_lock)
+		set_bit(OBMF_USB_QUIESCED, &u->flags);
 	disable_delayed_work_sync(&u->recover);
 	for (i = 0; i < OBMF_USB_RX_URBS; i++)
 		usb_kill_urb(u->rx_urb[i]);
-	/* Wait for a send that started before OBMF_USB_QUIESCED was set */
-	mutex_lock(&u->tx_lock);
-	mutex_unlock(&u->tx_lock);
+	/* Each send in flight ends within its own timeout */
+	wait_event(u->tx_idle, obmf_usb_tx_idle(u));
 }
 
 static int obmf_usb_resume_rx(struct obmf_transport *tp)
 {
 	struct obmf_usb *u = to_obmf_usb(tp);
+	int ret;
 
 	clear_bit(OBMF_USB_QUIESCED, &u->flags);
 	clear_bit(OBMF_USB_STALL_IN, &u->flags);
@@ -415,7 +573,43 @@ static int obmf_usb_resume_rx(struct obmf_transport *tp)
 	/* A failed core stays failed until the interface is bound again */
 	if (test_bit(OBMF_USB_FAILED, &u->flags))
 		return 0;
-	return obmf_usb_start(tp);
+	ret = obmf_usb_start(tp);
+	/* The quiesce may have cancelled the clear of a bulk OUT halt */
+	if (!ret && test_bit(OBMF_USB_STALL_OUT, &u->flags))
+		mod_delayed_work(system_dfl_wq, &u->recover, 0);
+	return ret;
+}
+
+static void obmf_usb_release_work(struct work_struct *work)
+{
+	struct obmf_usb_release *r =
+		container_of(work, struct obmf_usb_release, work);
+	struct usb_interface *intf = r->intf;
+	struct usb_device *udev = interface_to_usbdev(intf);
+	struct obmf_transport *tp;
+
+	usb_lock_device(udev);
+	/* Only the binding that asked: an unbind and a bind may come first */
+	if (intf->dev.driver == &obmf_usb_driver.driver) {
+		tp = usb_get_intfdata(intf);
+		if (tp && READ_ONCE(to_obmf_usb(tp)->released)) {
+			dev_dbg(&intf->dev,
+				"released after a failed discovery\n");
+			usb_driver_release_interface(&obmf_usb_driver, intf);
+		}
+	}
+	usb_unlock_device(udev);
+	usb_put_intf(intf);
+	kfree(r);
+}
+
+static void obmf_usb_release_intf(struct obmf_transport *tp)
+{
+	struct obmf_usb *u = to_obmf_usb(tp);
+
+	u->release->intf = usb_get_intf(u->intf);
+	WRITE_ONCE(u->released, true);
+	queue_work(obmf_usb_wq, &u->release->work);
 }
 
 static const struct obmf_transport_ops obmf_usb_ops = {
@@ -424,6 +618,7 @@ static const struct obmf_transport_ops obmf_usb_ops = {
 	.quiesce = obmf_usb_quiesce,
 	.resume = obmf_usb_resume_rx,
 	.send = obmf_usb_send,
+	.release = obmf_usb_release_intf,
 };
 
 static const struct obmf_usb_func_desc *
@@ -455,10 +650,9 @@ static void obmf_usb_free(struct obmf_usb *u)
 			kfree(u->rx_urb[i]->transfer_buffer);
 		usb_free_urb(u->rx_urb[i]);
 	}
-	if (u->tx_urb)
-		kfree(u->tx_urb->transfer_buffer);
-	usb_free_urb(u->tx_urb);
-	mutex_destroy(&u->tx_lock);
+	/* A queued release frees itself */
+	if (!u->released)
+		kfree(u->release);
 	kfree(u);
 }
 
@@ -479,17 +673,6 @@ static int obmf_usb_alloc_urbs(struct obmf_usb *u)
 		usb_fill_bulk_urb(u->rx_urb[i], u->udev, u->in_pipe, buf,
 				  u->rx_len, obmf_usb_rx_complete, u);
 	}
-	u->tx_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!u->tx_urb)
-		return -ENOMEM;
-	buf = kmalloc(u->tp.max_tx_msg, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-	usb_fill_bulk_urb(u->tx_urb, u->udev, u->out_pipe, buf,
-			  u->tp.max_tx_msg, obmf_usb_tx_complete, u);
-	/* OBMF-ICP over USB 1.0, 6.1: a ZLP ends a full-packet message */
-	if (u->zlp)
-		u->tx_urb->transfer_flags |= URB_ZERO_PACKET;
 	return 0;
 }
 
@@ -583,15 +766,20 @@ static int obmf_usb_probe(struct usb_interface *intf,
 	if (ret)
 		return ret;
 
-	struct obmf_usb *u __free(obmf_usb) = kzalloc_obj(*u);
+	struct obmf_usb *u __free(obmf_usb) = kzalloc_obj(*u, GFP_KERNEL);
 	if (!u)
 		return -ENOMEM;
+	u->release = kzalloc_obj(*u->release, GFP_KERNEL);
+	if (!u->release)
+		return -ENOMEM;
+	INIT_WORK(&u->release->work, obmf_usb_release_work);
 	u->intf = intf;
 	u->udev = interface_to_usbdev(intf);
 	u->in_pipe = usb_rcvbulkpipe(u->udev, usb_endpoint_num(in));
 	u->out_pipe = usb_sndbulkpipe(u->udev, usb_endpoint_num(out));
-	mutex_init(&u->tx_lock);
-	init_completion(&u->tx_done);
+	init_usb_anchor(&u->tx_anchor);
+	spin_lock_init(&u->send_lock);
+	init_waitqueue_head(&u->tx_idle);
 	INIT_DELAYED_WORK(&u->recover, obmf_usb_recover);
 	obmf_usb_fault_init(&u->fail_in);
 	obmf_usb_fault_init(&u->fail_out);
@@ -690,10 +878,16 @@ static int __init obmf_usb_init(void)
 {
 	int ret;
 
+	/* Freezable, as the hub's: a release waits for the system to wake */
+	obmf_usb_wq = alloc_workqueue("obmf-usb", WQ_FREEZABLE | WQ_UNBOUND, 0);
+	if (!obmf_usb_wq)
+		return -ENOMEM;
 	obmf_debugfs_init(usb_debug_root);
 	ret = usb_register(&obmf_usb_driver);
-	if (ret)
+	if (ret) {
 		obmf_debugfs_exit();
+		destroy_workqueue(obmf_usb_wq);
+	}
 	return ret;
 }
 module_init(obmf_usb_init);
@@ -701,6 +895,8 @@ module_init(obmf_usb_init);
 static void __exit obmf_usb_exit(void)
 {
 	usb_deregister(&obmf_usb_driver);
+	/* A release queued before the last unbind runs in this module */
+	destroy_workqueue(obmf_usb_wq);
 	/*
 	 * A device link to a function device may still hold its last
 	 * reference, put later from the device-link workqueue; the release
@@ -716,6 +912,9 @@ MODULE_LICENSE("GPL");
 
 #if IS_ENABLED(CONFIG_OBMF_KUNIT_TEST)
 #include <kunit/test.h>
+#include <linux/iopoll.h>
+
+#include "obmf-kunit.h"
 
 static struct usb_interface *obmf_usb_test_intf(struct kunit *test)
 {
@@ -777,6 +976,71 @@ static void obmf_usb_test_limits(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rx_len, 512);
 }
 
+/*
+ * An EF/09/01 interface matches the OBMF-ICP class entry for any
+ * VID/PID, one that other entries list too; another
+ * class, subclass or protocol matches no entry. The USB core matches no
+ * interface class of a device whose device class is vendor-specific, so
+ * the devices here have device class 0 or EF (Miscellaneous).
+ */
+static void obmf_usb_test_class_entry(struct kunit *test)
+{
+	static const struct {
+		u16 vid, pid;
+		u8 class;
+	} devs[] = {
+		{ 0x0000, 0x0000, 0 },
+		{ 0x1d6b, 0x0104, USB_CLASS_MISC },
+		{ 0x0955, 0xcf11, 0 },
+		{ 0xffff, 0xffff, USB_CLASS_MISC },
+	};
+	static const u8 other[][3] = {
+		{ USB_CLASS_MISC, OBMF_USB_SUBCLASS, OBMF_USB_PROTOCOL + 1 },
+		{ USB_CLASS_MISC, OBMF_USB_SUBCLASS + 1, OBMF_USB_PROTOCOL },
+		{ USB_CLASS_MISC, OBMF_USB_SUBCLASS - 1, OBMF_USB_PROTOCOL },
+		{ USB_CLASS_VENDOR_SPEC, OBMF_USB_SUBCLASS, OBMF_USB_PROTOCOL },
+		{ USB_CLASS_MISC, OBMF_USB_SUBCLASS, 0 },
+	};
+	struct usb_interface *intf = obmf_usb_test_intf(test);
+	struct usb_interface_descriptor *d = &intf->cur_altsetting->desc;
+	struct usb_device *udev =
+		kunit_kzalloc(test, sizeof(*udev), GFP_KERNEL);
+	const struct usb_device_id *id;
+	const struct obmf_usb_proto *proto;
+	int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, udev);
+	intf->dev.parent = &udev->dev;
+	for (i = 0; i < ARRAY_SIZE(devs); i++) {
+		udev->descriptor.idVendor = cpu_to_le16(devs[i].vid);
+		udev->descriptor.idProduct = cpu_to_le16(devs[i].pid);
+		udev->descriptor.bDeviceClass = devs[i].class;
+		d->bInterfaceClass = USB_CLASS_MISC;
+		d->bInterfaceSubClass = OBMF_USB_SUBCLASS;
+		d->bInterfaceProtocol = OBMF_USB_PROTOCOL;
+		id = usb_match_id(intf, obmf_usb_ids);
+		KUNIT_ASSERT_PTR_EQ_MSG(test, id, &obmf_usb_ids[0], "%04x:%04x",
+					devs[i].vid, devs[i].pid);
+		proto = (const struct obmf_usb_proto *)id->driver_info;
+		KUNIT_EXPECT_PTR_EQ(test, proto, &obmf_usb_icp);
+	}
+	KUNIT_EXPECT_EQ(test, USB_CLASS_MISC, 0xef);
+	KUNIT_EXPECT_EQ(test, OBMF_USB_SUBCLASS, 0x09);
+	KUNIT_EXPECT_EQ(test, OBMF_USB_PROTOCOL, 0x01);
+
+	udev->descriptor.idVendor = cpu_to_le16(0x1d6b);
+	udev->descriptor.idProduct = cpu_to_le16(0x0104);
+	udev->descriptor.bDeviceClass = 0;
+	for (i = 0; i < ARRAY_SIZE(other); i++) {
+		d->bInterfaceClass = other[i][0];
+		d->bInterfaceSubClass = other[i][1];
+		d->bInterfaceProtocol = other[i][2];
+		KUNIT_EXPECT_NULL_MSG(test, usb_match_id(intf, obmf_usb_ids),
+				      "%02x/%02x/%02x", other[i][0],
+				      other[i][1], other[i][2]);
+	}
+}
+
 #ifdef CONFIG_OBMF_DIALECTS
 static ssize_t obmf_usb_test_encode(struct obmf_channel *ch, u8 *buf,
 				    size_t len, size_t cap)
@@ -792,9 +1056,8 @@ static ssize_t obmf_usb_test_decode(struct obmf_channel *ch, const u8 *in,
 }
 
 /*
- * A dialect with one of encode and decode, or with nothing set.
- * Expected: one WARN for each of the two checks, unless an earlier test
- * has already hit it.
+ * A dialect with one of encode and decode, or with nothing set: each of
+ * the two checks warns once, inside obmf_test_warns()
  */
 static void obmf_usb_test_bad_dialect(struct kunit *test)
 {
@@ -827,17 +1090,208 @@ static void obmf_usb_test_bad_dialect(struct kunit *test)
 	intf->cur_altsetting->desc.bNumEndpoints = 2;
 	intf->dev.parent = &udev->dev;
 
-	for (i = 0; i < ARRAY_SIZE(bad); i++) {
-		proto.dialect = &bad[i];
-		KUNIT_EXPECT_EQ_MSG(test, obmf_usb_probe(intf, &id), -EINVAL,
-				    "table %d", i);
+	obmf_test_warns(test)
+	{
+		for (i = 0; i < ARRAY_SIZE(bad); i++) {
+			proto.dialect = &bad[i];
+			KUNIT_EXPECT_EQ_MSG(test, obmf_usb_probe(intf, &id),
+					    -EINVAL, "table %d", i);
+		}
 	}
 }
 
 #endif /* CONFIG_OBMF_DIALECTS */
+/* An interface with no USB device: the bulk OUT state of a probe */
+static struct obmf_usb *obmf_usb_test_tx(struct kunit *test)
+{
+	struct obmf_usb *u = kunit_kzalloc(test, sizeof(*u), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, u);
+	u->tp.core = kunit_kzalloc(test, sizeof(*u->tp.core), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, u->tp.core);
+	u->intf = obmf_usb_test_intf(test);
+	init_usb_anchor(&u->tx_anchor);
+	spin_lock_init(&u->send_lock);
+	init_waitqueue_head(&u->tx_idle);
+	INIT_DELAYED_WORK(&u->recover, obmf_usb_recover);
+	obmf_usb_fault_init(&u->fail_in);
+	obmf_usb_fault_init(&u->fail_out);
+	return u;
+}
+
+KUNIT_DEFINE_ACTION_WRAPPER(obmf_usb_test_free_urb, usb_free_urb, struct urb *);
+
+/* A send's transfer with no device, which the USB core refuses */
+static struct urb *obmf_usb_test_tx_urb(struct kunit *test,
+					struct obmf_usb_tx *tx)
+{
+	struct urb *urb = usb_alloc_urb(0, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, urb);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, obmf_usb_test_free_urb,
+						  urb),
+			0);
+	init_completion(&tx->done);
+	usb_fill_bulk_urb(urb, NULL, 0, NULL, 0, obmf_usb_tx_complete, tx);
+	return urb;
+}
+
+static long obmf_usb_test_tx_errors(struct obmf_usb *u)
+{
+	return atomic_long_read(&u->tp.core->cnt[OBMF_IF_TX_URB_ERRORS]);
+}
+
+/*
+ * A send is refused, nothing submitted, by the stop with -ENODEV, by
+ * the quiesce with -EAGAIN and while an OUT halt is marked with -EPIPE,
+ * in that order. A submission the USB core refuses leaves nothing on
+ * the anchor and nothing counted in flight; -ENOMEM is passed on.
+ */
+static void obmf_usb_test_tx_submit(struct kunit *test)
+{
+	static const struct {
+		unsigned long flags;
+		int ret;
+	} cases[] = {
+		{ BIT(OBMF_USB_STOPPED) | BIT(OBMF_USB_QUIESCED) |
+			  BIT(OBMF_USB_STALL_OUT),
+		  -ENODEV },
+		{ BIT(OBMF_USB_QUIESCED) | BIT(OBMF_USB_STALL_OUT), -EAGAIN },
+		{ BIT(OBMF_USB_STALL_OUT), -EPIPE },
+		/* The USB core's refusal: no device */
+		{ 0, -ENODEV },
+	};
+	struct obmf_usb *u = obmf_usb_test_tx(test);
+	struct obmf_usb_tx tx = { .u = u };
+	struct urb *urb = obmf_usb_test_tx_urb(test, &tx);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		u->flags = cases[i].flags;
+		KUNIT_EXPECT_EQ_MSG(test, obmf_usb_tx_submit(u, urb),
+				    cases[i].ret, "flags %#lx", cases[i].flags);
+		KUNIT_EXPECT_TRUE_MSG(test, usb_anchor_empty(&u->tx_anchor),
+				      "flags %#lx", cases[i].flags);
+		KUNIT_EXPECT_EQ(test, u->tx_count, 0);
+	}
+	KUNIT_EXPECT_EQ(test, obmf_usb_test_tx_errors(u), 0);
+
+	u->flags = 0;
+	KUNIT_EXPECT_EQ(test, obmf_usb_tx_refused(u, -ENOMEM), -ENOMEM);
+	KUNIT_EXPECT_EQ(test, obmf_usb_tx_refused(u, -EMSGSIZE), -EIO);
+	KUNIT_EXPECT_EQ(test, obmf_usb_test_tx_errors(u), 2);
+	/* A poisoned anchor: the error of the path that poisoned it */
+	KUNIT_EXPECT_EQ(test, obmf_usb_tx_refused(u, -EPERM), -EPIPE);
+	KUNIT_EXPECT_EQ(test, obmf_usb_tx_refused(u, -ENODEV), -ENODEV);
+	set_bit(OBMF_USB_STOPPED, &u->flags);
+	KUNIT_EXPECT_EQ(test, obmf_usb_tx_refused(u, -EPERM), -ENODEV);
+	KUNIT_EXPECT_EQ(test, obmf_usb_test_tx_errors(u), 2);
+}
+
+/*
+ * The completion marks an OUT halt before it wakes the sender, so that
+ * no later send reaches the endpoint; a transfer that succeeded marks
+ * nothing. A transfer another path cancelled is -EPIPE, or -ENODEV once
+ * the stop has begun.
+ */
+static void obmf_usb_test_tx_complete(struct kunit *test)
+{
+	struct obmf_usb *u = obmf_usb_test_tx(test);
+	struct obmf_usb_tx tx = { .u = u };
+	struct urb *urb = obmf_usb_test_tx_urb(test, &tx);
+
+	urb->status = 0;
+	obmf_usb_tx_complete(urb);
+	KUNIT_EXPECT_TRUE(test, completion_done(&tx.done));
+	KUNIT_EXPECT_FALSE(test, test_bit(OBMF_USB_STALL_OUT, &u->flags));
+
+	reinit_completion(&tx.done);
+	urb->status = -EPIPE;
+	obmf_usb_tx_complete(urb);
+	KUNIT_EXPECT_TRUE(test, completion_done(&tx.done));
+	KUNIT_EXPECT_TRUE(test, test_bit(OBMF_USB_STALL_OUT, &u->flags));
+
+	KUNIT_EXPECT_EQ(test, obmf_usb_tx_cancelled(u), -EPIPE);
+	set_bit(OBMF_USB_STOPPED, &u->flags);
+	KUNIT_EXPECT_EQ(test, obmf_usb_tx_cancelled(u), -ENODEV);
+}
+
+struct obmf_usb_test_quiesce {
+	struct work_struct work;
+	struct obmf_usb *u;
+	struct completion done;
+};
+
+static void obmf_usb_test_quiesce_fn(struct work_struct *work)
+{
+	struct obmf_usb_test_quiesce *q =
+		container_of(work, struct obmf_usb_test_quiesce, work);
+
+	obmf_usb_quiesce(&q->u->tp);
+	complete(&q->done);
+}
+
+/*
+ * The quiesce refuses new sends at once and returns only when the send
+ * in flight has returned. Only expectations between the queueing and the
+ * flush: the work must not outlive the case.
+ */
+static void obmf_usb_test_tx_quiesce(struct kunit *test)
+{
+	struct obmf_usb *u = obmf_usb_test_tx(test);
+	struct obmf_usb_test_quiesce q = { .u = u };
+	unsigned long left;
+	bool idle;
+	int set;
+
+	u->tx_count = 1;
+	init_completion(&q.done);
+	INIT_WORK_ONSTACK(&q.work, obmf_usb_test_quiesce_fn);
+	queue_work(system_dfl_wq, &q.work);
+	KUNIT_EXPECT_EQ(test,
+			read_poll_timeout(test_bit, set, set, 1000, 1000000,
+					  false, OBMF_USB_QUIESCED, &u->flags),
+			0);
+	left = wait_for_completion_timeout(&q.done, msecs_to_jiffies(50));
+	KUNIT_EXPECT_EQ(test, left, 0);
+
+	/* The send returns, as obmf_usb_send() does */
+	scoped_guard(spinlock, &u->send_lock)
+		idle = !--u->tx_count;
+	if (idle)
+		wake_up(&u->tx_idle);
+	left = wait_for_completion_timeout(&q.done, msecs_to_jiffies(1000));
+	KUNIT_EXPECT_NE(test, left, 0);
+	flush_work(&q.work);
+	destroy_work_on_stack(&q.work);
+}
+
+/*
+ * The stop marks the transport stopped, disables the recovery work and
+ * poisons the anchor, so that a transfer submitted before it is
+ * cancelled and none is submitted after it.
+ */
+static void obmf_usb_test_tx_stop(struct kunit *test)
+{
+	struct obmf_usb *u = obmf_usb_test_tx(test);
+
+	obmf_usb_stop(&u->tp);
+	KUNIT_EXPECT_TRUE(test, test_bit(OBMF_USB_STOPPED, &u->flags));
+	KUNIT_EXPECT_TRUE(test, u->tx_anchor.poisoned);
+	mod_delayed_work(system_dfl_wq, &u->recover, msecs_to_jiffies(60000));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&u->recover));
+	cancel_delayed_work_sync(&u->recover);
+}
+
 static struct kunit_case obmf_usb_cases[] = {
 	KUNIT_CASE(obmf_usb_test_no_proto),
 	KUNIT_CASE(obmf_usb_test_limits),
+	KUNIT_CASE(obmf_usb_test_class_entry),
+	KUNIT_CASE(obmf_usb_test_tx_submit),
+	KUNIT_CASE(obmf_usb_test_tx_complete),
+	KUNIT_CASE(obmf_usb_test_tx_quiesce),
+	KUNIT_CASE(obmf_usb_test_tx_stop),
 #ifdef CONFIG_OBMF_DIALECTS
 	KUNIT_CASE(obmf_usb_test_bad_dialect),
 #endif
